@@ -22,6 +22,12 @@ enum SidebarTab: Hashable {
     case library(key: String)
     case liveTV(sourceId: String?)
     case settings
+    #if DEBUG
+    /// UIKit cell catalog — no Plex required.
+    case components
+    /// Opens the real detail UI with canned MediaItem data (no Plex).
+    case detailTemplate
+    #endif
 }
 
 // MARK: - Nested Navigation State

@@ -1757,7 +1757,12 @@ final class PlexHomeViewController: UIViewController {
         // contentless Home can trap focus — see Docs/bugs/fresh-signin-blank-home.md).
         let isWaitingForHero = shouldWaitForHeroBeforeContent(hubsEmpty: hubsEmpty)
         stateViewHasFocusableAction = false
-        if !hasCredentials {
+        #if DEBUG
+        let treatAsSignedIn = hasCredentials || DemoContentSeeder.isEnabled
+        #else
+        let treatAsSignedIn = hasCredentials
+        #endif
+        if !treatAsSignedIn {
             stateView.configure(kind: .notConnected)
             stateView.isHidden = false
             collectionView.isHidden = true
@@ -1801,7 +1806,7 @@ final class PlexHomeViewController: UIViewController {
         // launch since the UIKit cutover rode the splash's full 15s safety
         // timeout. Ready = any SETTLED state (content, empty, error): the
         // splash exists to cover the initial load, not to mask outcomes.
-        if hasCredentials, !(isLoadingHubs && hubsEmpty), !isWaitingForHero, !dataStore.isHomeContentReady {
+        if treatAsSignedIn, !(isLoadingHubs && hubsEmpty), !isWaitingForHero, !dataStore.isHomeContentReady {
             // Deferred: updateHomeState can run inside viewDidLoad during a
             // SwiftUI view update (the bridge's makeUIViewController), and
             // publishing @Published state there logs "Publishing changes from
@@ -1816,7 +1821,7 @@ final class PlexHomeViewController: UIViewController {
         // state (notConnected / error / empty, or hero disabled) the backdrop
         // is hidden and no image will load — mark the hero ready now so the
         // splash dismisses on content alone instead of riding the cap/timeout.
-        if hasCredentials, !(isLoadingHubs && hubsEmpty), !isWaitingForHero, backdropView.isHidden {
+        if treatAsSignedIn, !(isLoadingHubs && hubsEmpty), !isWaitingForHero, backdropView.isHidden {
             markHeroReady()
         }
     }

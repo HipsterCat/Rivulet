@@ -88,6 +88,12 @@ struct TVSidebarView: View {
         return dataStore.libraries.first(where: { $0.key == key })?.isMusicLibrary ?? false
     }
 
+    #if DEBUG
+    private var demoModeActive: Bool { DemoContentSeeder.isEnabled }
+    #else
+    private var demoModeActive: Bool { false }
+    #endif
+
     private var tabSelection: Binding<SidebarTab> {
         Binding(
             get: { selectedTab },
@@ -373,6 +379,12 @@ struct TVSidebarView: View {
             // Returning user already authed at launch → sidebar populates via the
             // normal Home sync; don't offer the fresh-sign-in reload.
             if authManager.selectedServerToken != nil { freshSignInHandled = true }
+            #if DEBUG
+            if DemoContentSeeder.isEnabled {
+                DemoContentSeeder.install()
+                syncSidebarStructure()
+            }
+            #endif
             applyDebugLaunchTab()
             // Defer What's New check if profile picker needs to be shown first
             if profileManager.showProfilePickerOnLaunch && authManager.selectedServerToken != nil {
@@ -487,6 +499,14 @@ struct TVSidebarView: View {
             }
 
             TabSection("") {
+                #if DEBUG
+                Tab("Components", systemImage: "square.grid.2x2", value: SidebarTab.components) {
+                    tabContent(for: .components)
+                }
+                Tab("Detail Template", systemImage: "rectangle.portrait.on.rectangle.portrait.angled", value: SidebarTab.detailTemplate) {
+                    tabContent(for: .detailTemplate)
+                }
+                #endif
                 Tab("Settings", systemImage: "gearshape.fill", value: SidebarTab.settings) {
                     tabContent(for: .settings)
                 }
@@ -597,9 +617,9 @@ struct TVSidebarView: View {
                 // overlay; the home behind is `.disabled` so focus lands on the
                 // welcome button, not a hidden home element.
                 PlexHomeRoot()
-                    .disabled(!authManager.hasCredentials)
+                    .disabled(!authManager.hasCredentials && !demoModeActive)
                     .overlay {
-                        if !authManager.hasCredentials {
+                        if !authManager.hasCredentials && !demoModeActive {
                             welcomeView
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .background(.black)
@@ -627,6 +647,12 @@ struct TVSidebarView: View {
                 LiveTVContainerView(sourceIdFilter: sourceId)
             case .settings:
                 settingsTabContent
+            #if DEBUG
+            case .components:
+                ComponentSandboxContainer()
+            case .detailTemplate:
+                MockDetailTemplateView()
+            #endif
             }
         }
         .overlay {
@@ -694,13 +720,43 @@ struct TVSidebarView: View {
 
     /// DEBUG: jump straight to a library named by the RIVULET_OPEN_LIBRARY env
     /// var once libraries have loaded, so sim iteration skips the sidebar nav.
+    /// Also honors RIVULET_OPEN_DETAIL=show|movie|episode|1 to present the
+    /// canned detail template without Plex.
     private func applyDebugLaunchTab() {
-        guard !didApplyDebugLaunch,
-              let name = ProcessInfo.processInfo.environment["RIVULET_OPEN_LIBRARY"],
+        guard !didApplyDebugLaunch else { return }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["RIVULET_OPEN_COMPONENTS"] == "1" {
+            didApplyDebugLaunch = true
+            selectedTab = .components
+            return
+        }
+        if let kind = MockDetailKind.fromEnvironment(ProcessInfo.processInfo.environment["RIVULET_OPEN_DETAIL"]) {
+            didApplyDebugLaunch = true
+            selectedTab = .detailTemplate
+            presentMockDetailWhenReady(kind: kind)
+            return
+        }
+        #endif
+        guard let name = ProcessInfo.processInfo.environment["RIVULET_OPEN_LIBRARY"],
               let lib = dataStore.visibleMediaLibraries.first(where: { $0.title == name }) else { return }
         didApplyDebugLaunch = true
         selectedTab = .library(key: lib.key)
     }
+
+    #if DEBUG
+    /// Retry until a host VC exists (launch can race the window).
+    private func presentMockDetailWhenReady(kind: MockDetailKind, attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            if let top = Self.topPresentedViewController() {
+                MockDetailLauncher.present(kind: kind, from: top)
+                return
+            }
+            if attempt < 20 {
+                presentMockDetailWhenReady(kind: kind, attempt: attempt + 1)
+            }
+        }
+    }
+    #endif
 
     private func isMusicLibraryTab(_ tab: SidebarTab) -> Bool {
         guard case .library(let key) = tab else { return false }

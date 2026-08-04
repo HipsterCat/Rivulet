@@ -221,7 +221,7 @@ enum AttestClientError: Error {
 /// app updates and be device-local. UserDefaults would be wiped on reinstall,
 /// forcing a needless re-attest; the Keychain persists.
 private enum Keychain {
-    private static let service = "com.gstudios.rivulet.attest"
+    private static let service = "com.gstudioss.rivulet.attest"
 
     static func save(_ account: String, value: String) {
         let q: [String: Any] = [

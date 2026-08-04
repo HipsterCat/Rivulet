@@ -100,6 +100,12 @@ struct ContentView: View {
             MusicProviderRegistry.shared.populateFromCurrentAuth()
             MusicQueue.shared.configure(registry: MusicProviderRegistry.shared)
 
+            #if DEBUG
+            // Seed Home / Libraries before the first paint settles on
+            // "Not Connected". No env var needed — scheme sets RIVULET_DEMO=1.
+            DemoContentSeeder.install()
+            #endif
+
             splashLog.info("Splash task started — hasCredentials=\(self.authManager.hasCredentials)")
             if !authManager.hasCredentials {
                 splashLog.info("No credentials on launch — dismissing splash immediately")

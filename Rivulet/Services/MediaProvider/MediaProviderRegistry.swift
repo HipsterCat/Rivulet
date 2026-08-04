@@ -47,12 +47,21 @@ final class MediaProviderRegistry {
     /// app launch and after auth-state changes (sign-in, sign-out, server
     /// switch). Wave 1 single-server: at most one provider entry.
     func populateFromCurrentAuth() {
+        #if DEBUG
+        // Keep the mock detail provider across auth clears so the DEBUG
+        // template can open without Plex credentials.
+        let mockProvider = providers[MockDetailProvider.idValue]
+        #endif
+
         let auth = PlexAuthManager.shared
         guard
             let serverURL = auth.selectedServerURL,
             let token = auth.selectedServerToken
         else {
             providers.removeAll()
+            #if DEBUG
+            if let mockProvider { register(mockProvider) }
+            #endif
             return
         }
         // Prefer Plex's real machineIdentifier when the user has selected a
@@ -74,6 +83,9 @@ final class MediaProviderRegistry {
             authToken: token
         )
         register(provider)
+        #if DEBUG
+        if let mockProvider { register(mockProvider) }
+        #endif
     }
 
     /// Process-stable hash. Avoid `String.hashValue` (per-process randomized).

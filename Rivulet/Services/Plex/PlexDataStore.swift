@@ -1139,6 +1139,33 @@ class PlexDataStore: ObservableObject {
         Task { await cacheManager.cacheHomeItems(rail) }
     }
 
+    #if DEBUG
+    /// Seeds Home / Library surfaces with canned rails (no Plex / no disk write).
+    /// Used by `DemoContentSeeder` when `RIVULET_DEMO=1`.
+    func installDemoContent(
+        libraries demoLibraries: [PlexLibrary],
+        homeRail: CachedHomeRail,
+        libraryRails: [String: CachedHomeRail]
+    ) {
+        libraries = demoLibraries
+        hasLoadedLibraries = true
+        librariesError = nil
+        isLoadingLibraries = false
+
+        homeItems = homeRail
+        homeItemsVersion = UUID()
+        hubsError = nil
+        isLoadingHubs = false
+        didCompleteInitialHubFetch = true
+        isHomeContentReady = true
+        isHomeHeroReady = true
+
+        libraryItemsByKey = libraryRails
+        libraryHubsVersion = UUID()
+        isLoadingLibraryHubs = false
+    }
+    #endif
+
     /// Stage-3 launch fast-paint: assigns `homeItems` + bumps the version from
     /// the on-disk MediaItem cache WITHOUT re-writing it (the rail came from
     /// the cache, so re-caching would be redundant disk I/O on the launch path).
