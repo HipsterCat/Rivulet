@@ -17,8 +17,15 @@ import Foundation
 enum PlexAPI: Sendable {
     static let baseUrl = "https://plex.tv"
     static let productName = "Rivulet"
-    static let deviceName = "Apple TV"
-    static let platform = "tvOS"
+
+    /// Host-injected, defaulting to the tvOS app's values. The iOS app
+    /// overrides both at launch (RivuletiOSApp.init), before any request is
+    /// built. Injection rather than `#if os(...)` because shared code carries
+    /// no platform conditionals (CLAUDE.md, Platform Boundary), and rather
+    /// than `UIDevice.systemName` because that reports "iPadOS" on some iPad
+    /// versions and "iOS" on others — Plex would see one app as two platforms.
+    static var deviceName = "Apple TV"
+    static var platform = "tvOS"
 
     /// Per-install UUID generated on first launch and persisted in UserDefaults.
     /// Plex uses this to distinguish devices in its Dashboard, attribute transcode
@@ -151,7 +158,7 @@ nonisolated struct PlexLibraryMediaContainer: Codable, Sendable {
     let Directory: [PlexLibrary]?
 }
 
-nonisolated struct PlexLibrary: Codable, Identifiable, Sendable {
+nonisolated struct PlexLibrary: Codable, Identifiable, Hashable, Sendable {
     var id: String { key }
     let key: String
     let type: String          // "movie", "show", "artist", etc.
@@ -165,6 +172,24 @@ nonisolated struct PlexLibrary: Codable, Identifiable, Sendable {
     let scannedAt: Int?
     let Location: [PlexLibraryLocation]?
 
+    /// The user's pin state for this library, straight from `/library/sections`.
+    /// This is Plex's own per-user setting, the one the Plex app's "Pin to
+    /// home" / "Hide" controls write:
+    ///
+    ///   0 (or absent) — pinned: contributes a row to Home
+    ///   1             — hidden from Home, still listed in the sidebar
+    ///   2             — hidden from Home AND from the sidebar
+    ///
+    /// Verified against a live PMS 1.43.3: `hidden == 0` correlates exactly with
+    /// having a hub promoted to Home. All six pinned libraries had one, all
+    /// seven unpinned had none.
+    /// Defaulted so the memberwise init stays source-compatible with the
+    /// fixtures that predate this field.
+    var hidden: Int?
+
+    /// Whether the user pinned this library to their Plex home screen.
+    var isPinnedToHome: Bool { (hidden ?? 0) == 0 }
+
     /// Check if this is a video library
     var isVideoLibrary: Bool {
         type == "movie" || type == "show"
@@ -176,7 +201,7 @@ nonisolated struct PlexLibrary: Codable, Identifiable, Sendable {
     }
 }
 
-nonisolated struct PlexLibraryLocation: Codable, Sendable {
+nonisolated struct PlexLibraryLocation: Codable, Hashable, Sendable {
     let id: Int
     let path: String
 }
@@ -208,7 +233,7 @@ nonisolated struct PlexExtrasContainerWrapper: Codable, Sendable {
 
 // MARK: - Hub (for home screen sections)
 
-nonisolated struct PlexHub: Codable, Identifiable, Sendable {
+nonisolated struct PlexHub: Codable, Identifiable, Hashable, Sendable {
     var id: String { hubIdentifier ?? title ?? UUID().uuidString }
     var hubIdentifier: String?
     var title: String?
@@ -217,6 +242,13 @@ nonisolated struct PlexHub: Codable, Identifiable, Sendable {
     var key: String?
     var more: Bool?
     var size: Int?
+    /// Set by `/hubs`: the user promoted this hub to their Plex home screen
+    /// (Plex Web → library → Manage Recommendations → Home). Home renders the
+    /// promoted set verbatim, so this is the switch that decides whether a row
+    /// exists at all. Absent on `/hubs/sections/{key}` (library pages show
+    /// every hub regardless of promotion), hence optional; treat nil as "not
+    /// applicable" rather than as false.
+    var promoted: Bool?
     var Metadata: [PlexMetadata]?
 
     init(
@@ -227,6 +259,7 @@ nonisolated struct PlexHub: Codable, Identifiable, Sendable {
         key: String? = nil,
         more: Bool? = nil,
         size: Int? = nil,
+        promoted: Bool? = nil,
         Metadata: [PlexMetadata]? = nil
     ) {
         self.hubIdentifier = hubIdentifier
@@ -236,6 +269,7 @@ nonisolated struct PlexHub: Codable, Identifiable, Sendable {
         self.key = key
         self.more = more
         self.size = size
+        self.promoted = promoted
         self.Metadata = Metadata
     }
 

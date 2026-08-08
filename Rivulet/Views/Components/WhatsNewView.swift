@@ -140,6 +140,19 @@ struct WhatsNewView: View {
     // MARK: - Changelog Data
 
     static let changelogs: [(version: String, features: [String])] = [
+        ("1.0.4 (76)", [
+            "Fixed Search and Discover, where no button press did anything after opening them",
+            "The playback controls now hide on their own again after a few seconds",
+            "A title's Play button now shows the time left, matching its Continue Watching tile",
+            "The player's Description tab no longer floats the summary in the middle of the panel",
+            "Home row titles now come from your Plex server and appear in your language",
+            "Home now shows the rows you have promoted on your Plex server",
+            "Continue Watching and On Deck now show as one row instead of two",
+            "New Rows page in Settings under Home lets you hide Home rows",
+            "Live TV guide times are now correct for guides that set a time zone",
+            "Music can now move back to the sidebar with a left press",
+            "Updated AetherEngine to 6.5.5",
+        ]),
         ("1.0.4 (75)", [
             "Top Shelf artwork on the Apple TV Home screen now includes the title logo",
             "Moving between the playback controls no longer skips the video",

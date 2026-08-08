@@ -45,11 +45,27 @@ enum PlexAuthState: Equatable {
 class PlexAuthManager: ObservableObject {
     static let shared = PlexAuthManager()
 
+    /// Handoffs to whatever holds cached library / hub / metadata content.
+    ///
+    /// This manager owns identity, not content, and the content store is per
+    /// platform: tvOS has `PlexDataStore`, iOS has `IOSPlexSession`. Calling
+    /// `PlexDataStore.shared` directly from here is what kept the whole auth
+    /// stack pinned to the tvOS target. The host sets these at launch.
+    ///
+    /// `onAuthenticated` is awaited on purpose. It prefetches libraries as part
+    /// of sign-in so the sidebar renders with library tabs on its first build;
+    /// fire-and-forget would reintroduce the empty-latch it was added to fix.
+    static var onAuthenticated: (@MainActor () async -> Void)?
+    static var onSignedOut: (@MainActor () -> Void)?
+
     // MARK: - Published State
 
     @Published var state: PlexAuthState = .idle
     @Published var authToken: String?
     @Published var username: String?
+    /// The signed-in account's avatar, from the same /api/v2/user payload as
+    /// `username`. Persisted so it survives relaunch without a refetch.
+    @Published var userThumbURL: URL?
     @Published var selectedServer: PlexDevice?
     @Published var selectedServerURL: String?
 
@@ -73,6 +89,7 @@ class PlexAuthManager: ObservableObject {
 
     // UserDefaults keys (non-sensitive data only)
     private let usernameKey = "plexUsername"
+    private let userThumbKey = "plexUserThumb"
     private let serverURLKey = "selectedServerURL"
     private let serverNameKey = "selectedServerName"
     /// Sentinel set after a successful auth. Used to detect fresh installs —
@@ -117,6 +134,7 @@ class PlexAuthManager: ObservableObject {
 
         // Load non-sensitive data from UserDefaults
         username = userDefaults.string(forKey: usernameKey)
+        userThumbURL = userDefaults.string(forKey: userThumbKey).flatMap { URL(string: $0) }
         selectedServerURL = userDefaults.string(forKey: serverURLKey)
 
         // Load server-specific token from Keychain, fall back to user's auth token for owned servers
@@ -229,7 +247,7 @@ class PlexAuthManager: ObservableObject {
                 // library tabs on first build. Without this, the sidebar's
                 // conditional TabSection can latch to "empty" and not recover when
                 // libraries load asynchronously later.
-                await PlexDataStore.shared.loadLibrariesIfNeeded()
+                await Self.onAuthenticated?()
 
                 return true
             } else {
@@ -657,6 +675,7 @@ class PlexAuthManager: ObservableObject {
 
         authToken = nil
         username = nil
+        userThumbURL = nil
         selectedServer = nil
         selectedServerURL = nil
         selectedServerToken = nil
@@ -669,6 +688,7 @@ class PlexAuthManager: ObservableObject {
 
         // Clear non-sensitive data from UserDefaults
         userDefaults.removeObject(forKey: usernameKey)
+        userDefaults.removeObject(forKey: userThumbKey)
         userDefaults.removeObject(forKey: serverURLKey)
         userDefaults.removeObject(forKey: serverNameKey)
         userDefaults.removeObject(forKey: hasPersistedSessionKey)
@@ -687,7 +707,7 @@ class PlexAuthManager: ObservableObject {
         // them — visually confusing on a multi-server account because the
         // UI labels the connection with the new server while showing the
         // previous server's content.
-        PlexDataStore.shared.reset()
+        Self.onSignedOut?()
 
         state = .idle
     }
@@ -923,10 +943,17 @@ class PlexAuthManager: ObservableObject {
                 ]
             )
 
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let name = json["username"] as? String ?? json["friendlyName"] as? String {
-                username = name
-                userDefaults.set(name, forKey: usernameKey)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let name = json["username"] as? String ?? json["friendlyName"] as? String {
+                    username = name
+                    userDefaults.set(name, forKey: usernameKey)
+                }
+                // The account avatar comes back in the same payload; keep it
+                // so hosts can show the signed-in account (iOS top chrome).
+                if let thumb = json["thumb"] as? String, let url = URL(string: thumb) {
+                    userThumbURL = url
+                    userDefaults.set(thumb, forKey: userThumbKey)
+                }
             }
         } catch {
             // Non-critical error, just log it
