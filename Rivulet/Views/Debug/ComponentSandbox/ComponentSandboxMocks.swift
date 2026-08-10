@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
 
 #if DEBUG
 //
@@ -24,17 +22,29 @@ enum ComponentSandboxMocks {
         URL(string: "https://m.staticpop.net/poster/item/wide/\(n).jpg")!
     }
 
-    private static let posterURL = medium(1)
-    private static let posterBURL = medium(2)
-    private static let posterCURL = medium(3)
-    private static let backdropURL = wide(1)
-    private static let backdropBURL = wide(2)
-    private static let thumbURL = wide(3)
-    private static let logoURL = wide(4)
-    private static let castURL = medium(5)
-    private static let castBURL = medium(6)
-    private static let castCURL = medium(7)
-    private static let musicURL = medium(8)
+//    private static let posterURL = medium(1)
+//    private static let posterBURL = medium(2)
+//    private static let posterCURL = medium(3)
+//    private static let backdropURL = wide(1)
+//    private static let backdropBURL = wide(2)
+//    private static let thumbURL = wide(3)
+//    private static let logoURL = wide(4)
+//    private static let castURL = medium(5)
+//    private static let castBURL = medium(6)
+//    private static let castCURL = medium(7)
+//    private static let musicURL = medium(8)
+    // Stable picsum seeds so ImageCache hits stay warm across launches.
+    private static let posterURL = URL(string: "https://picsum.photos/seed/rivulet-poster/600/900")!
+    private static let posterBURL = URL(string: "https://picsum.photos/seed/rivulet-poster-b/600/900")!
+    private static let posterCURL = URL(string: "https://picsum.photos/seed/rivulet-poster-c/600/900")!
+    private static let backdropURL = URL(string: "https://picsum.photos/seed/rivulet-backdrop/1280/720")!
+    private static let backdropBURL = URL(string: "https://picsum.photos/seed/rivulet-backdrop-b/1280/720")!
+    private static let thumbURL = URL(string: "https://picsum.photos/seed/rivulet-thumb/800/450")!
+    private static let logoURL = URL(string: "https://picsum.photos/seed/rivulet-logo/800/200")!
+    private static let castURL = URL(string: "https://picsum.photos/seed/rivulet-cast/400/400")!
+    private static let castBURL = URL(string: "https://picsum.photos/seed/rivulet-cast-b/400/400")!
+    private static let castCURL = URL(string: "https://picsum.photos/seed/rivulet-cast-c/400/400")!
+    private static let musicURL = URL(string: "https://picsum.photos/seed/rivulet-music/600/600")!
 
     // MARK: - Movies / music
 
@@ -365,3 +375,4 @@ private extension MediaItem {
     }
 }
 #endif
+
