@@ -559,6 +559,17 @@ final class PlexHomeViewController: UIViewController {
     /// The library hero defaults ON when the key has never been set (matches
     /// SettingsView's `@AppStorage("showLibraryHero") = true` default); an
     /// explicit user OFF is respected.
+    /// Empty-state copy for the current surface. Discover is fed by TMDB, so
+    /// telling the user their Plex library looks empty is simply wrong there.
+    private var emptyStateMessage: String {
+        switch mode {
+        case .discover:
+            return "Recommendations aren't available right now."
+        case .home, .library, .search:
+            return "Your Plex library appears to be empty."
+        }
+    }
+
     private var showHomeHero: Bool {
         switch mode {
         case .home:
@@ -1712,8 +1723,20 @@ final class PlexHomeViewController: UIViewController {
                 && gridItems.isEmpty
         case .discover:
             isLoadingHubs = isLoadingDiscover
+            // TMDBDiscoverService returns [] on failure rather than throwing, so
+            // there is no error to surface here and a total failure presents as
+            // empty. Giving Discover a real error state means teaching the
+            // service to report one.
             hubsError = nil
+            // Empty means NOTHING to show, not "no hero". The hero picks and the
+            // curated lists come from INDEPENDENT TMDB fetches, so a hero-only
+            // failure used to hide fully-populated rows behind the empty state.
+            // That branch sets `collectionView.isHidden = true`, which left the
+            // Refresh button as the only focusable thing on the page — nothing
+            // below it, so Down did nothing.
             hubsEmpty = discoverModel.heroItems.isEmpty
+                && discoverModel.forYou.isEmpty
+                && TMDBDiscoverSection.allCases.allSatisfy { discoverModel.items(for: $0).isEmpty }
                 && TMDBDiscoverSection.allCases.allSatisfy { discoverModel.items(for: $0).isEmpty }
         case .search:
             // Search renders its own inline prompt/searching/error states as
@@ -1755,7 +1778,7 @@ final class PlexHomeViewController: UIViewController {
             stateViewHasFocusableAction = true
             setNeedsFocusUpdate()
         } else if hubsEmpty {
-            stateView.configure(kind: .empty)
+            stateView.configure(kind: .empty(message: emptyStateMessage))
             stateView.isHidden = false
             collectionView.isHidden = true
             backdropView.isHidden = true
@@ -2591,23 +2614,11 @@ final class PlexHomeViewController: UIViewController {
         updateAmbientIfNeeded()
         // Cold launch: the hero cell materializes only after this apply's
         // layout pass — re-assert the launch focus once it exists.
-        let itemCount = snapshot.numberOfItems
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.nudgeInitialHeroFocusIfNeeded()
-            // Soft restart: once the rebuilt home has real content painted and
-            // has re-landed hero focus, tell the coordinator to lift the cover.
-            // Fires once; a no-op outside a restart.
-            if !self.didSignalSoftRestartPaint, case .home = self.mode, itemCount > 1 {
-                self.didSignalSoftRestartPaint = true
-                AppRestartCoordinator.shared.notifyHomePainted()
-            }
         }
     }
-
-    /// One-shot guard so the soft-restart "home painted" signal fires only on the
-    /// first content paint of a freshly-built home.
-    private var didSignalSoftRestartPaint = false
 
     // MARK: - Shelf rows (Continue Watching / Recently Added / Recommendations / Watchlist)
 
