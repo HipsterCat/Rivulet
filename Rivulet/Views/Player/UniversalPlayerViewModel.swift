@@ -25,7 +25,6 @@ enum PostVideoState: Equatable {
     case hidden
     case loading
     case showingEpisodeSummary
-    case showingMovieSummary
 }
 
 /// Video frame state for shrink animation
@@ -226,8 +225,11 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var requestedInsightKeys: Set<String> = []
     /// Cancels the mid-playback trivia re-check on item swaps or player teardown.
     private var insightsRecheckTask: Task<Void, Never>?
-    @Published private(set) var recommendations: [PlexMetadata] = []
     @Published var countdownSeconds: Int = 0
+
+    /// What `countdownSeconds` started at. The one resolved copy of the
+    /// autoplay setting — read it, don't re-derive it from UserDefaults.
+    @Published private(set) var countdownTotalSeconds: Int = 0
     @Published var isCountdownPaused: Bool = false
     private var countdownTimer: Timer?
     @Published var scrubThumbnail: UIImage?
@@ -352,6 +354,38 @@ final class UniversalPlayerViewModel: ObservableObject {
     // MARK: - Private State
 
     private var cancellables = Set<AnyCancellable>()
+
+    /// Subscriptions on the AetherPlayer, kept apart from `cancellables` so a
+    /// re-bind can drop the previous set. `startWithFallback` REUSES one
+    /// AetherPlayer across episodes and calls `bindAetherPublishers` again for
+    /// each, so without this every swap added a second copy of all fourteen
+    /// sinks: N episodes in, one engine tick ran `checkMarkers` N times.
+    private var aetherCancellables = Set<AnyCancellable>()
+
+    /// True from the moment `playNextEpisode()` commits to the next item until
+    /// its playback has actually started. A terminal `.ended` that lands in
+    /// this window belongs to the OUTGOING episode: nothing pauses the old
+    /// stream while the swap's awaits run, and the reused player's
+    /// `stateSubject` is a CurrentValueSubject, so the re-bind in
+    /// `startWithFallback` replays whatever it last held. Either one would run
+    /// the end-of-playback funnel against the INCOMING episode — marking it
+    /// watched and opening Up Next for the episode after it, which is the
+    /// double-autoplay users see. `hasTriggeredPostVideo` already holds the
+    /// marker path shut across the same window; this is its `.ended` twin.
+    ///
+    /// It only suppresses engine events as EVIDENCE (see
+    /// `currentItemHasStarted`) — the end funnel keys off that, not off this
+    /// window, so a stale `.ended` delivered a turn late (Combine's
+    /// `receive(on:)` re-dispatches even when already on main) is still
+    /// rejected after the window closes.
+    private var isSwappingItem = false
+
+    /// Whether the item now loaded has actually begun playing. An item cannot
+    /// end before it starts, so this is what makes the end-of-playback funnel
+    /// safe: a terminal `.ended` is only ever acted on for an item observed
+    /// playing since the last swap. Cleared with `itemGeneration`, set on the
+    /// first `.playing` that isn't a stale replay from the outgoing item.
+    private var currentItemHasStarted = false
     private var controlsTimer: Timer?
     private let controlsHideDelay: TimeInterval = 5
     private var scrubTimer: Timer?
@@ -421,6 +455,15 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var plexSessionId: String?
     /// Playback startup/fallback plan for Rivulet direct-play-first policy.
     private var playbackPlan: PlaybackPlan?
+    /// The route actually serving playback right now.
+    ///
+    /// Starts as the plan's primary and flips in `attemptRivuletHLSFallback`
+    /// when the server transcode takes over. `playbackPlan` is written once per
+    /// startup and never rewritten, so reading `.primary` for this describes
+    /// what was planned rather than what is playing: after an Aether startup
+    /// failure it reported `aether` for a session running on HLS, which put
+    /// every rescued session under the route it failed to use.
+    private var activeRoute: PlaybackRoute?
     /// Optional prebuilt HLS fallback URL/headers to reduce fallback startup latency.
     private var rivuletFallbackURL: URL?
     private var rivuletFallbackHeaders: [String: String] = [:]
@@ -571,6 +614,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         streamURL = nil
         streamHeaders = [:]
         playbackPlan = nil
+        activeRoute = nil
         rivuletFallbackURL = nil
         rivuletFallbackHeaders = [:]
     }
@@ -696,6 +740,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         )
         let plan = ContentRouter.plan(for: routingContext)
         playbackPlan = plan
+        activeRoute = plan.primary
         rivuletFallbackURL = nil
         rivuletFallbackHeaders = [:]
         // Tag the chosen route for App Hang triage (RIVULET-41).
@@ -844,7 +889,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// (engine cues on aether, /library/streams sidecars on hls) and are never
     /// burned in.
     var streamingModeInfo: StreamingModeInfo {
-        if case .aether = playbackPlan?.primary {
+        if case .aether = activeRoute {
             let audioCodec = metadata.Media?.first?.Part?.first?
                 .Stream?.first(where: { $0.isAudio })?.codec
                 ?? metadata.Media?.first?.audioCodec
@@ -966,7 +1011,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                         self.diagnostics.recordPrimaryFailure(
                             itemError,
                             kind: self.classifyDirectPlayFailure(PlayerError.loadFailed(message)),
-                            route: self.playbackPlan?.primary.description.lowercased() ?? "unknown"
+                            route: self.activeRoute?.description.lowercased() ?? "unknown"
                         )
                         if self.shouldAttemptRivuletFallbackOnItemFailure() {
                             let failureKind = self.classifyDirectPlayFailure(PlayerError.loadFailed(message))
@@ -1062,6 +1107,11 @@ final class UniversalPlayerViewModel: ObservableObject {
         isBuffering = state == .buffering
 
         if state == .playing {
+            // Not while swapping: the reused player's CurrentValueSubject
+            // replays the OUTGOING episode's `.playing` into the re-bind, and
+            // taking that as "the new item started" would re-arm the funnel for
+            // the old stream's EOF.
+            if !isSwappingItem { currentItemHasStarted = true }
             startControlsHideTimer()
             UIApplication.shared.isIdleTimerDisabled = true
             cancelPausedPosterTimer()
@@ -1081,7 +1131,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             }
         }
 
-        if state == .ended {
+        if state == .ended, currentItemHasStarted {
             Task { await finishPlayback() }
         }
     }
@@ -1111,7 +1161,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             "stall_seconds": stallSeconds,
             "position_seconds": currentTime,
             "resolved_to": next.appHangLabel,
-            "route": playbackPlan?.primary.description.lowercased() ?? "unknown"
+            "route": activeRoute?.description.lowercased() ?? "unknown"
         ]
         SentryBridge.addBreadcrumb(crumb)
     }
@@ -1335,6 +1385,10 @@ final class UniversalPlayerViewModel: ObservableObject {
                 return .demuxInit
             case .unknown:
                 return .unknown
+            case .engineFailure(let kind, _):
+                // The engine already classified this. Everything below is the
+                // guess we make when nobody did.
+                return DirectPlayFailureKind(engineKind: kind)
             }
         }
 
@@ -1506,7 +1560,13 @@ final class UniversalPlayerViewModel: ObservableObject {
                 // classified and then discarded, so if the HLS fallback ALSO
                 // failed we reported the fallback's error and destroyed the only
                 // evidence of why direct play died in the first place.
-                diagnostics.recordPrimaryFailure(error, kind: kind, route: "aether")
+                diagnostics.recordPrimaryFailure(
+                    error,
+                    kind: kind,
+                    route: "aether",
+                    engineKind: (error as? PlayerError)?.engineKind,
+                    engineUnderlying: aetherPlayer?.lastEngineErrorUnderlying
+                )
                 // RIVULET-19 diagnostics. Fire-and-forget, deliberately NOT
                 // awaited: the user's recovery is the HLS fallback below and
                 // nothing may delay it. See `probeStreamBodyForDiagnostics`.
@@ -1708,6 +1768,9 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// engine. Called whenever a fresh AetherPlayer is created in
     /// startWithFallback.
     private func bindAetherPublishers(_ player: AetherPlayer) {
+        // Same instance on a next-episode swap, so drop the previous bind
+        // before adding this one.
+        aetherCancellables.removeAll()
         player.playbackStatePublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
@@ -1736,7 +1799,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                     Task { await self.loadUpNextEpisodes() }
                 }
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         // Ids are monotonic per engine instance, so a fresh player starts over.
         seekHold = SeekHoldLogic()
@@ -1748,7 +1811,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                     self.currentTime = time
                 }
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.timePublisher
             .receive(on: DispatchQueue.main)
@@ -1770,21 +1833,21 @@ final class UniversalPlayerViewModel: ObservableObject {
                 self.tickReplayWindow(at: time)
                 self.applyContentFilter(at: time)
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.durationPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] dur in
                 if dur > 0 { self?.duration = dur }
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.errorPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] err in
                 self?.errorMessage = err.userFacingDescription
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         // Subtitle overlay feed: Aether decodes cues (text and PGS/DVB
         // bitmap) and publishes them; the host renders via
@@ -1795,7 +1858,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             .sink { [weak self] cues in
                 self?.aetherSubtitleModel.update(cues: cues)
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         // Mirrored onto the view model because AetherPlayer is not an
         // ObservableObject: a SwiftUI view reading `aetherPlayer.videoSize`
@@ -1807,14 +1870,14 @@ final class UniversalPlayerViewModel: ObservableObject {
             .sink { [weak self] size in
                 self?.videoSize = size
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.$sourceTime
             .receive(on: DispatchQueue.main)
             .sink { [weak self] t in
                 self?.aetherSubtitleModel.sourceTime = t
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         // Up Next early resolve. The playhead must know the next episode
         // BEFORE the credits marker so the overlay can present without a
@@ -1826,7 +1889,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 guard let self, avp != nil else { return }  // hls route (AVPlayer-backed) only
                 Task { await self.resolveNextEpisodeEarlyIfNeeded() }
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         // Engine track lists. Both funnel through updateTrackLists(), which
         // merges them with Plex's streams into ONE list per type (engine index
@@ -1838,7 +1901,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 guard let self, !tracks.isEmpty else { return }
                 self.updateTrackLists()
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.$subtitleTracks
             .receive(on: DispatchQueue.main)
@@ -1846,7 +1909,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 guard let self, !tracks.isEmpty else { return }
                 self.updateTrackLists()
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.$activeAudioTrackId
             .receive(on: DispatchQueue.main)
@@ -1854,7 +1917,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 guard let self, let id else { return }
                 self.currentAudioTrackId = id
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.$activeSubtitleTrackId
             .receive(on: DispatchQueue.main)
@@ -1872,7 +1935,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 // the engine's active index needs no translation.
                 self.currentSubtitleTrackId = id
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
 
         player.$isBuffering
             .receive(on: DispatchQueue.main)
@@ -1880,7 +1943,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 guard let self, let player else { return }
                 self.handleAetherBufferingChanged(buffering, player: player)
             }
-            .store(in: &cancellables)
+            .store(in: &aetherCancellables)
     }
 
     // MARK: - HLS Manifest Debugging
@@ -2335,6 +2398,11 @@ final class UniversalPlayerViewModel: ObservableObject {
         streamURL = fallback.url
         streamHeaders = fallback.headers
         plexSessionId = fallback.sessionId
+        // The Aether session is torn down above, so this is the point the
+        // session stops being the planned route. Tag it before the preflight:
+        // a fallback that dies in preflight still died on HLS.
+        activeRoute = .hls(url: fallback.url, headers: fallback.headers)
+        AppHangContext.setPlaybackRoute(activeRoute?.description)
 
         diagnostics.step("hls_fallback_preflight", detail: "reason=\(reason) kind=\(failureKind.rawValue)")
         let transcodeReady = await waitForHLSTranscodeReady(url: fallback.url, headers: fallback.headers)
@@ -4198,6 +4266,11 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     func handlePlaybackEnded() async {
         let isEpisode = metadata.type == "episode"
+        // This funnel ends ONE item, and it awaits twice before it commits any
+        // state. A swap landing in either gap would otherwise write the
+        // outgoing episode's ending onto the incoming one — mark it watched at
+        // ~0s and open Up Next for the episode after it.
+        let generation = itemGeneration
 
         // Don't re-enter if already showing post-video
         guard postVideoState == .hidden else { return }
@@ -4206,6 +4279,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         // This runs exactly once whether the custom overlay or the native
         // card drives Up Next.
         await markCurrentAsWatched()
+        guard generation == itemGeneration else { return }
 
         postVideoState = .loading
 
@@ -4226,7 +4300,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
 
         // Fetch next episode
-        nextEpisode = await fetchNextEpisode()
+        let resolvedNext = await fetchNextEpisode()
+        guard generation == itemGeneration else { return }
+        nextEpisode = resolvedNext
 
         // No next episode: Skip PostVideo - just let the video play through
         guard nextEpisode != nil else {
@@ -4241,6 +4317,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
         // Show episode summary after brief delay
         try? await Task.sleep(nanoseconds: 200_000_000)  // 0.2s
+        guard generation == itemGeneration else { return }
         postVideoState = .showingEpisodeSummary
 
         // Start countdown and preload
@@ -4662,26 +4739,6 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
-    /// Fetch recommendations for movies
-    func fetchRecommendations() async -> [PlexMetadata] {
-        guard let ratingKey = metadata.ratingKey else { return [] }
-
-        let networkManager = PlexNetworkManager.shared
-
-        do {
-            let related = try await networkManager.getRelatedItems(
-                serverURL: serverURL,
-                authToken: authToken,
-                ratingKey: ratingKey,
-                limit: 10
-            )
-            return related
-        } catch {
-            print("🎬 [PostVideo] Failed to fetch recommendations: \(error)")
-            return []
-        }
-    }
-
     /// Start autoplay countdown timer
     func startAutoplayCountdown() {
         // Default to 5 seconds if not set (key doesn't exist)
@@ -4699,6 +4756,12 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
 
         countdownSeconds = countdownSetting
+        // The ring draws remaining/total, so it needs the RESOLVED setting.
+        // Re-reading the raw default at the ring is what broke it:
+        // `integer(forKey:)` answers 0 for a key nobody has written, and
+        // nothing writes this one until the user visits the picker — so on a
+        // default install the arc trimmed to zero and never moved.
+        countdownTotalSeconds = countdownSetting
         isCountdownPaused = false
 
         countdownTimer?.invalidate()
@@ -4795,6 +4858,11 @@ final class UniversalPlayerViewModel: ObservableObject {
     func playNextEpisode() async {
         guard let next = nextEpisode else { return }
 
+        // Everything below runs while the OUTGOING episode is still playing.
+        // See `isSwappingItem`.
+        isSwappingItem = true
+        defer { isSwappingItem = false }
+
         // Mark current episode as watched BEFORE switching to next
         await markCurrentAsWatched()
 
@@ -4816,6 +4884,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         // signal), so bump this explicitly for anything that caches
         // per-item state and needs to reset across the swap.
         itemGeneration += 1
+        // Nothing has played on the new item yet, so nothing can have ended.
+        currentItemHasStarted = false
         // Clear stale Up Next rows from the outgoing episode's season; the
         // resolve-early hook repopulates them for the new episode.
         upNextEpisodes = []
@@ -4902,7 +4972,6 @@ final class UniversalPlayerViewModel: ObservableObject {
         postVideoState = .hidden
         videoFrameState = .fullscreen
         nextEpisode = nil
-        recommendations = []
         countdownSeconds = 0
         isCountdownPaused = false
         // Don't reset hasTriggeredPostVideo here - prevents immediate re-trigger
