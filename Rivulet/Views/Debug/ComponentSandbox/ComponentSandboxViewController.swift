@@ -183,7 +183,7 @@ final class ComponentSandboxViewController: UIViewController {
         collectionView.register(SandboxTriggersCell.self, forCellWithReuseIdentifier: SandboxTriggersCell.reuseID)
         collectionView.register(SandboxBannerCell.self, forCellWithReuseIdentifier: SandboxBannerCell.reuseID)
         collectionView.register(SandboxHomeStateCell.self, forCellWithReuseIdentifier: SandboxHomeStateCell.reuseID)
-        collectionView.register(SearchPromptCell.self, forCellWithReuseIdentifier: SearchPromptCell.reuseID)
+        collectionView.register(SearchRecentsCell.self, forCellWithReuseIdentifier: SearchRecentsCell.reuseID)
         collectionView.register(SearchStateCell.self, forCellWithReuseIdentifier: SearchStateCell.reuseID)
         collectionView.register(SandboxSkipPillsCell.self, forCellWithReuseIdentifier: SandboxSkipPillsCell.reuseID)
         collectionView.register(SandboxCountdownCell.self, forCellWithReuseIdentifier: SandboxCountdownCell.reuseID)
@@ -368,8 +368,8 @@ final class ComponentSandboxViewController: UIViewController {
 
             case .searchPrompt:
                 let cell = collectionView.dequeueReusableCell(
-                    withReuseIdentifier: SearchPromptCell.reuseID, for: indexPath) as! SearchPromptCell
-                cell.configure(recentSearches: ["Rivulet", "Night Harbor", "Copper Sky"])
+                    withReuseIdentifier: SearchRecentsCell.reuseID, for: indexPath) as! SearchRecentsCell
+                cell.configure(recentItems: Array(self.posters.prefix(3)))
                 return cell
 
             case .searchState(let key):
@@ -573,7 +573,7 @@ final class ComponentSandboxViewController: UIViewController {
         case "notConnected": return .notConnected
         case "loading": return .loading
         case "error": return .error(message: "The sandbox server is unreachable.")
-        default: return .empty
+        default: return .empty(message: "Тут пока пусто.")
         }
     }
 

@@ -346,6 +346,9 @@ final class HeroOverlayView: UIView {
             let watchType: PlexWatchlistItem.WatchlistType = (resolved.type == "show") ? .show : .movie
             let posterURL: URL? = {
                 guard let thumbPath = resolved.thumb, !thumbPath.isEmpty else { return nil }
+                if thumbPath.hasPrefix("http://") || thumbPath.hasPrefix("https://") {
+                    return URL(string: thumbPath)
+                }
                 return URL(string: "\(serverURL)\(thumbPath)?X-Plex-Token=\(authToken)")
             }()
             let watchlistItem = PlexWatchlistItem(

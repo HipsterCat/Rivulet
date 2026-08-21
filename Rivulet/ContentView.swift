@@ -95,7 +95,13 @@ struct ContentView: View {
             #if DEBUG
             // Seed Home / Libraries before the first paint settles on
             // "Not Connected". No env var needed — scheme sets RIVULET_DEMO=1.
-            DemoContentSeeder.install()
+            // kino.pub look-and-feel demo takes precedence over the canned
+            // English rails when it is on; otherwise nothing changes.
+            if KinoPubDemo.isEnabled {
+                KinoPubDemo.install()
+            } else {
+                DemoContentSeeder.install()
+            }
             #endif
 
             splashLog.info("Splash task started — hasCredentials=\(self.authManager.hasCredentials)")

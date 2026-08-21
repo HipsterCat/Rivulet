@@ -450,8 +450,7 @@ final class PosterCell: UICollectionViewCell {
         } else {
             path = item.thumb
         }
-        guard let path else { return nil }
-        return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(token)")
+        return PlexMediaMapper.artworkURL(path, serverURL: serverURL, authToken: token)
     }
 
     // MARK: - In-progress bar (CW-style)

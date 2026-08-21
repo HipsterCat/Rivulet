@@ -169,8 +169,7 @@ final class HeroSlideView: UIView {
         // fade-in on it so the slide never flashes the fallback text and then
         // jumps to the logo mid-fade.
         let logoURL: URL? = {
-            guard let path = item.clearLogoPath else { return nil }
-            return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(authToken)")
+            PlexMediaMapper.artworkURL(item.clearLogoPath, serverURL: serverURL, authToken: authToken)
         }()
         loadLogo(from: logoURL, fallbackTitle: item.seriesTitleForDisplay ?? item.title ?? "",
                  animated: animated, completion: onReady)

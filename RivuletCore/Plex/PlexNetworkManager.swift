@@ -408,6 +408,11 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         type: Int? = nil,
         includeGuids: Bool = false
     ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
+        #if DEBUG
+        if KinoPubDemo.isActive {
+            return KinoPubDemoPlexFixtures.sectionItems(sectionId: sectionId, start: start, size: size)
+        }
+        #endif
         guard var components = URLComponents(string: "\(serverURL)/library/sections/\(sectionId)/all") else {
             throw PlexAPIError.invalidURL
         }
@@ -487,6 +492,14 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         authToken: String,
         ratingKey: String
     ) async throws -> PlexMetadata {
+        #if DEBUG
+        if KinoPubDemo.isActive {
+            guard let raw = KinoPubDemoCatalog.shared.item(id: ratingKey) else {
+                throw PlexAPIError.invalidURL
+            }
+            return KinoPubDemoPlexFixtures.metadata(raw)
+        }
+        #endif
         guard var components = URLComponents(string: "\(serverURL)/library/metadata/\(ratingKey)") else {
             throw PlexAPIError.invalidURL
         }
@@ -874,6 +887,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
     /// Returns Continue Watching, Recently Added, Recently Released, etc. for that library
     /// - Parameter count: Number of items per hub (default 24, Plex defaults to ~6)
     func getLibraryHubs(serverURL: String, authToken: String, sectionId: String, userId: Int? = nil, count: Int = 24) async throws -> [PlexHub] {
+        #if DEBUG
+        if KinoPubDemo.isActive { return KinoPubDemoPlexFixtures.libraryHubs(sectionId: sectionId, count: count) }
+        #endif
         guard var components = URLComponents(string: "\(serverURL)/hubs/sections/\(sectionId)") else {
             throw PlexAPIError.invalidURL
         }
@@ -909,6 +925,11 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         start: Int = 0,
         count: Int = 24
     ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
+        #if DEBUG
+        if KinoPubDemo.isActive {
+            return KinoPubDemoPlexFixtures.hubItems(hubKey: hubKey, start: start, count: count)
+        }
+        #endif
         // The hubKey might be a full path like "/hubs/sections/1/continueWatching"
         // or just the section like "hub.movies.recentlyadded"
         let fullPath: String
@@ -1966,6 +1987,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         start: Int = 0,
         size: Int = 60
     ) async throws -> [PlexMetadata] {
+        #if DEBUG
+        if KinoPubDemo.isActive { return KinoPubDemoPlexFixtures.search(query, limit: size) }
+        #endif
         var urlString = "\(serverURL)/search"
         if let section = sectionId {
             urlString = "\(serverURL)/library/sections/\(section)/search"

@@ -253,7 +253,7 @@ final class ContinueWatchingCell: UICollectionViewCell {
             path = item.art ?? item.thumb
         }
         guard let path else { return nil }
-        return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(token)")
+        return PlexMediaMapper.artworkURL(path, serverURL: serverURL, authToken: token)
     }
 
     /// PlexMetadata failure icon: "film" for movies, "play.rectangle" otherwise.

@@ -141,15 +141,13 @@ extension PlexMetadata {
         let thumbnailPath = thumb ?? bestThumb
         let logoPath = logoPathOverride ?? clearLogoPath
 
-        let backdropURL = backdropPath.flatMap {
-            URL(string: "\(serverURL)\($0)?X-Plex-Token=\(authToken)")
-        }
-        let thumbnailURL = thumbnailPath.flatMap {
-            URL(string: "\(serverURL)\($0)?X-Plex-Token=\(authToken)")
-        }
-        let logoURL = logoPath.flatMap {
-            URL(string: "\(serverURL)\($0)?X-Plex-Token=\(authToken)")
-        }
+        // Through the mapper, which knows Plex mixes absolute (CDN) and
+        // relative (server-path) artwork in one response. Concatenating the
+        // server onto an absolute URL yields "https://serverhttps://cdn…" and
+        // the hero silently stays black.
+        let backdropURL = PlexMediaMapper.artworkURL(backdropPath, serverURL: serverURL, authToken: authToken)
+        let thumbnailURL = PlexMediaMapper.artworkURL(thumbnailPath, serverURL: serverURL, authToken: authToken)
+        let logoURL = PlexMediaMapper.artworkURL(logoPath, serverURL: serverURL, authToken: authToken)
 
         return HeroBackdropRequest(
             cacheKey: ratingKey ?? "\(type ?? "item"):\(title ?? "unknown")",

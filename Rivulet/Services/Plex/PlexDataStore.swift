@@ -1590,14 +1590,20 @@ class PlexDataStore: ObservableObject {
     // MARK: - Off-main fetch helpers
 
     private func fetchHubsOffMain(serverURL: String, token: String, userId: Int?) async throws -> [PlexHub] {
-        try await Task.detached(priority: .userInitiated) {
+        #if DEBUG
+        if KinoPubDemo.isEnabled { return KinoPubDemoPlexFixtures.hubs() }
+        #endif
+        return try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try await PlexNetworkManager.shared.getHubs(serverURL: serverURL, authToken: token, userId: userId)
         }.value
     }
 
     private func fetchContinueWatchingOffMain(serverURL: String, token: String, userId: Int?) async throws -> PlexHub? {
-        try await Task.detached(priority: .userInitiated) {
+        #if DEBUG
+        if KinoPubDemo.isEnabled { return KinoPubDemoPlexFixtures.continueWatchingHub() }
+        #endif
+        return try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try await PlexNetworkManager.shared.getContinueWatching(serverURL: serverURL, authToken: token, userId: userId)
         }.value
@@ -1613,7 +1619,10 @@ class PlexDataStore: ObservableObject {
     }
 
     private func fetchLibrariesOffMain(serverURL: String, token: String, userId: Int?) async throws -> [PlexLibrary] {
-        try await Task.detached(priority: .userInitiated) {
+        #if DEBUG
+        if KinoPubDemo.isEnabled { return KinoPubDemoPlexFixtures.libraries() }
+        #endif
+        return try await Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try await PlexNetworkManager.shared.getLibraries(serverURL: serverURL, authToken: token, userId: userId)
         }.value
@@ -1822,6 +1831,12 @@ class PlexDataStore: ObservableObject {
         }
 
         guard let thumbPath = thumb else { return nil }
+        // Plex mixes absolute (CDN) and relative (server-path) thumbs in the
+        // same response — the same guard `PlexMediaMapper.artworkURL` carries.
+        // Without it an absolute URL comes back as "https://serverhttps://cdn…".
+        if thumbPath.hasPrefix("http://") || thumbPath.hasPrefix("https://") {
+            return URL(string: thumbPath)
+        }
         var urlString = "\(serverURL)\(thumbPath)"
         if !urlString.contains("X-Plex-Token") {
             urlString += urlString.contains("?") ? "&" : "?"
