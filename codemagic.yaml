@@ -60,17 +60,6 @@ workflows:
       - name: Apply fetched signing profiles to Xcode project
         script: xcode-project use-profiles
 
-      - name: Generate Secrets.swift from env
-        script: |
-          cat > RivuletCore/Config/Secrets.swift <<EOF
-          import Foundation
-
-          enum Secrets {
-              static let sentryDSN = "${SENTRY_DSN:-}"
-          }
-          EOF
-          echo "Wrote RivuletCore/Config/Secrets.swift (dsn set: $([ -n "${SENTRY_DSN:-}" ] && echo yes || echo no))"
-
       - name: Set build number from the tag
         script: |
           # The tag is the source of truth, not App Store Connect's counter.
@@ -114,6 +103,7 @@ workflows:
             --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME" \
             --config Release \
+            --archive-xcargs "RIVULET_SENTRY_DSN=${SENTRY_DSN:-}" \
             --archive-flags="-destination 'generic/platform=tvOS'"
 
       - name: Upload dSYMs to Sentry
@@ -228,18 +218,6 @@ workflows:
       - name: Apply fetched signing profiles to Xcode project
         script: xcode-project use-profiles
 
-      - name: Generate Secrets.swift from env
-        script: |
-          mkdir -p RivuletCore/Config
-          cat > RivuletCore/Config/Secrets.swift <<EOF
-          import Foundation
-
-          enum Secrets {
-              static let sentryDSN = "${SENTRY_DSN:-}"
-          }
-          EOF
-          echo "Wrote RivuletCore/Config/Secrets.swift (dsn set: $([ -n "${SENTRY_DSN:-}" ] && echo yes || echo no))"
-
       - name: Set build number from the tag
         script: |
           # Tag shape is ios-vX.Y.Z-<build>, matching the tvOS rule that the tag
@@ -270,6 +248,7 @@ workflows:
             --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME" \
             --config Release \
+            --archive-xcargs "RIVULET_SENTRY_DSN=${SENTRY_DSN:-}" \
             --archive-flags="-destination 'generic/platform=iOS'"
 
       # Without this the in-app frames on iOS crash and app-hang events resolve

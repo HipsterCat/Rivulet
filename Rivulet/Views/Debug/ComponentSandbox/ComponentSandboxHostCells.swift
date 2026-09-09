@@ -93,25 +93,56 @@ final class SandboxTriggersCell: UICollectionViewCell {
     }
 }
 
-// MARK: - Connection banner
+// MARK: - Connection alert (replaces the old inline banner)
 
 final class SandboxBannerCell: UICollectionViewCell {
     static let reuseID = "SandboxBannerCell"
 
-    private let banner = ConnectionErrorBannerView()
+    private let card = UIView()
+    private let titleLabel = UILabel()
+    private let messageLabel = UILabel()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        SandboxHostHelpers.pin(banner, to: contentView)
-        banner.setMessage("Showing cached content")
-        banner.onRetry = { /* sandbox no-op */ }
+
+        card.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        card.layer.cornerRadius = 16
+        card.layer.cornerCurve = .continuous
+
+        titleLabel.text = "Can't Reach Your Server"
+        titleLabel.font = .systemFont(ofSize: 28, weight: .semibold)
+        titleLabel.textColor = .white
+
+        messageLabel.text = "Rivulet can't connect to your Plex server. Cached browsing still works — the live alert is modal now."
+        messageLabel.font = .systemFont(ofSize: 22, weight: .regular)
+        messageLabel.textColor = UIColor.white.withAlphaComponent(0.75)
+        messageLabel.numberOfLines = 0
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, messageLabel])
+        stack.axis = .vertical
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(stack)
+        card.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(card)
+
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            card.topAnchor.constraint(equalTo: contentView.topAnchor),
+            card.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -20)
+        ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
     override var canBecomeFocused: Bool { false }
-    override var preferredFocusEnvironments: [UIFocusEnvironment] { [banner] }
 }
 
 // MARK: - Home state
@@ -213,19 +244,13 @@ final class SandboxCountdownCell: UICollectionViewCell {
     private var remainingSeconds = 10
     private var isPaused = false
     private var timer: Timer?
-    private var host: UIHostingController<CountdownRing>?
+    private let ring = CountdownRingView()
     private let controls = UIStackView()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
 
-        let hosting = UIHostingController(rootView: CountdownRing(
-            totalSeconds: totalSeconds,
-            remainingSeconds: remainingSeconds,
-            isPaused: isPaused
-        ))
-        hosting.view.backgroundColor = .clear
-        host = hosting
+        ring.translatesAutoresizingMaskIntoConstraints = false
 
         controls.axis = .horizontal
         controls.spacing = 16
@@ -241,7 +266,7 @@ final class SandboxCountdownCell: UICollectionViewCell {
         controls.addArrangedSubview(restartButton)
         controls.addArrangedSubview(pauseButton)
 
-        let root = UIStackView(arrangedSubviews: [hosting.view, controls])
+        let root = UIStackView(arrangedSubviews: [ring, controls])
         root.axis = .horizontal
         root.spacing = 40
         root.alignment = .center
@@ -289,9 +314,9 @@ final class SandboxCountdownCell: UICollectionViewCell {
     }
 
     private func refreshRing() {
-        host?.rootView = CountdownRing(
-            totalSeconds: totalSeconds,
-            remainingSeconds: remainingSeconds,
+        ring.update(
+            remaining: remainingSeconds,
+            total: totalSeconds,
             isPaused: isPaused
         )
     }

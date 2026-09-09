@@ -1195,7 +1195,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             "container": metadata.Media?.first?.container ?? "unknown",
             "allow_audio_direct_stream": allowAudioDirectStreamDecision(reason: "selection_breadcrumb")
         ]
-        SentrySDK.addBreadcrumb(breadcrumb)
+        SentryBridge.addBreadcrumb(breadcrumb)
     }
 
     // MARK: - Playback Controls

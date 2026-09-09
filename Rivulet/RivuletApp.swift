@@ -83,11 +83,11 @@ struct RivuletApp: App {
         // window is clean. Trade-off: a crash in the first ~3s is not captured
         // (rare; acceptable given the launch-perf + log-noise win).
         Task.detached(priority: .utility) {
-            // No DSN configured (Secrets.swift is local-only) — skip Sentry
-            // entirely rather than initializing a dead SDK. SentryBridge stays
-            // inactive so breadcrumb/capture calls no-op instead of spamming
-            // "SDK is disabled" fatals.
-            guard !Secrets.sentryDSN.isEmpty else { return }
+            // No DSN baked into the release build — skip Sentry entirely rather
+            // than initializing a dead SDK. SentryBridge stays inactive so
+            // breadcrumb/capture calls no-op instead of spamming "SDK is
+            // disabled" fatals.
+            guard SentryConfig.isEnabled else { return }
             try? await Task.sleep(for: .seconds(3))
             await Self.startSentry()
         }

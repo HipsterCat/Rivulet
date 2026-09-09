@@ -270,7 +270,8 @@ private struct ChannelCardButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.15), value: isFocused)
     }
 }
-
+// STEAL: Empty View
+// NEED: Show list states when its not empty
 #Preview {
     ChannelListView()
 }

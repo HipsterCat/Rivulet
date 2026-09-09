@@ -526,3 +526,56 @@ final class HeroPagingDotsView: UIView {
         }
     }
 }
+
+// STEAL: TOP 2 buttons, nice variant to see face-to-face closer to top 1 style. maybe logic is better in some case
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Play pill") {
+    HeroControlPreview {
+        let pill = HeroPillButton()
+        pill.title = "Play"
+        pill.iconImage = UIImage(systemName: "play.fill")
+        return pill
+    }
+}
+
+#Preview("Circle button") {
+    HeroControlPreview {
+        let circle = HeroCircleButton()
+        circle.setImage(UIImage(systemName: "plus"), for: .normal)
+        return circle
+    }
+}
+
+#Preview("Hero button row") {
+    HeroControlPreview {
+        let row = HeroButtonRowView()
+        row.primaryAction = .play
+        row.canAdvance = true
+        return row
+    }
+}
+
+private struct HeroControlPreview<Control: UIView>: UIViewRepresentable {
+    let make: () -> Control
+
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .black
+        let control = make()
+        control.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(control)
+        NSLayoutConstraint.activate([
+            control.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 80),
+            control.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -48),
+            control.topAnchor.constraint(greaterThanOrEqualTo: box.topAnchor, constant: 40),
+            control.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -80)
+        ])
+        return box
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+#endif

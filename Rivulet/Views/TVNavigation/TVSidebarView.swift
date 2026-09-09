@@ -514,6 +514,10 @@ struct TVSidebarView: View {
                 LiveTVContainerView(sourceIdFilter: sourceId)
             case .settings:
                 settingsTabContent
+            case .detailTemplate:
+                Color.clear
+            case .components:
+                Color.clear
             }
         }
         .overlay {

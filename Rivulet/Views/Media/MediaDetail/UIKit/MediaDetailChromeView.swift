@@ -1191,3 +1191,35 @@ final class MediaDetailChromeView: UIView {
         return container
     }
 }
+// STEAL: ALMOST IDEAL button layout/look/style, apple-like. Info button, plus, checkmark - everything. Also take the entire info sheet from this place (the one opening on info)
+#if DEBUG
+import SwiftUI
+
+#Preview("Detail chrome") {
+    MediaDetailChromePreview(item: MockDetailFixtures.movie())
+}
+
+private struct MediaDetailChromePreview: UIViewRepresentable {
+    let item: MediaItem
+
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .black
+        let chrome = MediaDetailChromeView()
+        chrome.mode = .expandedDetail
+        chrome.item = item
+        chrome.chromeAlpha = 1
+        chrome.isUserInteractionEnabled = true
+        chrome.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(chrome)
+        NSLayoutConstraint.activate([
+            chrome.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 80),
+            chrome.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -80),
+            chrome.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -36)
+        ])
+        return box
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+#endif
