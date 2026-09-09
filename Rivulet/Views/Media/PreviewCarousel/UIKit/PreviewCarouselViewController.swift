@@ -337,7 +337,7 @@ final class PreviewCarouselViewController: UIViewController {
         expandedDetail.onPlayEpisode = { [weak self] episode in
             self?.playMediaItem(episode)
         }
-        // Trailer / extra Select → play that video (no resume). Routed on the
+        // Trailer / extra Select → play that video. Routed on the
         // extra's playbackKey, NOT its id: IVA extras have no library ratingKey.
         expandedDetail.onPlayTrailer = { [weak self] trailer in
             self?.presentExtraPlayer(trailer)
@@ -362,16 +362,22 @@ final class PreviewCarouselViewController: UIViewController {
             self?.presentStandaloneDetail(item)
         }
 
-        // Season pill Select → that season's own standalone page (full summary,
-        // only its episodes, its extras). Same-season guard: on a season's own
-        // page, re-selecting its pill must not stack a duplicate of the page it
-        // is already on. SIBLING seasons still open — presentStandaloneDetail
-        // walks to the topmost presented controller, so season-to-season hopping
-        // stacks naturally, and each hop keeps the focus-restore contract.
+        // Season pill Select → the season's own title-first detail page (the
+        // same page an episode's description opens), NOT another standalone
+        // carousel detail: that page re-hosted the pills over a one-season rail,
+        // so from there every season needed a click and each click stacked
+        // another carousel. Focus already switched the rail's season; the press
+        // opens the season's summary and info on top of the show.
         expandedDetail.onOpenSeason = { [weak self] season in
             guard let self else { return }
-            if self.standaloneDetail, self.items.first?.ref == season.ref { return }
-            self.presentStandaloneDetail(season)
+            let show = self.items.indices.contains(self.selectedIndex) ? self.items[self.selectedIndex] : nil
+            let page = MediaItemDetailPageViewController(
+                item: season,
+                seriesTitle: show?.kind == .show ? show?.title : nil,
+                // playHeroItem, not playMediaItem: a season key has no media, so
+                // Play must resolve to its first unplayed episode.
+                onPlay: { [weak self] season in self?.playHeroItem(season) })
+            self.present(page, animated: true)
         }
         // Cast / crew cell Select → person detail page (full-screen).
         expandedDetail.onSelectPerson = { [weak self] person in
@@ -1076,7 +1082,12 @@ final class PreviewCarouselViewController: UIViewController {
     }
 
     /// Resolve a Plex ratingKey → metadata → present the player. Used for the
-    /// hero/episode play AND trailer/extra playback (resumeOffset nil for those).
+    /// hero/episode play AND trailer/extra playback.
+    ///
+    /// A nil `resumeOffset` means "ask the server", not "start from zero": the
+    /// metadata we fetch here is the only place a library-addressable extra's
+    /// resume point appears (issue #303 — extras always restarted), and it is
+    /// also fresher than a MediaItem's cached userState.
     private func presentPlayer(ratingKey: String, resumeOffset: Double?) {
         Task { [weak self] in
             guard let serverURL = PlexAuthManager.shared.selectedServerURL,
@@ -1098,8 +1109,16 @@ final class PreviewCarouselViewController: UIViewController {
                     return
                 }
             }
+            // `viewOffset` is ms. Gated on the shared policy rather than
+            // `> 0` so a few accidental seconds don't become a resume point
+            // and a nearly-finished extra restarts instead of resuming at
+            // the credits.
+            let serverResume = playItem.isInProgress
+                ? playItem.viewOffset.map { Double($0) / 1000 }
+                : nil
             await MainActor.run {
-                self?.present(playItem: playItem, serverURL: serverURL, token: token, resumeOffset: resumeOffset)
+                self?.present(playItem: playItem, serverURL: serverURL, token: token,
+                              resumeOffset: resumeOffset ?? serverResume)
             }
         }
     }
@@ -1141,9 +1160,12 @@ final class PreviewCarouselViewController: UIViewController {
 
         switch route {
         case .libraryMetadata(let ratingKey):
+            // nil = resume from whatever the server has for this extra.
             presentPlayer(ratingKey: ratingKey, resumeOffset: nil)
 
         case .directPartPath(let path):
+            // IVA extras aren't library items, so /:/timeline never recorded a
+            // position for them — there is nothing to resume from.
             guard let serverURL = PlexAuthManager.shared.selectedServerURL,
                   let token = PlexAuthManager.shared.selectedServerToken else {
                 previewCarouselLog.error("[PCV] extra play: no server/token")
