@@ -360,3 +360,18 @@ private final class PillTabItemView: UIControl {
         }
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Pill tab bar") {
+    UIKitPreviewHost {
+        PillTabBarView(
+            titles: ["Top 10", "Cast", "Production", "Lore"],
+            selectedIndex: 0
+        )
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

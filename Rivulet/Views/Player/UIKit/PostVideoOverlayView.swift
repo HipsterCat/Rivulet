@@ -587,3 +587,19 @@ final class PostVideoButtonView: UIControl {
         super.pressesBegan(presses, with: event)
     }
 }
+
+// STEAL as variant of inevitable progress
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Countdown ring") {
+    UIKitPreviewHost {
+        let ring = CountdownRingView()
+        ring.update(remaining: 7, total: 10, isPaused: false)
+        return ring
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

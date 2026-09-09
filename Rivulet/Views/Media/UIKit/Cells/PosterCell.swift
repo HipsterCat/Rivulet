@@ -687,3 +687,48 @@ final class PosterWatchedBadge: UIView {
         }
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Poster unwatched") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: PosterCell) in
+        cell.configure(item: ComponentSandboxMocks.movieUnwatched())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Poster in progress") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: PosterCell) in
+        cell.configure(item: ComponentSandboxMocks.movieInProgress())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Poster watched") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: PosterCell) in
+        cell.configure(item: ComponentSandboxMocks.movieWatched())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Poster album") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.musicWidth, height: MediaRowMetrics.musicHeight) { (cell: PosterCell) in
+        cell.configure(item: ComponentSandboxMocks.musicAlbum())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Poster show") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: PosterCell) in
+        cell.configure(item: ComponentSandboxMocks.show())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+

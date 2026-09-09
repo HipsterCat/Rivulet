@@ -183,3 +183,23 @@ final class WatchlistPosterCell: UICollectionViewCell {
             .withConfiguration(UIImage.SymbolConfiguration(pointSize: 32, weight: .light))
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Watchlist movie") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: WatchlistPosterCell) in
+        cell.configure(item: ComponentSandboxMocks.movieUnwatched())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Watchlist show") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: WatchlistPosterCell) in
+        cell.configure(item: ComponentSandboxMocks.show())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

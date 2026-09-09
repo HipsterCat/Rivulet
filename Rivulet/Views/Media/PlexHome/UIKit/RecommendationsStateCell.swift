@@ -133,3 +133,25 @@ final class RecommendationsStateCell: UICollectionViewCell {
         onRetry?()
     }
 }
+
+    // LAZY STEAL probably its more native in some defaut variant
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Recommendations loading") {
+    UIKitCellPreviewHost(width: 1400, height: 72) { (cell: RecommendationsStateCell) in
+        cell.configure(state: .loading)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Recommendations error") {
+    UIKitCellPreviewHost(width: 1400, height: 72) { (cell: RecommendationsStateCell) in
+        cell.configure(state: .error(message: "Couldn't load recommendations."))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

@@ -242,3 +242,40 @@ final class WatchlistToastView: UIView {
 // The connection-error banner that used to live here is gone: it reserved
 // 120pt of the home's `contentInset.top`, so every row jumped down when the
 // connection check resolved. Offline is announced by `ConnectionAlert` now.
+// LAZY STEAL probably its more native in some defaut variant. skeletons when possible for content
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Home loading") {
+    UIKitCellPreviewHost(width: 520, height: 360) { (view: HomeStateView) in
+        view.configure(kind: .loading)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Home not connected") {
+    UIKitCellPreviewHost(width: 520, height: 360) { (view: HomeStateView) in
+        view.configure(kind: .notConnected)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Home empty") {
+    UIKitCellPreviewHost(width: 520, height: 360) { (view: HomeStateView) in
+        view.configure(kind: .empty(message: "Your libraries returned nothing. Try Refresh."))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Home error") {
+    UIKitCellPreviewHost(width: 520, height: 360) { (view: HomeStateView) in
+        view.configure(kind: .error(message: "The sandbox server is unreachable."))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

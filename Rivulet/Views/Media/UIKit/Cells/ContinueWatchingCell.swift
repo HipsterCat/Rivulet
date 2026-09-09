@@ -494,6 +494,28 @@ private final class ContinueWatchingTitleLogoView: UIView {
     }
 }
 
+// its maybe ok to STEAL thinking... it also has some additional image of title on top...
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Continue Watching movie") {
+    UIKitCellPreviewHost(width: 520, height: 292) { (cell: ContinueWatchingCell) in
+        cell.configure(item: ComponentSandboxMocks.movieInProgress())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Continue Watching episode") {
+    UIKitCellPreviewHost(width: 520, height: 292) { (cell: ContinueWatchingCell) in
+        cell.configure(item: ComponentSandboxMocks.episode(inProgress: true))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+
 // Info bar moved to `Rivulet/Views/Media/UIKit/Cells/MediaProgressInfoBar.swift`
 // for reuse by PosterCell (in-progress items in Recently Added /
 // Personalized Recommendations rows render the same composition).

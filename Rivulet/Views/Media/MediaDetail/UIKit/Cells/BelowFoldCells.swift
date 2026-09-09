@@ -436,3 +436,59 @@ private func pinFilling(_ inner: UIView, to container: UIView) {
         inner.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
     ])
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Related poster") {
+    UIKitCellPreviewHost(width: RelatedPosterCell.posterWidth, height: RelatedPosterCell.posterHeight) { (cell: RelatedPosterCell) in
+        cell.configure(item: ComponentSandboxMocks.movieUnwatched())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+/// STEAL YES seems like the right way to go
+
+#Preview("Episode collection") {
+    UIKitCellPreviewHost(width: EpisodeCell.cardWidth, height: 435) { (cell: EpisodeCollectionCell) in
+        cell.configure(episode: ComponentSandboxMocks.episode(inProgress: true), showSeasonPrefix: false)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Cast collection") {
+    UIKitCellPreviewHost(width: CastCell.circleSize + 56, height: 355) { (cell: CastCollectionCell) in
+        cell.configure(person: ComponentSandboxMocks.castRow()[0], fallbackSubtitle: nil)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Season pill collection") {
+    UIKitCellPreviewHost(width: 180, height: 64) { (cell: SeasonPillCollectionCell) in
+        cell.configure(label: "Season 1", isSelected: true)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Below-fold header") {
+    UIKitCellPreviewHost(width: 400, height: 40) { (header: BelowFoldSectionHeader) in
+        header.configure(title: "Episodes")
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+// Nice detail to STEAL
+
+#Preview("Season divider") {
+    UIKitCellPreviewHost(width: SeasonDividerCell.cardWidth, height: 435) { (cell: SeasonDividerCell) in
+        cell.configure(label: "S2")
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

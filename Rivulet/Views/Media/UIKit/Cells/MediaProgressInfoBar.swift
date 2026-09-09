@@ -302,3 +302,17 @@ final class WatchedGlyphView: UIImageView {
 
     required init?(coder: NSCoder) { fatalError() }
 }
+
+// yes very basic STEAL
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Progress info bar") {
+    UIKitCellPreviewHost(width: 480, height: 36) { (bar: MediaProgressInfoBar) in
+        bar.configure(item: ComponentSandboxMocks.movieInProgress())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

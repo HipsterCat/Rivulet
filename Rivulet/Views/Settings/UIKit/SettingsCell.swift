@@ -262,3 +262,23 @@ final class SettingsCell: UICollectionViewCell {
         contentView.layoutIfNeeded()
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Settings row") {
+    UIKitCellPreviewHost(width: 816, height: 64) { (cell: SettingsCell) in
+        cell.configure(title: "Appearance", value: "Dark", showsChevron: true, destructive: false)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Settings destructive") {
+    UIKitCellPreviewHost(width: 816, height: 64) { (cell: SettingsCell) in
+        cell.configure(title: "Sign Out", value: nil, showsChevron: false, destructive: true)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

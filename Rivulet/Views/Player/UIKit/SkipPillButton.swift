@@ -184,3 +184,30 @@ final class SkipPillButton: UIButton {
         }, completion: nil)
     }
 }
+
+
+// STEAL but we need to show progrresss animated
+#if DEBUG
+import SwiftUI
+
+#Preview("Skip Intro") {
+    UIKitPreviewHost {
+        let pill = SkipPillButton()
+        pill.setTitle("Skip Intro", for: .normal)
+        return pill
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Skip Credits") {
+    UIKitPreviewHost {
+        let pill = SkipPillButton()
+        pill.setTitle("Skip Credits", for: .normal)
+        return pill
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+

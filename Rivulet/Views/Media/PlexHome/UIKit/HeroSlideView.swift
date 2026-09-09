@@ -312,3 +312,17 @@ final class HeroRatingBadgeView: UIView {
 
     required init?(coder: NSCoder) { fatalError() }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Rating badge") {
+    UIKitPreviewHost {
+        let badge = HeroRatingBadgeView()
+        badge.text = "TV-14"
+        return badge
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

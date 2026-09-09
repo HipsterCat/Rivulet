@@ -43,3 +43,14 @@ final class HeroLoadingCell: UICollectionViewCell {
         if window != nil { spinner.startAnimating() } else { spinner.stopAnimating() }
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Hero loading") {
+    UIKitCellPreviewHost(width: 1600, height: 600, leading: 0, top: 0) { (_: HeroLoadingCell) in
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

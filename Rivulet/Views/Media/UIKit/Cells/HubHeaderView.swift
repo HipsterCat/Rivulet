@@ -88,3 +88,15 @@ final class HubHeaderView: UICollectionReusableView {
         countLabel.isHidden = true
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Continue Watching header") {
+    UIKitCellPreviewHost(width: 720, height: 48) { (header: HubHeaderView) in
+        header.configure(title: "Continue Watching", style: .swiftUIInfiniteRow)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
