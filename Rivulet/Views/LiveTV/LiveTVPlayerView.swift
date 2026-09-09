@@ -1268,7 +1268,7 @@ private struct PlayerButtonStyle: ButtonStyle {
             name: "Test Channel HD",
             callSign: "TEST",
             logoURL: nil,
-            streamURL: URL(string: "http://example.com/stream.m3u8")!,
+            streamURL: URL(string: "https://iptv.online/play/4E161A37C2BA7C2/m3u8")!,
             tvgId: nil,
             groupTitle: "Entertainment",
             isHD: true

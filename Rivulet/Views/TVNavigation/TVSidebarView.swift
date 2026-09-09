@@ -514,6 +514,12 @@ struct TVSidebarView: View {
                 LiveTVContainerView(sourceIdFilter: sourceId)
             case .settings:
                 settingsTabContent
+            #if DEBUG
+            case .components:
+                ComponentSandboxContainer()
+            #endif
+            case .detailTemplate:
+                MockDetailTemplateView()
             }
         }
         .overlay {
@@ -696,4 +702,3 @@ struct TVSidebarView: View {
         }
     }
 }
-
