@@ -922,8 +922,8 @@
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/superuser404notfound/AetherEngine";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 6.32.0;
+				kind = exactVersion;
+				version = 6.81.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

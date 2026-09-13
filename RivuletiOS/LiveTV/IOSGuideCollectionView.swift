@@ -130,16 +130,34 @@ struct IOSGuideCollectionView: UIViewRepresentable {
 
         func update(parent: IOSGuideCollectionView) {
             self.parent = parent
-            if parent.snapToken != lastSnapToken {
-                lastSnapToken = parent.snapToken
-                resetWindow()
-                return
+
+            // Data first: a snap and an EPG refresh can arrive in the SAME
+            // update, and snapping used to return before the signature check.
+            // That was harmless while the snap branch called resetWindow(),
+            // which rebuilds; snapToNow() scrolls without rebuilding, so the
+            // new programmes were dropped until some later update happened to
+            // run. Rebuilding first also settles the content before the
+            // animated scroll, instead of reloading out from under it.
+            let signature = dataSignature()
+            if signature != lastDataSignature {
+                lastDataSignature = signature
+                rebuildData(reload: true)
             }
 
-            let signature = dataSignature()
-            guard signature != lastDataSignature else { return }
-            lastDataSignature = signature
-            rebuildData(reload: true)
+            if parent.snapToken != lastSnapToken {
+                lastSnapToken = parent.snapToken
+                snapToNow()
+            }
+        }
+
+        func snapToNow() {
+            let anchor = Self.floorToHalfHour(Date())
+            let end = windowStart.addingTimeInterval(TimeInterval(totalMinutes * 60))
+            if anchor >= windowStart && anchor < end {
+                setLeftEdge(to: anchor, animated: true)
+            } else {
+                resetWindow()
+            }
         }
 
         func resetWindow() {
