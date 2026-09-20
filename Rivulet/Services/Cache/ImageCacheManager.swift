@@ -307,6 +307,10 @@ actor ImageCacheManager: NSObject {
             let maxAttempts = 3
             let backoff: [UInt64] = [500_000_000, 1_500_000_000] // ns before retries 2 and 3
 
+            if url.isFileURL {
+                return try? Data(contentsOf: url)
+            }
+
             for attempt in 0..<maxAttempts {
                 let isLastAttempt = attempt == maxAttempts - 1
                 do {

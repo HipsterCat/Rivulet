@@ -374,3 +374,39 @@ final class SearchStateCell: UICollectionViewCell {
         }
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Search recents") {
+    UIKitCellPreviewHost(width: 1520, height: 240, leading: 0) { (cell: SearchRecentsCell) in
+        cell.configure(recentItems: Array(ComponentSandboxMocks.posterRow().prefix(3)))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Search searching") {
+    UIKitCellPreviewHost(width: 900, height: 420, leading: 0) { (cell: SearchStateCell) in
+        cell.configure(state: .searching)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Search no results") {
+    UIKitCellPreviewHost(width: 900, height: 420, leading: 0) { (cell: SearchStateCell) in
+        cell.configure(state: .noResults)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Search error") {
+    UIKitCellPreviewHost(width: 900, height: 420, leading: 0) { (cell: SearchStateCell) in
+        cell.configure(state: .error(message: "Couldn't reach Plex. Check your connection."))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

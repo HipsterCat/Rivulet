@@ -234,3 +234,19 @@ final class LibraryLetterIndicatorView: UIView {
         alpha = 0
     }
 }
+
+// MAYBE future consider....
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Alphabet bar") {
+    UIKitCellPreviewHost(width: LibraryAlphabetBarView.width, height: 920) { (bar: LibraryAlphabetBarView) in
+        let letters = (65...90).map { String(UnicodeScalar($0)!) } + ["#"]
+        bar.setLetters(letters)
+        bar.entryIndex = 0
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

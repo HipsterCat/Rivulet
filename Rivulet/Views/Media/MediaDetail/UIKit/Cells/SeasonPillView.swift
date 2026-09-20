@@ -144,3 +144,26 @@ final class SeasonPillView: UIControl {
         return season.title
     }
 }
+
+// STEAL 
+#if DEBUG
+import SwiftUI
+
+#Preview("Season pills") {
+    UIKitPreviewHost {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 16
+        stack.alignment = .center
+        for entry in ComponentSandboxMocks.seasonLabels() {
+            let pill = SeasonPillView()
+            pill.configure(label: entry.label, isSelected: entry.selected)
+            stack.addArrangedSubview(pill)
+        }
+        return stack
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+

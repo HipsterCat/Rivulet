@@ -237,7 +237,7 @@ struct StreamSlotView: View {
                 name: "Test Channel HD",
                 callSign: "TEST",
                 logoURL: nil,
-                streamURL: URL(string: "http://example.com/stream.m3u8")!,
+                streamURL: URL(string: "https://shallowtv.com/sample.m3u")!,
                 tvgId: nil,
                 groupTitle: "Entertainment",
                 isHD: true

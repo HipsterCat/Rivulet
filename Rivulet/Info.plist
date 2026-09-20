@@ -29,5 +29,7 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>RivuletSentryDSN</key>
+	<string>$(RIVULET_SENTRY_DSN)</string>
 </dict>
 </plist>

@@ -106,3 +106,16 @@ final class PosterSkeletonCell: UICollectionViewCell {
         }
     }
 }
+
+// lazy steal seems very inefficient
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Poster skeleton") {
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight + 40) { (_: PosterSkeletonCell) in
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

@@ -472,17 +472,22 @@ private final class ContinueWatchingTitleLogoView: UIView {
         // source key directly (one metadata fetch) via the shared resolver.
         guard let ratingKey = TopShelfLogoResolver.sourceRatingKey(for: item) else { return nil }
 
+        // Plain metadata, not `getFullMetadata`: the only field read below is
+        // `clearLogoPath`, and the seven include params buy nothing here while
+        // costing 28% more bytes and twice the latency. This runs once per
+        // visible cell, so it is the app's one per-item metadata fan-out and
+        // showed up in Sentry as an N+1 (RIVULET-V).
         let sourceMetadata: PlexMetadata
-        if let cached = PlexDataStore.shared.getCachedFullMetadata(for: ratingKey) {
+        if let cached = PlexDataStore.shared.getCachedLogoMetadata(for: ratingKey) {
             sourceMetadata = cached
         } else {
             do {
-                let fetched = try await PlexNetworkManager.shared.getFullMetadata(
+                let fetched = try await PlexNetworkManager.shared.getMetadata(
                     serverURL: serverURL,
                     authToken: token,
                     ratingKey: ratingKey
                 )
-                PlexDataStore.shared.cacheFullMetadata(fetched, for: ratingKey)
+                PlexDataStore.shared.cacheLogoMetadata(fetched, for: ratingKey)
                 sourceMetadata = fetched
             } catch {
                 return nil
@@ -493,6 +498,28 @@ private final class ContinueWatchingTitleLogoView: UIView {
         return urlString.isEmpty ? nil : URL(string: urlString)
     }
 }
+
+// its maybe ok to STEAL thinking... it also has some additional image of title on top...
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Continue Watching movie") {
+    UIKitCellPreviewHost(width: 520, height: 292) { (cell: ContinueWatchingCell) in
+        cell.configure(item: ComponentSandboxMocks.movieInProgress())
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Continue Watching episode") {
+    UIKitCellPreviewHost(width: 520, height: 292) { (cell: ContinueWatchingCell) in
+        cell.configure(item: ComponentSandboxMocks.episode(inProgress: true))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
 
 // Info bar moved to `Rivulet/Views/Media/UIKit/Cells/MediaProgressInfoBar.swift`
 // for reuse by PosterCell (in-progress items in Recently Added /

@@ -35,7 +35,7 @@ The video player is **AetherPlayer** — an adapter around AetherEngine (FFmpeg 
 - **Language**: Swift 6
 - **UI Framework**: UIKit for the primary surfaces (see above); SwiftUI for the rest
 - **Video Player**: AetherPlayer for VOD and Live TV; AVPlayer only for the `hls` route (server transcode, primary-when-no-direct-URL or Aether fallback). See `Docs/RIVULET_PLAYER.md`.
-- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (6.32.0). **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
+- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (7.7.0). **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
 - **Design Guide**: See `Docs/DESIGN_GUIDE.md` for UI/UX patterns
 - **Repo is public**: keep commit messages short and plain; no internal detail.
 
@@ -705,6 +705,28 @@ The Plex Discover API uses three different hosts:
 | GUIDs | Pass `includeGuids=1` — Plex omits the `Guid` array by default |
 | Pagination | `X-Plex-Container-Size` is rejected on the watchlist endpoint |
 | Mutations | Resolve external GUID → discover `ratingKey` via matches endpoint first, then PUT actions |
+
+## Plex server API gotchas
+
+**`X-Plex-Container-Size` is ignored unless `X-Plex-Container-Start` is sent
+with it.** Measured on PMS 1.43.4: `/library/recentlyAdded?X-Plex-Container-Size=1`
+returned all 50 items (75KB); adding `X-Plex-Container-Start=0` returned one
+(1.7KB). So a `limit:` argument that only sets the size parameter silently does
+nothing, and the caller pays for the full page. `getRecentlyAdded` has shipped
+that way, which is why its `start` is an optional parameter rather than always 0:
+`PlexProvider.recentlyAdded` and `PlexMusicProvider.recentlyAddedAlbums` were
+tuned against the over-fetch, and the music one filters `type == "album"` out of
+it, so making the limit work would shrink its results.
+
+**Neither `updatedAt` nor `scannedAt` on `/library/sections` detects new content.**
+On the same server a section's `updatedAt` was six months stale with items added
+that morning (it tracks section settings, not contents), and `scannedAt` moved on
+every library at once from the scheduled scan whether or not anything was added.
+The working signal is the newest item on `/library/recentlyAdded` capped with
+`X-Plex-Container-Start=0&X-Plex-Container-Size=1`, keyed on ratingKey + addedAt +
+`updatedAt` together, because an episode added to the season that is already
+newest keeps that season's ratingKey and moves only its timestamps. `PlexDataStore`'s 30s poll
+uses exactly this to decide when to refetch Home's Recently Added rows (#315).
 
 ## Plex Live TV
 

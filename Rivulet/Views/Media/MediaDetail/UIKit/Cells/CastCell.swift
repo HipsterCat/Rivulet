@@ -70,14 +70,14 @@ final class CastCell: UIView {
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         nameLabel.font = .systemFont(ofSize: 27, weight: .semibold)
         nameLabel.textColor = UIColor.white.withAlphaComponent(0.9)
-        nameLabel.numberOfLines = 1
+        nameLabel.numberOfLines = 2
         nameLabel.textAlignment = .center
         addSubview(nameLabel)
 
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
         subtitleLabel.font = .systemFont(ofSize: 22, weight: .medium)
         subtitleLabel.textColor = UIColor.white.withAlphaComponent(0.72)
-        subtitleLabel.numberOfLines = 1
+        subtitleLabel.numberOfLines = 2
         subtitleLabel.textAlignment = .center
         addSubview(subtitleLabel)
 
@@ -142,5 +142,23 @@ final class CastCell: UIView {
     /// Focus = ENLARGE only (no ring, no glow).
     func setFocused(_ focused: Bool) {
         glowView.transform = focused ? CGAffineTransform(scaleX: 1.14, y: 1.14) : .identity
+        
     }
 }
+// STEAL meh at least its not disgusting
+#if DEBUG
+import SwiftUI
+
+#Preview("Cast") {
+    UIKitCellPreviewHost(width: CastCell.circleSize + 56, height: 355) { (cell: CastCell) in
+        cell.configure(person: ComponentSandboxMocks.castRow()[0])
+    }
+    UIKitCellPreviewHost(width: CastCell.circleSize + 56, height: 355) { (cell: CastCell) in
+        cell.configure(person: ComponentSandboxMocks.castRow()[0])
+        cell.setFocused(true)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+

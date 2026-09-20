@@ -468,3 +468,58 @@ final class AboutCardControl: UIControl {
         }
     }
 }
+
+// STEAL: native-like apple look for footer details, better choice from others
+
+#if DEBUG
+import SwiftUI
+
+#Preview("About") {
+    AboutCellPreview()
+}
+
+#Preview("Information columns") {
+    InfoColumnsPreview()
+}
+
+private struct AboutCellPreview: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .black
+        let cell = AboutCollectionCell(frame: .zero)
+        cell.configure(detail: MockDetailFixtures.movieDetail())
+        cell.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(cell)
+        NSLayoutConstraint.activate([
+            cell.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 56),
+            cell.topAnchor.constraint(equalTo: box.topAnchor, constant: 40),
+            cell.widthAnchor.constraint(equalToConstant: 904),
+            cell.heightAnchor.constraint(equalToConstant: 420),
+            cell.bottomAnchor.constraint(lessThanOrEqualTo: box.bottomAnchor, constant: -40)
+        ])
+        return box
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+private struct InfoColumnsPreview: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let box = UIView()
+        box.backgroundColor = .black
+        let columns = InfoColumnsView()
+        columns.configure(detail: MockDetailFixtures.movieDetail())
+        columns.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(columns)
+        NSLayoutConstraint.activate([
+            columns.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 56),
+            columns.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -56),
+            columns.topAnchor.constraint(equalTo: box.topAnchor, constant: 40),
+            columns.bottomAnchor.constraint(lessThanOrEqualTo: box.bottomAnchor, constant: -40)
+        ])
+        return box
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+#endif

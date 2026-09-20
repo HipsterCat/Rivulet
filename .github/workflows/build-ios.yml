@@ -50,10 +50,6 @@ jobs:
           sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version
 
-      # Both app targets read Secrets.swift; placeholders compile fine.
-      - name: Generate placeholder Secrets.swift
-        run: cp RivuletCore/Config/Secrets.swift.template RivuletCore/Config/Secrets.swift
-
       # AetherEngine pulls FFmpeg as binary artifacts — the checkout is the
       # slow part, so cache it keyed on the pin.
       - name: Cache Swift packages

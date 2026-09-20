@@ -606,3 +606,26 @@ private final class PaddingLabel: UILabel {
                       height: size.height + insets.top + insets.bottom)
     }
 }
+
+// STEAL accurate UI but NEED show also focused hover states, seen, future, not available, etc
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Episode") {
+    UIKitCellPreviewHost(width: EpisodeCell.cardWidth, height: 435) { (cell: EpisodeCell) in
+        cell.configure(episode: ComponentSandboxMocks.episode(inProgress: false))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Episode in progress") {
+    UIKitCellPreviewHost(width: EpisodeCell.cardWidth, height: 435) { (cell: EpisodeCell) in
+        cell.configure(episode: ComponentSandboxMocks.episode(inProgress: true))
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+

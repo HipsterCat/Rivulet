@@ -330,3 +330,23 @@ final class PersonHeaderCell: UICollectionViewCell {
     // through to the poster rows. Matches AboutCollectionCell / ShelfRowCell.
     override var canBecomeFocused: Bool { false }
 }
+
+// MEH ITS NICE as header but description must be highlighted only on focus/hover when clipped... Not defaulted
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Person header") {
+    UIKitCellPreviewHost(width: 1400, height: 280) { (cell: PersonHeaderCell) in
+        cell.configure(
+            name: "Ava Meridian",
+            biography: ComponentSandboxMocks.actorBiography(),
+            portraitURL: ComponentSandboxMocks.actorPortraitURL(),
+            isLoading: false,
+            onMore: {}
+        )
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

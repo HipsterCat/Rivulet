@@ -369,7 +369,11 @@ final class ComponentSandboxViewController: UIViewController {
             case .searchPrompt:
                 let cell = collectionView.dequeueReusableCell(
                     withReuseIdentifier: SearchRecentsCell.reuseID, for: indexPath) as! SearchRecentsCell
-                cell.configure(recentItems: Array(self.posters.prefix(3)))
+                cell.configure(recentItems: [
+                    ComponentSandboxMocks.movieUnwatched(),
+                    ComponentSandboxMocks.movieInProgress(),
+                    ComponentSandboxMocks.movieWatched()
+                ])
                 return cell
 
             case .searchState(let key):
@@ -573,7 +577,7 @@ final class ComponentSandboxViewController: UIViewController {
         case "notConnected": return .notConnected
         case "loading": return .loading
         case "error": return .error(message: "The sandbox server is unreachable.")
-        default: return .empty(message: "Тут пока пусто.")
+        default: return .empty(message: "Your libraries returned nothing. Try Refresh.")
         }
     }
 

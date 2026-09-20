@@ -149,3 +149,86 @@ final class FocusableActionButton: UIControl {
         }
     }
 }
+
+// LAZY STEAL... GONNA FIX THIS UI bugs....
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Action Play pill") {
+    UIKitPreviewHost {
+        previewPlayPill(title: "Play", progress: nil)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Action Play pill in progress") {
+    UIKitPreviewHost {
+        previewPlayPill(title: "S1E3 · 29m", progress: 0.42)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+/// Mirrors `SandboxPlayPillsCell.makePlayPill` so the action-row pill can
+/// be previewed without pulling in the sandbox tab.
+private func previewPlayPill(title: String, progress: Double?) -> FocusableActionButton {
+    let height = HeroPillButton.buttonHeight
+    let pill = FocusableActionButton()
+    pill.translatesAutoresizingMaskIntoConstraints = false
+    pill.layer.cornerRadius = height / 2
+    pill.layer.cornerCurve = .continuous
+
+    let playIcon = UIImageView(image: UIImage(systemName: "play.fill"))
+    playIcon.translatesAutoresizingMaskIntoConstraints = false
+    playIcon.tintColor = .white
+    playIcon.contentMode = .scaleAspectFit
+
+    let track = UIView()
+    track.translatesAutoresizingMaskIntoConstraints = false
+    track.backgroundColor = UIColor.white.withAlphaComponent(0.25)
+    track.layer.cornerRadius = 2
+    track.clipsToBounds = true
+    track.isHidden = progress == nil
+
+    let fill = UIView()
+    fill.translatesAutoresizingMaskIntoConstraints = false
+    fill.backgroundColor = .white
+    track.addSubview(fill)
+
+    let titleLabel = UILabel()
+    titleLabel.translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
+    titleLabel.textColor = .white
+    titleLabel.text = title
+
+    let contentStack = UIStackView(arrangedSubviews: [playIcon, track, titleLabel])
+    contentStack.translatesAutoresizingMaskIntoConstraints = false
+    contentStack.axis = .horizontal
+    contentStack.alignment = .center
+    contentStack.spacing = 12
+    pill.addSubview(contentStack)
+
+    NSLayoutConstraint.activate([
+        pill.widthAnchor.constraint(equalToConstant: HeroPillButton.pillWidth),
+        pill.heightAnchor.constraint(equalToConstant: height),
+        contentStack.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
+        contentStack.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+        contentStack.leadingAnchor.constraint(greaterThanOrEqualTo: pill.leadingAnchor, constant: 20),
+        contentStack.trailingAnchor.constraint(lessThanOrEqualTo: pill.trailingAnchor, constant: -18),
+        playIcon.widthAnchor.constraint(equalToConstant: 20),
+        playIcon.heightAnchor.constraint(equalToConstant: 20),
+        track.widthAnchor.constraint(equalToConstant: 56),
+        track.heightAnchor.constraint(equalToConstant: 4),
+        fill.leadingAnchor.constraint(equalTo: track.leadingAnchor),
+        fill.topAnchor.constraint(equalTo: track.topAnchor),
+        fill.bottomAnchor.constraint(equalTo: track.bottomAnchor),
+        fill.widthAnchor.constraint(equalTo: track.widthAnchor, multiplier: CGFloat(progress ?? 0))
+    ])
+
+    pill.invertOnFocus = [playIcon, titleLabel]
+    pill.invertBackgroundOnFocus = [track]
+    return pill
+}
+#endif

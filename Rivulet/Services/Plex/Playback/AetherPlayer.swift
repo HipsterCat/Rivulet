@@ -140,6 +140,30 @@ final class AetherPlayer: PlayerProtocol {
     /// background timestamp so the teardown-drain wait still applies.
     private var pendingReloadSince: Date?
 
+    /// AetherEngine's own version string. SwiftPM resolves a package to a
+    /// revision rather than a tag, so nothing else in the app can name the
+    /// engine release at runtime: `Package.resolved` is a build artifact and
+    /// the licenses screen carries a hand-maintained copy. Settings → About
+    /// prints this one, which the engine states about itself.
+    static var engineVersion: String { AetherEngine.version }
+
+    /// Warm the opening bytes of a source the engine is not playing yet, so a
+    /// later `load()` of that URL skips the cold open's two-to-three sequential
+    /// round trips (AetherEngine 7.7.0).
+    ///
+    /// The URL and headers are the adoption key and must be byte-identical to
+    /// the ones the load will carry, or the bytes are fetched and never taken.
+    /// Needs no engine instance, so a host warms while its player is still on
+    /// the current item. Best-effort by contract: it declines rather than
+    /// queues when the origin has no free request slot, and the bytes live in
+    /// memory only until adopted or dropped under pressure.
+    static func prewarm(url: URL, headers: [String: String]) async {
+        let report = await AetherEngine.prewarm(url: url, httpHeaders: headers)
+        if let declined = report.declined {
+            print("[AetherPlayer] prewarm declined: \(declined)")
+        }
+    }
+
     init() {
         do {
             self.engine = try AetherEngine()
@@ -726,7 +750,17 @@ final class AetherPlayer: PlayerProtocol {
             // page the broadcast FLAGS as a subtitle page; AU FTA channels carry
             // captions on 801 without that flag, so auto-detect returns nothing.
             // Region-default to 801 for AU, otherwise auto-detect.
-            teletextPage: Self.regionTeletextPage()
+            teletextPage: Self.regionTeletextPage(),
+            // Broadcast H.264 routinely mis-signals interlaced content as
+            // progressive (codecpar fieldOrder=0; MBAFF is only flagged
+            // per-frame), which routes it down the engine's NATIVE path with
+            // no deinterlacer — visible combing. Ask for the software path on
+            // live demux sessions: bwdif deinterlaces genuinely interlaced
+            // frames and passes true progressive through untouched, so a
+            // correctly-signalled progressive channel only pays a SW decode.
+            // The engine ignores this on the native-HLS shortcut, which never
+            // enters the demux dispatch, so it is scoped to `!isHLS` anyway.
+            preferredDecodePath: isHLS ? .automatic : .software
         )
         // Same reason as the VOD path: a zap is new content, and broadcast
         // mixes 4:3 SD with 16:9 HD channel to channel, so a reused slot must
@@ -735,18 +769,6 @@ final class AetherPlayer: PlayerProtocol {
         userIntendsToPlay = true
         pendingReloadSince = nil
         do {
-            // Broadcast H.264 routinely mis-signals interlaced content as
-            // progressive (codecpar fieldOrder=0; MBAFF is only flagged
-            // per-frame), which routes it down the engine's NATIVE path with
-            // no deinterlacer — visible combing. Force the software path for
-            // live demux sessions: bwdif deinterlaces genuinely interlaced
-            // frames and passes true progressive through untouched, so a
-            // correctly-signalled progressive channel only pays a SW decode.
-            // (Engine flag is labeled test-only but is the exact switch for
-            // this; reset immediately after dispatch. Not applied to the
-            // native-HLS shortcut, which never enters the demux dispatch.)
-            if !isHLS { AetherEngine.setForceSoftwarePathForTesting(true) }
-            defer { if !isHLS { AetherEngine.setForceSoftwarePathForTesting(false) } }
             try await engine.load(url: url, startPosition: nil, options: options)
         } catch {
             // The caller left the slot / retuned while the load was in flight.
@@ -996,11 +1018,40 @@ final class AetherPlayer: PlayerProtocol {
     ///    before the first sample and on the `hls`/AVPlayer-bypass path (no
     ///    loopback pipeline). Its own fields are path-asymmetric, so the
     ///    Advanced view prunes absent rows rather than showing placeholders.
+    /// Map the engine's `AudioDelivery` to a stats row, or nil to omit the row.
+    ///
+    /// Switched exhaustively with no `default` on purpose: this file is the only
+    /// place an AetherEngine type is named, so a case the engine adds should
+    /// fail the build here rather than silently render as a blank row.
+    private static func audioDeliveryLabel(_ delivery: AudioDelivery) -> String? {
+        switch delivery {
+        case .none: return nil  // Pre-load or torn down: nothing to report yet.
+        case .noAudioInSource: return "No audio in source"
+        case .streamCopy: return "Stream copy"
+        case .bridged: return "Bridged"
+        case .decoded: return "Decoded"
+        case .droppedNoPipeline: return "Video only (audio dropped)"
+        case .playerManaged: return "AVFoundation"
+        }
+    }
+
+    /// Keep the outgoing item on screen until the next `load()` replaces it.
+    ///
+    /// Call immediately before an episode swap that reuses this player. Video
+    /// renders through the engine's own layer (`engine.bind(view:)`), so without
+    /// this the gap between items is a black frame. Consumed by the next
+    /// `load()`; a `stop()` in between cancels it, and it no-ops when the
+    /// outgoing session is not on the engine's native backend.
+    func prepareForItemReplacement() {
+        engine.prepareForItemReplacement()
+    }
+
     func advancedStats() -> AetherAdvancedStats {
         let t = engine.diagnostics.liveTelemetry
         return AetherAdvancedStats(
             backend: engine.activeVideoDecoder,
             audioBridge: engine.activeAudioDecoder,
+            audioDelivery: Self.audioDeliveryLabel(engine.audioDelivery),
             instantBitrateMbps: t?.instantBitrateMbps,
             averageBitrateMbps: t?.averageBitrateMbps,
             audioBridgeBitrateMbps: t?.audioBridgeBitrateMbps,
@@ -1035,6 +1086,11 @@ struct AetherAdvancedStats {
     // Decoder identity (from engine.activeVideoDecoder / activeAudioDecoder).
     let backend: String?
     let audioBridge: String?
+    /// How the session's audio reaches the renderer, mapped from the engine's
+    /// own `audioDelivery`. Worth a row of its own because `audioBridge` names
+    /// a decoder and this names a FATE: "Video only" here is the engine saying
+    /// the source has audio it could not deliver, which no decoder label shows.
+    let audioDelivery: String?
     // Enthusiast telemetry.
     let instantBitrateMbps: Double?
     let averageBitrateMbps: Double?
@@ -1058,6 +1114,7 @@ struct AetherAdvancedStats {
     init(
         backend: String? = nil,
         audioBridge: String? = nil,
+        audioDelivery: String? = nil,
         instantBitrateMbps: Double? = nil,
         averageBitrateMbps: Double? = nil,
         audioBridgeBitrateMbps: Double? = nil,
@@ -1078,6 +1135,7 @@ struct AetherAdvancedStats {
     ) {
         self.backend = backend
         self.audioBridge = audioBridge
+        self.audioDelivery = audioDelivery
         self.instantBitrateMbps = instantBitrateMbps
         self.averageBitrateMbps = averageBitrateMbps
         self.audioBridgeBitrateMbps = audioBridgeBitrateMbps

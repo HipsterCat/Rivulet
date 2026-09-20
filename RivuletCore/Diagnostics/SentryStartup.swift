@@ -40,8 +40,10 @@ public enum SentryStartup {
     /// actor it trips the Main Thread Checker on every launch.
     @MainActor
     public static func start(platform: Platform) {
+        guard SentryConfig.isEnabled else { return }
+
         SentrySDK.start { options in
-            options.dsn = Secrets.sentryDSN
+            options.dsn = SentryConfig.dsn
             options.debug = false
             // Set as the initial scope rather than via configureScope after
             // start, so events captured during startup carry the tag too.

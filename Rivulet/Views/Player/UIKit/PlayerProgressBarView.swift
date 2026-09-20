@@ -823,3 +823,25 @@ final class PlayerProgressBarView: UIView {
         return String(format: "%d:%02d", minutes, secs)
     }
 }
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Progress bar") {
+    UIKitCellPreviewHost(width: 1400, height: 80) { (bar: PlayerProgressBarView) in
+        bar.layoutIfNeeded()
+        bar.update(
+            currentTime: 42 * 60,
+            duration: 120 * 60,
+            isScrubbing: false,
+            scrubTime: 0,
+            scrubStepLabelText: nil,
+            scrubThumbnail: nil,
+            markers: [],
+            chapters: []
+        )
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif

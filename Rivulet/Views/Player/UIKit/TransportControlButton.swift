@@ -144,3 +144,46 @@ final class TransportControlButton: UIControl {
         }, completion: nil)
     }
 }
+
+// Maybe.... but probably not
+
+#if DEBUG
+import SwiftUI
+
+#Preview("Skip back") {
+    UIKitPreviewHost {
+        TransportControlButton(
+            icon: UIImage(systemName: "gobackward.10"),
+            accessibilityLabel: "Skip back"
+        )
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+
+#Preview("Transport buttons") {
+    UIKitPreviewHost {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 20
+        stack.alignment = .center
+        let specs: [(String, String)] = [
+            ("gobackward.10", "Skip back"),
+            ("goforward.10", "Skip forward"),
+            ("captions.bubble", "Subtitles"),
+            ("info.circle", "Info"),
+            ("list.bullet", "Up Next")
+        ]
+        for (symbol, label) in specs {
+            stack.addArrangedSubview(TransportControlButton(
+                icon: UIImage(systemName: symbol),
+                accessibilityLabel: label
+            ))
+        }
+        return stack
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(.black)
+}
+#endif
+
