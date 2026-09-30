@@ -73,6 +73,12 @@ nonisolated struct PlexLiveTVChannel: Codable, Identifiable, Sendable {
     let channelNumber: String?
     let streamURL: String?  // HDHomeRun stream URL
 
+    /// Name of the lineup whose DVR carried this channel, used to group the
+    /// guide the way an M3U's `group-title` does. Assigned by the fetch, which
+    /// is the only place that knows which DVR it just queried — and left nil
+    /// when there is only one, since a lone tab would duplicate All Channels.
+    var tunerName: String?
+
     var id: String { ratingKey }
 
     /// Parse channel number as Int
@@ -137,6 +143,10 @@ nonisolated struct PlexLiveTVProgram: Codable, Identifiable, Sendable {
     let premiere: Bool?
     let Genre: [PlexGenreTag]?
     let Media: [PlexMedia]?
+    /// Episode and season numbers, for the "S2 E5" line in programme info.
+    let index: Int?
+    let parentIndex: Int?
+    let contentRating: String?
 
     var id: String { ratingKey ?? "\(beginsAt ?? 0):\(title)" }
 
@@ -163,9 +173,12 @@ nonisolated struct PlexLiveTVProgram: Codable, Identifiable, Sendable {
         return nil
     }
 
-    /// Category from first genre
+    /// Every genre tag, comma-joined like XMLTV's categories, less the bare
+    /// provider codes some guides carry ("178"). The first tag alone was
+    /// often only the code, which hid the real label behind it.
     var category: String? {
-        Genre?.first?.tag
+        let tags = (Genre ?? []).map(\.tag).filter { $0.contains(where: \.isLetter) }
+        return tags.isEmpty ? nil : tags.joined(separator: ", ")
     }
 }
 
@@ -195,6 +208,53 @@ nonisolated struct PlexDVR: Codable, Sendable {
     let lineup: String?
     let epgIdentifier: String?
     let Device: [PlexDVRDevice]?
+
+    /// Name for this tuner's guide group.
+    ///
+    /// The lineup carries it already, in its fragment — no extra request:
+    ///
+    ///     lineup://tv.plex.providers.epg.cloud/5fc76c88…#Freeview - Perth (58 channels)
+    ///                                                   └──────── this ────────┘
+    ///
+    /// That is the name the user picked their lineup by, so it wins over the
+    /// hardware description. The trailing "(58 channels)" is a count Plex
+    /// appends for its own picker and is dropped — it goes stale the moment a
+    /// channel is enabled or hidden.
+    ///
+    /// `key` is deliberately NOT in the chain: "161" is a worse heading than no
+    /// heading, and nil leaves the channels ungrouped rather than filed under a
+    /// number.
+    var guideGroupName: String? {
+        func cleaned(_ value: String?) -> String? {
+            guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !trimmed.isEmpty else { return nil }
+            return trimmed
+        }
+
+        let makeModel = [cleaned(make), cleaned(model)]
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        // Annotated: a bare literal mixing String? with the non-optional
+        // `makeModel` infers [Any] and the whole expression stops compiling.
+        let candidates: [String?] = [Self.lineupName(from: lineup), friendlyName, device, makeModel]
+        return candidates.lazy.compactMap(cleaned).first
+    }
+
+    /// Human-readable half of a lineup string, or nil if it carries none.
+    static func lineupName(from lineup: String?) -> String? {
+        guard let lineup, let hash = lineup.firstIndex(of: "#") else { return nil }
+        let raw = String(lineup[lineup.index(after: hash)...])
+        // The value arrives percent-encoded when it has been through a query.
+        let decoded = raw.removingPercentEncoding ?? raw
+        let trimmed = decoded.replacingOccurrences(
+            of: #"\s*\(\d+\s+channels?\)\s*$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        let name = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
 }
 
 struct PlexDVRDevice: Sendable {
@@ -266,12 +326,7 @@ extension PlexLiveTVChannel {
             authToken: authToken
         )
         // Consensus wire form: '+' profile-clause separators travel as %2B.
-        if let escapedQuery = components?.percentEncodedQuery?
-            .replacingOccurrences(of: "+", with: "%2B") {
-            components?.percentEncodedQuery = escapedQuery
-        }
-
-        let resultURL = components?.url
+        let resultURL = components.flatMap { Self.finalizedLiveURL($0) }
 
         // Log transcode URL building result (GitHub #64 - DVB diagnostics)
         if let url = resultURL {
@@ -353,6 +408,32 @@ extension PlexLiveTVChannel {
         ]
     }
 
+    /// Finalise a live-session URL, applying the clause-separator encoding that
+    /// every one of these URLs needs and that nothing enforces.
+    ///
+    /// `X-Plex-Client-Profile-Extra` joins its clauses with a raw `+`. That is a
+    /// legal query character, so `URLComponents` does NOT percent-encode it, and
+    /// a strict parser on the far end reads it as a space — the clause boundary
+    /// is gone and PMS parses a malformed profile. It has to travel as `%2B`.
+    ///
+    /// Forgetting is silent: the URL still forms and still looks right, the
+    /// server just negotiates against garbage. It was already missed once, in
+    /// `PlexLiveTVProvider.buildStreamURL`, which re-parses an
+    /// already-correct URL to swap the session UUID — reading `queryItems`
+    /// decodes `%2B` back to `+`, and re-serialising left it raw. Route every
+    /// build and REBUILD of one of these URLs through here.
+    ///
+    /// (`%2C` needs no such care: it survives the round trip because the `%`
+    /// itself gets encoded to `%25`, and decoded back, symmetrically.)
+    static func finalizedLiveURL(_ components: URLComponents) -> URL? {
+        var components = components
+        if let escaped = components.percentEncodedQuery?
+            .replacingOccurrences(of: "+", with: "%2B") {
+            components.percentEncodedQuery = escaped
+        }
+        return components.url
+    }
+
     /// X-Plex-Client-Profile-Extra for live sessions, in the canonical
     /// header-form: clauses joined by raw '+', comma lists pre-encoded as %2C
     /// (the PMS OpenAPI spec's own example uses exactly this shape). The whole
@@ -363,21 +444,40 @@ extension PlexLiveTVChannel {
             // Direct-play profiles: AetherEngine demuxes raw MPEG-TS HLS and
             // software-decodes MPEG-2 / mp2, so declare the raw broadcast
             // codecs and let the server grant passthrough when it can.
-            "add-direct-play-profile(type=videoProfile&protocol=hls&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3)",
-            "add-direct-play-profile(type=videoProfile&protocol=http&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3)",
+            //
+            // Video is deliberately left at the three codecs broadcast actually
+            // uses. Audio adds DTS, which shows up on cable and satellite feeds
+            // and would otherwise pull a channel into a conversion over audio
+            // the client could have taken as-is. Codecs an MPEG-TS cannot carry
+            // (FLAC, ALAC, Vorbis, PCM) are left out: declaring them buys nothing.
+            //
+            // `subtitleCodec=dvb_teletext` is the reason this matters most: it
+            // tells PMS we can take teletext untouched, so it has no cause to
+            // convert the page to WebVTT. Without it, a stream that would
+            // otherwise direct-play can be pulled into a conversion purely by
+            // its subtitles, and the teletext the caption renderer wants is gone.
+            "add-direct-play-profile(type=videoProfile&protocol=hls&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3%2Cdts&subtitleCodec=dvb_teletext%2Cdvb_subtitle%2Ceia_608)",
+            "add-direct-play-profile(type=videoProfile&protocol=http&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3%2Cdts&subtitleCodec=dvb_teletext%2Cdvb_subtitle%2Ceia_608)",
 
             // Direct-stream target: keep mp2/mp3 so a remux COPIES broadcast
             // audio instead of re-encoding it (the engine decodes mp2 fine).
-            "add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3&replace=true)",
+            "add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mpegts&videoCodec=h264%2Chevc%2Cmpeg2video&audioCodec=aac%2Cac3%2Ceac3%2Cmp2%2Cmp3%2Cdts&replace=true)",
 
-            // Subtitle transcode target.
+            // Subtitle transcode target. Only reached when direct play was
+            // refused for some other reason; the clause above is what keeps
+            // teletext out of this path in the first place.
             "add-transcode-target(type=subtitleProfile&context=streaming&protocol=hls&container=webvtt&subtitleCodec=webvtt)",
         ]
         return clauses.joined(separator: "+")
     }
 
     /// Convert to UnifiedChannel
-    func toUnifiedChannel(sourceId: String, serverURL: String, authToken: String) -> UnifiedChannel {
+    func toUnifiedChannel(
+        sourceId: String,
+        serverURL: String,
+        authToken: String,
+        favouriteRank: Int? = nil
+    ) -> UnifiedChannel {
         let channelId = UnifiedChannel.makeId(
             sourceType: .plex,
             sourceId: sourceId,
@@ -467,8 +567,12 @@ extension PlexLiveTVChannel {
             logoURL: logoURL,
             streamURL: streamURLValue,
             tvgId: channelIdentifier ?? ratingKey,
-            groupTitle: nil,
-            isHD: isHD
+            // Groups the guide by tuner, the same field an M3U fills from
+            // `group-title`. nil reads as "ungrouped" rather than a new tab.
+            groupTitle: tunerName,
+            isHD: isHD,
+            isFavourite: favouriteRank != nil,
+            favouriteRank: favouriteRank
         )
     }
 }
@@ -500,6 +604,11 @@ extension PlexLiveTVProgram {
         let poster = Self.plexImageURL(posterPath, serverURL: serverURL, authToken: authToken)
         let background = Self.plexImageURL(backgroundPath, serverURL: serverURL, authToken: authToken)
 
+        var episodeLine: String?
+        if isEpisode, let episode = index {
+            episodeLine = parentIndex.map { "S\($0) E\(episode)" } ?? "E\(episode)"
+        }
+
         return UnifiedProgram(
             id: programId,
             channelId: unifiedChannelId,
@@ -512,8 +621,14 @@ extension PlexLiveTVProgram {
             iconURL: poster,          // keep icon = poster for existing callers
             posterURL: poster,        // 2:3 poster (Plex `thumb`)
             landscapeURL: background, // 16:9 background (Plex `art`)
-            episodeNumber: nil,
-            isNew: premiere ?? false
+            episodeNumber: episodeLine,
+            isNew: premiere ?? false,
+            // What the DVR schedules against: the subscription template is
+            // keyed by the airing's own guid (plex://episode/…, plex://movie/…).
+            sourceGuid: guid,
+            year: isEpisode ? nil : year,
+            contentRating: contentRating,
+            isMovie: type?.lowercased() == "movie"
         )
     }
 

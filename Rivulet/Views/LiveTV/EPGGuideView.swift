@@ -45,8 +45,15 @@ enum EPGTheme {
     static let timelineHeight: CGFloat = 54
     /// Height of the slim rounded boxes inside the timeline / date row.
     static let timelineBoxHeight: CGFloat = 34
-    /// Height of the fixed info bar (top layer) the grid scrolls beneath.
-    static let infoBarHeight: CGFloat = 300
+    /// The app's page margin (Home rows, detail chrome). The guide ignores the
+    /// safe area and sits this far in from the leading, trailing and top edges.
+    static let pageMargin: CGFloat = MediaRowMetrics.rowLeading
+    /// The corner player after Back: 16:9 in 16pt width steps, top-right at
+    /// the page margin. The info bar's poster shares its height.
+    static let miniPlayerSize = CGSize(width: 528, height: 297)
+    /// Height of the fixed info bar (top layer) the grid scrolls beneath: the
+    /// page margin, the poster / corner-player band, and a small gap.
+    static let infoBarHeight: CGFloat = pageMargin + miniPlayerSize.height + 11
     /// Height of the UIKit category pills between the info bar and time ruler.
     static let categoryBarHeight: CGFloat = 64
     /// Gap between the info bar and the time ruler.
@@ -95,8 +102,6 @@ struct EPGGuide: UIViewRepresentable {
     let categoryTitles: [String]
     let selectedCategory: String?
     let onCategorySelect: (String?) -> Void
-    /// When true the grid releases focus (e.g. an overlay is presented).
-    var menuActive: Bool = false
     var onFocus: (UnifiedChannel?, UnifiedProgram?) -> Void
     var onSelect: (UnifiedChannel, UnifiedProgram?) -> Void
     /// Fired when horizontal scroll (or focus) nears the loaded right edge, so
@@ -107,6 +112,18 @@ struct EPGGuide: UIViewRepresentable {
     var transparent: Bool = true
     /// Space reserved above the time ruler (the info bar lives there).
     var topInset: CGFloat? = nil
+    /// Put focus on this channel's live programme. A new token re-requests the
+    /// same channel (the guide uses it when the player closes).
+    var focusRequest: EPGFocusRequest? = nil
+    /// Long-press (held Select) on a programme: the programme menu. The frame
+    /// is the pressed cell's, in window coordinates.
+    var onLongPress: ((UnifiedChannel, UnifiedProgram?, CGRect?) -> Void)? = nil
+    /// Programmes set to record, marked in their cells.
+    var recordingProgramIds: Set<String> = []
+    /// An extra pill at the end of the category bar that opens something
+    /// rather than filtering (Recordings).
+    var categoryActionTitle: String? = nil
+    var onCategoryAction: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -126,7 +143,12 @@ struct EPGGuide: UIViewRepresentable {
         cv.showsVerticalScrollIndicator = false
         cv.showsHorizontalScrollIndicator = false
         cv.bounces = false
-        cv.remembersLastFocusedIndexPath = true
+        // Focus memory is kept by the coordinator in channel + time terms, not
+        // by the collection view as an index path. An index path goes stale on
+        // every reload: when the timeline start moves forward, programmes that
+        // ended drop out of each row and the remembered item then names a show
+        // hours later (issue #317).
+        cv.remembersLastFocusedIndexPath = false
         cv.dataSource = context.coordinator
         cv.delegate = context.coordinator
         cv.register(ProgramCellView.self, forCellWithReuseIdentifier: ProgramCellView.reuseID)
@@ -149,13 +171,21 @@ struct EPGGuide: UIViewRepresentable {
         jump.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
         cv.addGestureRecognizer(jump)
 
+        // Held Select opens the programme menu, the same long-press every
+        // other surface uses for its menus.
+        cv.addGestureRecognizer(TileLongPress.makeRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleLongPress(_:))))
+
         let container = EPGContainerView()
         container.contentTopInset = infoBarInset
         container.install(collectionView: cv)
         container.configureCategories(
             titles: categoryTitles,
             selected: selectedCategory,
-            onSelect: onCategorySelect)
+            onSelect: onCategorySelect,
+            actionTitle: categoryActionTitle,
+            onAction: onCategoryAction)
         container.setTransparent(transparent)
         return container
     }
@@ -164,21 +194,34 @@ struct EPGGuide: UIViewRepresentable {
         context.coordinator.parent = self
         guard let cv = context.coordinator.collectionView,
               let layout = cv.collectionViewLayout as? EPGLayout else { return }
-        uiView.isUserInteractionEnabled = !menuActive
         uiView.configureCategories(
             titles: categoryTitles,
             selected: selectedCategory,
-            onSelect: onCategorySelect)
+            onSelect: onCategorySelect,
+            actionTitle: categoryActionTitle,
+            onAction: onCategoryAction)
+        context.coordinator.updateRecordingMarks(recordingProgramIds)
+        let timelineMoved = context.coordinator.lastTimelineStart.map { $0 != timelineStart } ?? false
         let dataChanged = context.coordinator.apply(self, to: layout)
         if dataChanged {
             cv.reloadData()
             if transparent, !context.coordinator.didRestScroll {
                 context.coordinator.didRestScroll = true
                 cv.contentOffset = CGPoint(x: -EPGTheme.channelColumnWidth, y: -layout.gridTopInset)
+            } else if timelineMoved {
+                // The grid now starts at a later half hour, so every x shifted.
+                // Keep "now" at the left edge rather than leaving the offset
+                // where it was, which reads as a jump hours to the right.
+                context.coordinator.resetHorizontalScroll()
             }
         } else {
             // Likely just `now` advanced — move the now-line without a reload.
             layout.invalidateLayout()
+        }
+        uiView.setClock(now)
+        if let request = focusRequest, request != context.coordinator.handledFocusRequest {
+            context.coordinator.handledFocusRequest = request
+            context.coordinator.focusLiveProgramme(channelId: request.channelId)
         }
     }
 
@@ -206,6 +249,18 @@ struct EPGGuide: UIViewRepresentable {
         /// While `Date() < freeScrollUntil` the timeline may scroll horizontally.
         private var freeScrollUntil: Date = .distantPast
         private(set) var currentFocusedIsLive = false
+        var lastTimelineStart: Date?
+        var handledFocusRequest: EPGFocusRequest?
+
+        /// The time a vertical move keeps. Up/Down should land on what airs at
+        /// the same time on the next channel; the focus engine instead picks by
+        /// geometry, and from a wide programme that is often a show far to the
+        /// right (issue #317). Set by horizontal moves only.
+        private var anchorTime: Date?
+
+        /// Last focused cell in data terms, so it survives reloads that move
+        /// index paths (see `remembersLastFocusedIndexPath` above).
+        private var lastFocusedChannelId: String?
 
         init(_ parent: EPGGuide) { self.parent = parent }
 
@@ -261,6 +316,7 @@ struct EPGGuide: UIViewRepresentable {
 
             sections = chans
             programs = progs
+            lastTimelineStart = p.timelineStart
             layout.configure(rows: rows,
                              channelCount: chans.count,
                              totalMinutes: p.totalMinutes,
@@ -279,7 +335,7 @@ struct EPGGuide: UIViewRepresentable {
             let cell = cv.dequeueReusableCell(withReuseIdentifier: ProgramCellView.reuseID, for: indexPath) as! ProgramCellView
             cell.transparent = parent.transparent
             if let program = programs[safe: indexPath.section]?[safe: indexPath.item] {
-                cell.configure(program)
+                cell.configure(program, isRecording: recordingIds.contains(program.id))
             }
             return cell
         }
@@ -310,10 +366,16 @@ struct EPGGuide: UIViewRepresentable {
             let now = parent.now
             currentSection = ip.section
             currentFocusedIsLive = program.isLive(at: now)
+            lastFocusedChannelId = channel.id
             parent.onFocus(channel, program)
 
             let prev = context.previouslyFocusedIndexPath
             let sameChannel = (prev != nil && prev!.section == ip.section)
+            // A move along the row (or a fresh landing) sets the time Up/Down
+            // will keep: the programme's start, or now if it is on air.
+            if sameChannel || anchorTime == nil || prev == nil {
+                anchorTime = program.isLive(at: now) ? now : program.start
+            }
             if sameChannel {
                 freeScrollUntil = Date().addingTimeInterval(0.6)
             } else {
@@ -364,6 +426,9 @@ struct EPGGuide: UIViewRepresentable {
         /// move through. The edge is a real boundary, not a missing feature.
         func collectionView(_ collectionView: UICollectionView,
                             shouldUpdateFocusIn context: UICollectionViewFocusUpdateContext) -> Bool {
+            if context.focusHeading == .up || context.focusHeading == .down {
+                return shouldAllowVerticalMove(context, in: collectionView)
+            }
             guard context.focusHeading == .left,
                   let prev = context.previouslyFocusedIndexPath,
                   prev.item == 0
@@ -442,26 +507,148 @@ struct EPGGuide: UIViewRepresentable {
             parent.onSelect(channel, current)
         }
 
-        // Play/Pause → move focus to the now-playing programme in the current row.
-        @objc func jumpToNow() {
-            guard let cv = collectionView,
-                  currentSection < programs.count else { return }
-            let row = programs[currentSection]
-            let now = parent.now
-            let item = row.firstIndex { $0.isLive(at: now) }
-                ?? row.lastIndex { $0.start <= now }
-                ?? 0
-            guard !row.isEmpty else { return }
-            pendingFocus = IndexPath(item: item, section: currentSection)
-            cv.setNeedsFocusUpdate()
-            cv.updateFocusIfNeeded()
+        /// Programme ids currently marked as recording.
+        private var recordingIds: Set<String> = []
+
+        /// Re-mark the visible cells when what is set to record changes. No
+        /// reload: that would drop focus for a change to a dot.
+        func updateRecordingMarks(_ ids: Set<String>) {
+            guard ids != recordingIds else { return }
+            recordingIds = ids
+            guard let cv = collectionView else { return }
+            for indexPath in cv.indexPathsForVisibleItems {
+                guard let cell = cv.cellForItem(at: indexPath) as? ProgramCellView,
+                      let program = programs[safe: indexPath.section]?[safe: indexPath.item] else { continue }
+                cell.setRecording(ids.contains(program.id))
+            }
         }
 
+        @objc func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began,
+                  let cv = collectionView,
+                  let indexPath = TileLongPress.focusedCell(in: cv),
+                  let channel = sections[safe: indexPath.section] else { return }
+            let program = programs[safe: indexPath.section]?[safe: indexPath.item]
+            let frame = cv.cellForItem(at: indexPath).map { $0.convert($0.bounds, to: nil) }
+            parent.onLongPress?(channel, program, frame)
+        }
+
+        // Play/Pause → move focus to the now-playing programme in the current row.
+        @objc func jumpToNow() {
+            guard currentSection < programs.count,
+                  let item = liveItem(inSection: currentSection) else { return }
+            anchorTime = parent.now
+            requestFocus(IndexPath(item: item, section: currentSection))
+        }
+
+        /// Focus entering the grid lands on the last channel the viewer was on,
+        /// at the programme airing now, resolved against the data as it is NOW
+        /// rather than an index path from before the last reload.
         func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {
             defer { pendingFocus = nil }
-            return pendingFocus
+            if let pendingFocus { return pendingFocus }
+            guard let channelId = lastFocusedChannelId,
+                  let section = sections.firstIndex(where: { $0.id == channelId }),
+                  let item = programIndex(inSection: section, covering: anchorTime ?? parent.now) else { return nil }
+            return IndexPath(item: item, section: section)
+        }
+
+        // MARK: Focus placement
+
+        /// Veto the engine's geometric choice for Up/Down when it is not the
+        /// programme airing at the anchor time, and move focus there instead.
+        private func shouldAllowVerticalMove(_ context: UICollectionViewFocusUpdateContext,
+                                             in collectionView: UICollectionView) -> Bool {
+            guard let next = context.nextFocusedIndexPath,
+                  let prev = context.previouslyFocusedIndexPath,
+                  next.section != prev.section else { return true }
+            let anchor = clampedAnchor(in: collectionView)
+            guard let desired = programIndex(inSection: next.section, covering: anchor),
+                  desired != next.item else { return true }
+            let target = IndexPath(item: desired, section: next.section)
+            // Only redirect to a cell that exists right now; otherwise the veto
+            // would eat the swipe. The engine's own pick is in the same row, so
+            // the row is realized, and the anchor is inside the visible window.
+            guard collectionView.cellForItem(at: target) != nil else { return true }
+            requestFocus(target)
+            return false
+        }
+
+        /// The anchor, kept inside the visible time window and never in the past.
+        private func clampedAnchor(in collectionView: UICollectionView) -> Date {
+            let now = parent.now
+            var anchor = max(anchorTime ?? now, now)
+            let ppm = Double(EPGTheme.pointsPerMinute)
+            let leftMinutes = Double(collectionView.contentOffset.x + EPGTheme.channelColumnWidth) / ppm
+            let rightMinutes = leftMinutes + Double(collectionView.bounds.width - EPGTheme.channelColumnWidth) / ppm
+            let left = parent.timelineStart.addingTimeInterval(leftMinutes * 60)
+            let right = parent.timelineStart.addingTimeInterval(rightMinutes * 60)
+            if anchor < left { anchor = left }
+            if anchor > right { anchor = right }
+            return anchor
+        }
+
+        /// The row's programme airing at `date`, else the nearest one to it.
+        private func programIndex(inSection section: Int, covering date: Date) -> Int? {
+            guard let row = programs[safe: section], !row.isEmpty else { return nil }
+            if let hit = row.firstIndex(where: { $0.start <= date && $0.stop > date }) { return hit }
+            return row.indices.min {
+                abs(row[$0].start.timeIntervalSince(date)) < abs(row[$1].start.timeIntervalSince(date))
+            }
+        }
+
+        private func liveItem(inSection section: Int) -> Int? {
+            programIndex(inSection: section, covering: parent.now)
+        }
+
+        private func requestFocus(_ indexPath: IndexPath) {
+            guard let cv = collectionView,
+                  let container = cv.superview as? EPGContainerView else {
+                pendingFocus = indexPath
+                collectionView?.setNeedsFocusUpdate()
+                return
+            }
+            container.focusGridCell(at: indexPath, in: cv)
+        }
+
+        /// Scroll `channelId`'s row into view at the live edge of the timeline
+        /// and put focus on its programme airing now. Used when the player
+        /// closes, so the guide comes back on the channel that was playing.
+        func focusLiveProgramme(channelId: String) {
+            guard let cv = collectionView,
+                  let layout = cv.collectionViewLayout as? EPGLayout,
+                  let section = sections.firstIndex(where: { $0.id == channelId }),
+                  let item = liveItem(inSection: section) else { return }
+            lastFocusedChannelId = channelId
+            anchorTime = parent.now
+            currentSection = section
+
+            // Row a little below the top of the grid, timeline back at "now".
+            let rowH = EPGTheme.rowHeight
+            let inset = layout.rulerBottomInset
+            let maxY = max(-cv.contentInset.top,
+                           layout.collectionViewContentSize.height - cv.bounds.height + cv.contentInset.bottom)
+            let targetY = min(max(CGFloat(section) * rowH - inset - rowH, -cv.contentInset.top), maxY)
+            lockedX = -EPGTheme.channelColumnWidth
+            cv.setContentOffset(CGPoint(x: lockedX, y: targetY), animated: false)
+            cv.layoutIfNeeded()
+            requestFocus(IndexPath(item: item, section: section))
+        }
+
+        /// Back to the start of the timeline (the current half hour).
+        func resetHorizontalScroll() {
+            guard let cv = collectionView else { return }
+            lockedX = -EPGTheme.channelColumnWidth
+            cv.contentOffset.x = lockedX
         }
     }
+}
+
+/// A request for the guide to focus a channel's live programme. The token makes
+/// a repeat request for the same channel distinct.
+struct EPGFocusRequest: Equatable {
+    let channelId: String
+    let token: UUID
 }
 
 // Note: `Array.subscript(safe:)` is defined in MultiStreamViewModel.swift and
@@ -472,6 +659,15 @@ struct EPGGuide: UIViewRepresentable {
 final class EPGContainerView: UIView {
     private var collectionView: UICollectionView?
     private let categoryBar = GuideCategoryBarView()
+    /// The current time, at the right end of the category row (issue #318).
+    private let clockLabel = UILabel()
+    private static let clockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
+    private var clockTimer: Timer?
     private weak var pendingGridFocusTarget: UIView?
     private weak var pendingCategoryFocusTarget: UIView?
     private var gridUpSwipeBinding: DirectionalInputBinding?
@@ -493,6 +689,17 @@ final class EPGContainerView: UIView {
         self.collectionView = cv
         addSubview(cv)
         addSubview(categoryBar)
+        clockLabel.font = .monospacedDigitSystemFont(ofSize: 26, weight: .semibold)
+        clockLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        clockLabel.textAlignment = .right
+        clockLabel.isUserInteractionEnabled = false
+        addSubview(clockLabel)
+        setClock(Date())
+        // The guide's own tick is every 30s; the clock wants the minute to turn
+        // on time, so it keeps its own.
+        clockTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.setClock(Date()) }
+        }
         categoryBar.onMoveDown = { [weak self] in self?.moveFocusIntoGrid() }
         gridUpSwipeBinding = DirectionalInputBinding(
             gatedSwipesOn: cv,
@@ -529,9 +736,47 @@ final class EPGContainerView: UIView {
     func configureCategories(
         titles: [String],
         selected: String?,
-        onSelect: @escaping (String?) -> Void
+        onSelect: @escaping (String?) -> Void,
+        actionTitle: String? = nil,
+        onAction: (() -> Void)? = nil
     ) {
-        categoryBar.configure(titles: titles, selected: selected, onSelect: onSelect)
+        categoryBar.configure(titles: titles, selected: selected, onSelect: onSelect,
+                              actionTitle: actionTitle, onAction: onAction)
+    }
+
+    func setClock(_ date: Date) {
+        let text = Self.clockFormatter.string(from: date)
+        if clockLabel.text != text { clockLabel.text = text }
+    }
+
+    override func willMove(toWindow newWindow: UIWindow?) {
+        super.willMove(toWindow: newWindow)
+        if newWindow == nil {
+            clockTimer?.invalidate()
+            clockTimer = nil
+        } else if clockTimer == nil {
+            setClock(Date())
+            clockTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.setClock(Date()) }
+            }
+        }
+    }
+
+    /// Put focus on one programme cell once the focus update in progress (if
+    /// any) has finished. UIKit ignores a focus request made from inside a
+    /// focus delegate callback, and ignores `setNeedsFocusUpdate` unless the
+    /// requesting environment contains focus, so this asks as the container,
+    /// which contains the whole grid.
+    func focusGridCell(at indexPath: IndexPath, in cv: UICollectionView) {
+        DispatchQueue.main.async { [weak self, weak cv] in
+            guard let self, let cv, self.pendingGridFocusTarget == nil else { return }
+            cv.layoutIfNeeded()
+            guard let cell = cv.cellForItem(at: indexPath) else { return }
+            self.pendingGridFocusTarget = cell
+            self.setNeedsFocusUpdate()
+            self.updateFocusIfNeeded()
+            self.pendingGridFocusTarget = nil
+        }
     }
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
@@ -610,10 +855,16 @@ final class EPGContainerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        let clockWidth: CGFloat = 170
         categoryBar.frame = CGRect(
             x: 0,
             y: EPGTheme.infoBarHeight,
-            width: bounds.width,
+            width: max(bounds.width - clockWidth, 0),
+            height: EPGTheme.categoryBarHeight)
+        clockLabel.frame = CGRect(
+            x: bounds.width - clockWidth,
+            y: EPGTheme.infoBarHeight,
+            width: clockWidth - EPGTheme.pageMargin,
             height: EPGTheme.categoryBarHeight)
         collectionView?.frame = CGRect(x: 0, y: contentTopInset,
                                        width: bounds.width,
@@ -634,11 +885,14 @@ final class GuideCategoryBarView: UIView {
     private struct Item: Equatable {
         let title: String
         let group: String?
+        /// An action pill (Recordings): opens something instead of filtering.
+        var isAction = false
     }
 
     private var items: [Item] = []
     private var selectedGroup: String?
     private var onSelect: ((String?) -> Void)?
+    private var onAction: (() -> Void)?
     private var lastFocusedIndexPath: IndexPath?
     var onMoveDown: (() -> Void)?
     private var downSwipeBinding: DirectionalInputBinding?
@@ -695,16 +949,22 @@ final class GuideCategoryBarView: UIView {
     func configure(
         titles: [String],
         selected: String?,
-        onSelect: @escaping (String?) -> Void
+        onSelect: @escaping (String?) -> Void,
+        actionTitle: String? = nil,
+        onAction: (() -> Void)? = nil
     ) {
-        let nextItems = [Item(title: "All Channels", group: nil)]
+        var nextItems = [Item(title: "All Channels", group: nil)]
             + titles.map { Item(title: $0, group: $0) }
+        if let actionTitle {
+            nextItems.append(Item(title: actionTitle, group: nil, isAction: true))
+        }
         let itemsChanged = items != nextItems
         let selectionChanged = selectedGroup != selected
 
         items = nextItems
         selectedGroup = selected
         self.onSelect = onSelect
+        self.onAction = onAction
 
         if itemsChanged {
             collectionView.reloadData()
@@ -718,13 +978,13 @@ final class GuideCategoryBarView: UIView {
             guard let item = items[safe: indexPath.item],
                   let cell = collectionView.cellForItem(at: indexPath) as? GuideCategoryPillCell
             else { continue }
-            cell.configure(title: item.title, selected: item.group == selectedGroup)
+            cell.configure(title: item.title, selected: !item.isAction && item.group == selectedGroup)
         }
     }
 
     func preferredFocusTarget() -> UIView? {
         collectionView.layoutIfNeeded()
-        let selectedIndex = items.firstIndex { $0.group == selectedGroup }
+        let selectedIndex = items.firstIndex { !$0.isAction && $0.group == selectedGroup }
             .map { IndexPath(item: $0, section: 0) }
         let targetIndex = lastFocusedIndexPath ?? selectedIndex ?? IndexPath(item: 0, section: 0)
         return collectionView.cellForItem(at: targetIndex)
@@ -746,7 +1006,7 @@ extension GuideCategoryBarView: UICollectionViewDataSource,
             withReuseIdentifier: GuideCategoryPillCell.reuseIdentifier,
             for: indexPath) as! GuideCategoryPillCell
         if let item = items[safe: indexPath.item] {
-            cell.configure(title: item.title, selected: item.group == selectedGroup)
+            cell.configure(title: item.title, selected: !item.isAction && item.group == selectedGroup)
         }
         cell.onDeclinedDownPress = { [weak self] in
             self?.onMoveDown?()
@@ -766,9 +1026,12 @@ extension GuideCategoryBarView: UICollectionViewDataSource,
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        guard let item = items[safe: indexPath.item],
-              item.group != selectedGroup
-        else { return }
+        guard let item = items[safe: indexPath.item] else { return }
+        if item.isAction {
+            onAction?()
+            return
+        }
+        guard item.group != selectedGroup else { return }
         onSelect?(item.group)
     }
 
@@ -834,7 +1097,7 @@ final class GuideCategoryPillCell: UICollectionViewCell {
     ) {
         super.didUpdateFocus(in: context, with: coordinator)
         let focused = context.nextFocusedView === self
-        coordinator.addCoordinatedAnimations { self.applyAppearance(focused: focused) }
+        coordinator.animateFocusChange(gained: focused) { self.applyAppearance(focused: focused) }
     }
 
     private func applyAppearance(focused: Bool) {
@@ -1102,12 +1365,33 @@ final class ProgramCellView: UICollectionViewCell {
         contentView.layer.mask = clipMask
     }
 
-    func configure(_ program: UnifiedProgram) {
+    func configure(_ program: UnifiedProgram, isRecording: Bool = false) {
         titleLabel.text = program.title
         let sub = program.subtitle
         subtitleLabel.text = sub
         subtitleLabel.isHidden = (sub?.isEmpty ?? true)
+        setRecording(isRecording)
         applyFocus(false)
+    }
+
+    /// A red dot in the top-right corner while the programme is set to record.
+    private let recordingDot = UIView()
+
+    func setRecording(_ recording: Bool) {
+        if recordingDot.superview == nil {
+            recordingDot.backgroundColor = .systemRed
+            recordingDot.layer.cornerRadius = 6
+            recordingDot.isUserInteractionEnabled = false
+            recordingDot.translatesAutoresizingMaskIntoConstraints = false
+            card.addSubview(recordingDot)
+            NSLayoutConstraint.activate([
+                recordingDot.widthAnchor.constraint(equalToConstant: 12),
+                recordingDot.heightAnchor.constraint(equalToConstant: 12),
+                recordingDot.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+                recordingDot.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            ])
+        }
+        recordingDot.isHidden = !recording
     }
 
     override func layoutSubviews() {
@@ -1153,7 +1437,9 @@ final class ProgramCellView: UICollectionViewCell {
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         let focused = (context.nextFocusedView == self)
-        coordinator.addCoordinatedAnimations({ self.applyFocus(focused) })
+        // Losing focus is instant: a coordinated unfocus leaves the old
+        // programme's white card fading behind the move (ghosting).
+        coordinator.animateFocusChange(gained: focused) { self.applyFocus(focused) }
     }
 
     private func applyFocus(_ focused: Bool) {
@@ -1168,8 +1454,14 @@ final class ChannelColumnView: UICollectionReusableView {
     private let occluder = UIView()   // opaque; rounded only on the right
     private let box = UIView()        // coloured logo box; rounded all corners
     private let logo = UIImageView()
+    /// Channel number under the logo (issue #318).
+    private let numberLabel = UILabel()
+    /// The channel's name, in place of a logo it does not have. Without this a
+    /// playlist with no `tvg-logo` gave the column nothing to identify a row by.
+    private let nameLabel = UILabel()
     private var logoLoadTask: Task<Void, Never>?
     private var currentLogoURL: URL?
+    private var logoHeight: NSLayoutConstraint!
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1193,8 +1485,31 @@ final class ChannelColumnView: UICollectionReusableView {
         logo.translatesAutoresizingMaskIntoConstraints = false
         box.addSubview(logo)
 
+        numberLabel.font = .monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        numberLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+        numberLabel.textAlignment = .center
+        numberLabel.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(numberLabel)
+
+        nameLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        nameLabel.textColor = .white
+        nameLabel.textAlignment = .center
+        nameLabel.numberOfLines = 2
+        nameLabel.adjustsFontSizeToFitWidth = true
+        nameLabel.minimumScaleFactor = 0.8
+        nameLabel.isHidden = true
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(nameLabel)
+
+        logoHeight = logo.heightAnchor.constraint(equalToConstant: 62)
         let gap = EPGTheme.cellSpacing
         NSLayoutConstraint.activate([
+            numberLabel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 4),
+            numberLabel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -4),
+            numberLabel.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -6),
+            nameLabel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 8),
+            nameLabel.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -8),
+            nameLabel.centerYAnchor.constraint(equalTo: logo.centerYAnchor),
             occluder.topAnchor.constraint(equalTo: topAnchor),
             occluder.bottomAnchor.constraint(equalTo: bottomAnchor),
             occluder.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -1206,9 +1521,9 @@ final class ChannelColumnView: UICollectionReusableView {
             box.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -gap),
 
             logo.centerXAnchor.constraint(equalTo: box.centerXAnchor),
-            logo.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+            logo.topAnchor.constraint(equalTo: box.topAnchor, constant: 8),
             logo.widthAnchor.constraint(equalToConstant: 86),
-            logo.heightAnchor.constraint(equalToConstant: 62),
+            logoHeight,
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1216,6 +1531,15 @@ final class ChannelColumnView: UICollectionReusableView {
     func configure(_ channel: UnifiedChannel, transparent: Bool = false) {
         occluder.backgroundColor = transparent ? .clear : UIColor(EPGTheme.background)
         box.backgroundColor = transparent ? UIColor(white: 0, alpha: 0.28) : UIColor(EPGTheme.columnFill)
+
+        // Number under the logo when the source has one; the logo takes the
+        // whole box when it does not.
+        let number = channel.channelNumber.map(String.init)
+        numberLabel.text = number
+        numberLabel.isHidden = number == nil
+        logoHeight.constant = number == nil ? 70 : 52
+        nameLabel.text = channel.name
+        nameLabel.isHidden = channel.logoURL != nil
 
         // Reused cells get reconfigured rapidly during fast guide scrolling.
         // Track the URL each in-flight load belongs to and cancel on change,
@@ -1240,6 +1564,8 @@ final class ChannelColumnView: UICollectionReusableView {
                   self.currentLogoURL == url
             else { return }
             self.logo.image = image
+            // A logo that failed to load identifies nothing; show the name.
+            self.nameLabel.isHidden = image != nil
             self.logoLoadTask = nil
         }
     }
@@ -1389,11 +1715,24 @@ struct GuideInfoBar: View {
     let channel: UnifiedChannel?
     let program: UnifiedProgram?
 
-    /// Programme artwork for the poster, prioritising a 2:3 portrait image and
-    /// falling back to any programme icon. The channel logo is handled
-    /// separately so it can be letterboxed into a 2:3 frame.
+    /// Programme artwork for the poster, prioritising a 2:3 portrait image.
+    /// Landscape images are NEVER shown in the 2:3 poster slot — they route
+    /// to the guide backdrop instead, while the poster slot falls back to the
+    /// channel logo.
     private var programImageURL: URL? {
-        program?.posterURL ?? program?.iconURL
+        if let poster = program?.posterURL {
+            if EPGImageClassifier.shared.isLandscape(poster) {
+                return nil
+            }
+            return poster
+        }
+        if let icon = program?.iconURL {
+            if program?.landscapeURL == icon || EPGImageClassifier.shared.isLandscape(icon) {
+                return nil
+            }
+            return icon
+        }
+        return nil
     }
 
     var body: some View {
@@ -1403,7 +1742,7 @@ struct GuideInfoBar: View {
 
     /// Fixed poster height; width follows the image's own aspect ratio so a
     /// 2:3 poster shows 2:3 and a 16:9 fallback shows 16:9 (never cropped).
-    private let posterHeight: CGFloat = 252
+    private let posterHeight: CGFloat = EPGTheme.miniPlayerSize.height
 
     private var content: some View {
         HStack(alignment: .top, spacing: 30) {
@@ -1437,7 +1776,7 @@ struct GuideInfoBar: View {
         }
         .padding(.leading, EPGTheme.cellSpacing)
         .padding(.trailing, 48)
-        .padding(.top, 39)
+        .padding(.top, EPGTheme.pageMargin)
         .padding(.bottom, 9)
     }
 
@@ -1460,14 +1799,10 @@ struct GuideInfoBar: View {
 
     @ViewBuilder private var posterContent: some View {
         if let url = programImageURL {
-            CachedAsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fit)
-                default:
-                    logoInset
-                }
+            GuidePosterImage(url: url) {
+                logoInset
             }
+            .id(url)
         } else {
             logoInset
         }
@@ -1503,5 +1838,41 @@ struct GuideInfoBar: View {
     private func timeRange(_ program: UnifiedProgram) -> String {
         let f = Date.FormatStyle.dateTime.hour().minute()
         return "\(program.startTime.formatted(f)) — \(program.endTime.formatted(f))"
+    }
+}
+
+/// Dynamically inspects artwork aspect ratio to guarantee landscape images
+/// are never placed in the 2:3 poster slot, falling back to the channel logo.
+private struct GuidePosterImage<Fallback: View>: View {
+    let url: URL
+    @ViewBuilder let logoFallback: () -> Fallback
+    @State private var isLandscape: Bool
+
+    init(url: URL, @ViewBuilder logoFallback: @escaping () -> Fallback) {
+        self.url = url
+        self.logoFallback = logoFallback
+        self._isLandscape = State(initialValue: EPGImageClassifier.shared.isLandscape(url))
+    }
+
+    var body: some View {
+        if isLandscape {
+            logoFallback()
+        } else {
+            CachedAsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image.resizable().aspectRatio(contentMode: .fit)
+                default:
+                    logoFallback()
+                }
+            }
+            .task(id: url) {
+                let kind = await EPGImageClassifier.shared.classify(url) {
+                    await ImageCacheManager.shared.image(for: url)?.size
+                }
+                guard !Task.isCancelled else { return }
+                isLandscape = kind == .landscape
+            }
+        }
     }
 }

@@ -26,6 +26,7 @@ enum SettingsDescriptorStore {
         // so they cannot have their own entry. Fall back on the row KIND, which
         // is what the panel wants to explain anyway.
         if id.hasPrefix("homeRow_") { return descriptors["homeRowItem"] }
+        if id.hasPrefix("fav_") { return descriptors["liveTVFavoriteRow"] }
         return nil
     }
 
@@ -102,6 +103,10 @@ enum SettingsDescriptorStore {
             icon: "safari",
             description: "Shows the Discover tab in the sidebar for browsing Popular, Top Rated, Upcoming, and more from TMDB."
         ),
+        "showWatchlistTab": SettingDescriptor(
+            icon: "bookmark",
+            description: "Shows a Watchlist tab in the sidebar with everything on your Plex Watchlist."
+        ),
         "discoverAboveLibraries": SettingDescriptor(
             icon: "arrow.up.arrow.down",
             description: "Moves the Discover tab above your Media libraries in the sidebar for quicker access."
@@ -153,25 +158,37 @@ enum SettingsDescriptorStore {
             icon: "arrow.up.arrow.down",
             description: "Moves the Live TV section above your Media libraries in the sidebar for quicker access."
         ),
-        "classicTVMode": SettingDescriptor(
-            icon: "tv.fill",
-            description: "Hides player controls during live TV for a traditional television experience. Swipe up to show controls."
-        ),
         "combineSources": SettingDescriptor(
             icon: "square.stack.3d.down.right",
-            description: "Shows all Live TV sources in a single combined Channels view, or gives each source its own sidebar entry."
+            description: "Shows all Live TV sources together under one sidebar entry, or gives each source its own."
         ),
         "defaultLayout": SettingDescriptor(
             icon: "tv",
-            description: "Choose between the channel grid layout or the TV guide layout as your default Live TV view."
+            description: "Choose your default Live TV view: the TV guide, or What's On, with rows of what is on now and multiview like the Apple TV app."
+        ),
+        "liveTVFavorites": SettingDescriptor(
+            icon: "star.fill",
+            description: "Set the order of your favorite channels, from every source. To add one, hold Select on a channel in What's On or the guide."
+        ),
+        "liveTVFavoriteRow": SettingDescriptor(
+            icon: "star.fill",
+            description: "Hold Select to move this channel, then press Select to drop it. Turn it off to remove it. Favorites you set in Plex come after these, in Plex's order."
+        ),
+        "noLiveTVFavorites": SettingDescriptor(
+            icon: "star",
+            description: "Hold Select on a channel in What's On or the guide and choose Add to Favorites. Favorites from every source share one list."
+        ),
+        "liveTVSuggestions": SettingDescriptor(
+            icon: "sparkles",
+            description: "What's On learns what you watch and suggests what is on now that is like it, in a For You row. It learns on this Apple TV only. Turn it off to hide the row and stop learning."
+        ),
+        "keepPlayingInGuide": SettingDescriptor(
+            icon: "pip",
+            description: "When you go back from a live channel, it keeps playing with its sound in the corner of the Guide or What's On. Select it again to return to full screen."
         ),
         "confirmExitMultiview": SettingDescriptor(
             icon: "rectangle.split.2x2",
             description: "Shows a confirmation dialog before closing multiview mode to prevent accidentally ending multiple streams."
-        ),
-        "allowFourStreams": SettingDescriptor(
-            icon: "rectangle.split.2x2.fill",
-            description: "Enables 3 and 4 stream multiview layouts. Warning: 4 streams may cause instability on some devices."
         ),
 
         // MARK: Storage
@@ -257,9 +274,13 @@ enum SettingsDescriptorStore {
             icon: "textformat",
             description: "What this source is called in the sidebar and the guide."
         ),
-        "apiTokenField": SettingDescriptor(
+        "usernameField": SettingDescriptor(
+            icon: "person",
+            description: "Dispatcharr only. Sign in with your Dispatcharr user so Rivulet can schedule recordings and series from the guide. Leave it empty to just watch."
+        ),
+        "passwordField": SettingDescriptor(
             icon: "key",
-            description: "Only needed if your server asks for one. Leave it empty otherwise."
+            description: "Used once, to fetch your Dispatcharr API key. Rivulet keeps the key, not the password."
         ),
         "channelProfileField": SettingDescriptor(
             icon: "line.3.horizontal.decrease.circle",
@@ -307,31 +328,31 @@ enum SettingsDescriptorStore {
         // MARK: Content Filtering
         "cat_contentFilter": SettingDescriptor(
             icon: "hand.raised.fill",
-            description: "Mute strong language and skip scenes during playback, without ever changing the file. Language is detected live from the subtitle track; scene skips come from an imported filter list."
+            description: "Mute strong language and skip scenes during playback, without ever changing the file. Language is found in the title's subtitles, even with subtitles turned off; scene skips come from an imported filter list."
         ),
         "cf_master": SettingDescriptor(
             icon: "hand.raised.fill",
-            description: "Turn the local content filter on. Rivulet then mutes and skips in real time based on the categories below."
+            description: "Turn the local content filter on. Rivulet then mutes and skips in real time based on the categories below. While it's on, a button in the player pauses filtering for the title you're watching."
         ),
         "cf_profanity": SettingDescriptor(
             icon: "exclamationmark.bubble.fill",
-            description: "Mutes profane words as they appear in the subtitle line. Requires a subtitle track to be active. Use Profanity Strength to choose how much is filtered."
+            description: "Mutes profane words in the dialogue. Rivulet reads the title's subtitle file even when subtitles are off; a title whose only subtitles are inside the video file needs them turned on. Use Profanity Strength to choose how much is filtered."
         ),
         "cf_strength": SettingDescriptor(
             icon: "dial.medium.fill",
-            description: "How much profanity to mute: mild and up, moderate and up, or strong words only."
+            description: "How much profanity to mute: mild and up, moderate and up, or strong words only. Also applies to profanity in imported filter lists."
         ),
         "cf_blasphemy": SettingDescriptor(
             icon: "hands.clap.fill",
-            description: "Mutes irreverent uses of religious names and phrases detected in the subtitle line. Ordinary dialogue is left alone."
+            description: "Mutes religious names used as exclamations, such as \"oh my god\". The word god on its own is never muted."
         ),
         "cf_slur": SettingDescriptor(
             icon: "person.fill.xmark",
-            description: "Mutes racial and other slurs detected in the subtitle line."
+            description: "Mutes racial, homophobic and other slurs in the dialogue."
         ),
         "cf_sexualLanguage": SettingDescriptor(
             icon: "heart.slash.fill",
-            description: "Mutes crude and sexual language detected in the subtitle line."
+            description: "Mutes crude and sexual language in the dialogue."
         ),
         "cf_violence": SettingDescriptor(
             icon: "burst.fill",
@@ -351,7 +372,7 @@ enum SettingsDescriptorStore {
         ),
         "cf_sourceURL": SettingDescriptor(
             icon: "link",
-            description: "Optional. A location where per-title filter files live, in the open MCF (movie content filter) or EDL format. Use {id} for the Plex rating key, or point at a folder that holds <ratingKey>.mcf files. Rivulet loads the matching file when a title starts. It ships no filter data of its own."
+            description: "Optional. Where per-title filter files live, in the open MCF (movie content filter) or EDL format. For a folder, Rivulet looks for a file named after the video file, then the IMDb id (tt0133093.edl), then the Plex rating key. An address can use {file}, {imdb}, {tmdb}, {tvdb} or {id} instead. From moviecontentfilter.com, download the EDL format with your copy's start and end times. Rivulet ships no filter data of its own."
         ),
     ]
 
@@ -381,6 +402,7 @@ enum SettingsDescriptorStore {
         case .contentFilter: return ("hand.raised.fill", .systemOrange)
         case .contentFilterStrength: return ("dial.medium.fill", .systemOrange)
         case .liveTVSourceDetail: return ("tv.and.mediabox", .systemBlue)
+        case .liveTVFavorites: return ("star.fill", .systemYellow)
         case .addLiveTVSource: return ("plus.circle.fill", .systemBlue)
         case .addOwnServer: return ("server.rack", .systemBlue)
         case .addPlaylistURL: return ("list.bullet.rectangle", .systemGreen)

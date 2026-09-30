@@ -258,10 +258,11 @@ extension SettingsPageViewController: UICollectionViewDataSource, UICollectionVi
         case .navigationAction(let target, _, let prepare):
             prepare()
             onPush?(target)
-        case .toggle(let get, let set):
+        case .toggle(let get, let set, let didChange):
             set(!get())
             (collectionView.cellForItem(at: indexPath) as? SettingsCell)?.updateValue(get() ? "On" : "Off")
             refreshDimmedRows()
+            didChange?(get(), self)
         case .cycle(let value, let next):
             next()
             (collectionView.cellForItem(at: indexPath) as? SettingsCell)?.updateValue(value())
@@ -274,10 +275,10 @@ extension SettingsPageViewController: UICollectionViewDataSource, UICollectionVi
             // The handler owns its own list refresh (it may switch synchronously
             // or present a PIN modal and reload on dismiss).
             handler(self)
-        case .textEntry(let value, let placeholder, let hint, let suggestions, let keyboardType, let set):
+        case .textEntry(let value, let placeholder, let hint, let suggestions, let keyboardType, let isSecure, let set):
             let entry = TextEntryViewController(
                 title: item.title, initialText: value(), placeholder: placeholder,
-                hint: hint, suggestions: suggestions, keyboardType: keyboardType,
+                hint: hint, suggestions: suggestions, keyboardType: keyboardType, isSecure: isSecure,
                 onCommit: { [weak self] text in
                     set(text)
                     // Reload so the row shows the committed value. A Menu

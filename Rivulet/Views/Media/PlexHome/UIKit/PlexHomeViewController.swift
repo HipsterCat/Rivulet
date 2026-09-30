@@ -80,6 +80,10 @@ enum HomeMode {
     /// GRIDS of results (Movies & TV / Episodes & Seasons / Music). The query
     /// arrives from `SearchContainerViewController` via `updateSearchQuery`.
     case search
+    /// Watchlist surface: no hero, one poster grid of every Plex Watchlist
+    /// entry (issue #287). Entries are Discover metadata, so the tiles,
+    /// the tap and the tile menu all reuse the Home watchlist row's paths.
+    case watchlist
 }
 
 nonisolated struct HomeItemID: Hashable, Sendable {
@@ -122,6 +126,10 @@ enum HomeSectionKind: Equatable {
     case searchPrompt
     /// Search mode only — inline searching / error / no-results state.
     case searchState
+    /// Watchlist mode only — every watchlist entry as a poster grid. Same
+    /// layout as the library grid, but backed by `watchlistItems` (Discover
+    /// entries, not MediaItems) so it reuses the row's cell, tap and menu.
+    case watchlistGrid
     /// Search mode only — one grouped result grid (Movies & TV, Episodes &
     /// Seasons, Music) with a row-style header. Same 6-across poster grid
     /// as the library, no pagination (search caps at 80 results).
@@ -195,6 +203,22 @@ struct HomeSectionData {
         HomeSectionData(
             id: .watchlist,
             kind: .watchlist,
+            title: "Watchlist",
+            headerStyle: .swiftUIWatchlist,
+            totalSize: nil,
+            items: [],
+            watchlistItems: items,
+            heroItems: [],
+            hubKey: nil,
+            hubIdentifier: nil
+        )
+    }
+
+    /// Watchlist mode: every entry as a poster grid.
+    static func watchlistGrid(items: [PlexWatchlistItem]) -> HomeSectionData {
+        HomeSectionData(
+            id: .watchlist,
+            kind: .watchlistGrid,
             title: "Watchlist",
             headerStyle: .swiftUIWatchlist,
             totalSize: nil,
@@ -604,6 +628,8 @@ final class PlexHomeViewController: UIViewController {
         switch mode {
         case .discover:
             return "Recommendations aren't available right now."
+        case .watchlist:
+            return "Nothing in your Watchlist yet."
         case .home, .library, .search:
             return "Your Plex library appears to be empty."
         }
@@ -619,6 +645,8 @@ final class PlexHomeViewController: UIViewController {
             return true  // Discover always leads with the hero carousel
         case .search:
             return false  // Search has no hero — keyboard + results only
+        case .watchlist:
+            return false  // Watchlist is the grid alone
         }
     }
     /// `enablePersonalizedRecommendations` AppStorage gate.
@@ -631,6 +659,13 @@ final class PlexHomeViewController: UIViewController {
     }
 
     // MARK: - Lifecycle
+
+    /// Search mode's top inset IS the safe area (see `updateContentTopInset`),
+    /// so it has to be re-read whenever the search chrome grows or collapses.
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        updateContentTopInset()
+    }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
@@ -787,6 +822,19 @@ final class PlexHomeViewController: UIViewController {
             Task { @MainActor in
                 await dataStore.loadLibrariesIfNeeded()
             }
+        case .watchlist:
+            // Watchlist page: the service paints from its disk cache in init,
+            // so the grid is already populated on a warm launch; this refresh
+            // reconciles it with the account (subject to the 60s staleness
+            // window the service enforces).
+            Task { @MainActor in
+                isLoadingWatchlist = watchlistService.watchlistItems.isEmpty
+                updateHomeState()
+                await watchlistService.fetchWatchlist()
+                isLoadingWatchlist = false
+                applySnapshot(animated: false)
+                updateHomeState()
+            }
         }
     }
 
@@ -807,6 +855,10 @@ final class PlexHomeViewController: UIViewController {
     /// in-library TMDB id set). Only touched in discover mode.
     private let discoverModel = DiscoverViewModel()
     private var isLoadingDiscover = false
+    /// Watchlist mode only: true while the first fetch of a cold (uncached)
+    /// watchlist is in flight, so the surface shows the loading state instead
+    /// of "Nothing in your Watchlist yet."
+    private var isLoadingWatchlist = false
     /// Original TMDB items per discover section, aligned index-for-index with
     /// the section's mapped MediaItems. Context menus and the hero need the
     /// TMDB originals (watchlist guid construction, library matching).
@@ -1584,21 +1636,28 @@ final class PlexHomeViewController: UIViewController {
     /// reserves space below the connection banner when it's visible
     /// (mirrors SwiftUI's banner positioning above the content).
     private func updateContentTopInset() {
-        // Search needs no extra top inset: `UISearchContainerViewController`
-        // already sizes the results view to the area BELOW the keyboard, so
-        // nothing scrolls under the chrome and content starts where the view
-        // starts. (Measured: results view is [0,207 1920x873] on 1080p.)
+        // Search reads the SAFE AREA, because that is how the search controller
+        // hands us its chrome height. It does NOT size the results view below
+        // the keyboard — measured on tvOS 26.5, the view stays full screen at
+        // (0,0) 1920x1080 and publishes `safeAreaInsets.top = 306` (field
+        // 60..130, keyboard 165..231, separator 274). This page sets
+        // `contentInsetAdjustmentBehavior = .never` for the hero's full-bleed
+        // layout, so that 306 is dropped on the floor unless it is read here,
+        // and the recents row drew from y=0 straight through the keyboard.
+        // Reading only the top keeps `.never` doing its job on the sides: the
+        // chrome also publishes an 80pt left/right inset, which would shift
+        // every full-bleed row off its tuned leading margin.
+        //
+        // `viewSafeAreaInsetsDidChange` re-runs this, so the inset tracks the
+        // chrome collapsing when focus moves into the results and growing back
+        // when it returns.
+        //
         // With no hero the first row's title IS the top of the page, and the
         // collapsed sidebar pill draws over it (#298), so clear the pill rather
-        // than just giving the row breathing room. Search keeps the old margin:
-        // its container carries the same clearance already.
-        // Search takes no FIXED inset. The search controller already sizes the
-        // results view to the area below its chrome, and the recents cell adds
-        // the small remainder itself, so a constant on top of that just stacked
-        // (48 + 48 put the first row 139pt below the keyboard's separator, twice
-        // the Apple TV app's gap).
+        // than just giving the row breathing room. Search has the pill
+        // suppressed instead (`TVSidebarView`), so it needs no pill clearance.
         var noHeroTop = ShellPillMetrics.contentClearance
-        if case .search = mode { noHeroTop = 0 }
+        if case .search = mode { noHeroTop = view.safeAreaInsets.top }
         let topInset: CGFloat = showHomeHero ? 0 : noHeroTop
         if collectionView.contentInset.top != topInset {
             collectionView.contentInset.top = topInset
@@ -1881,6 +1940,13 @@ final class PlexHomeViewController: UIViewController {
             isLoadingHubs = false
             hubsError = nil
             hubsEmpty = false
+        case .watchlist:
+            isLoadingHubs = isLoadingWatchlist
+            // A failed fetch with a populated cache keeps showing the cache;
+            // with nothing cached the message is the empty state, which reads
+            // correctly either way (the watchlist really has nothing to show).
+            hubsError = nil
+            hubsEmpty = watchlistService.watchlistItems.isEmpty
         }
 
         // Precedence: notConnected → loading → error → empty → content.
@@ -2122,7 +2188,7 @@ final class PlexHomeViewController: UIViewController {
             return makeRecommendationsStateLayout()
         case .sortHeader:
             return makeSortHeaderSectionLayout()
-        case .grid:
+        case .grid, .watchlistGrid:
             return makeGridSectionLayout(section: section)
         case .searchPrompt, .searchState:
             return makeSearchFullWidthLayout()
@@ -2336,7 +2402,7 @@ final class PlexHomeViewController: UIViewController {
             case .continueWatching, .recentlyAdded, .recommendations, .grid, .discoverList,
                  .searchGrid:
                 loadedCount = section.items.count
-            case .watchlist: loadedCount = section.watchlistItems.count
+            case .watchlist, .watchlistGrid: loadedCount = section.watchlistItems.count
             }
             header.configure(
                 title: section.title ?? "",
@@ -2440,6 +2506,15 @@ final class PlexHomeViewController: UIViewController {
             }
             return cell
 
+        case .watchlistGrid:
+            let cell = collectionView.dequeueReusableCell(withReuseIdentifier: WatchlistPosterCell.reuseID, for: indexPath) as! WatchlistPosterCell
+            if let item = section.watchlistItems[safe: indexPath.item] {
+                Perf.interval(.cellPrepare, key: perfKey) {
+                    cell.configure(item: item)
+                }
+            }
+            return cell
+
         case .sortHeader:
             let cell = collectionView.dequeueReusableCell(withReuseIdentifier: MediaLibrarySortControl.reuseID, for: indexPath) as! MediaLibrarySortControl
             cell.configure(title: section.title ?? "", count: totalGridCount, sortName: gridSort.displayName)
@@ -2539,6 +2614,8 @@ final class PlexHomeViewController: UIViewController {
                         break  // TMDB lists don't change with playback state
                     case .search:
                         break  // results re-fetch per query, nothing standing to refresh
+                    case .watchlist:
+                        break  // playback state doesn't change what is on the watchlist
                     case .home:
                         await self.dataStore.refreshHubs()
                         await self.dataStore.refreshLibraryHubs()
@@ -2564,7 +2641,7 @@ final class PlexHomeViewController: UIViewController {
                     self?.requestHeroUpgrade()
                 }
                 .store(in: &dataStoreObservers)
-        case .discover, .search:
+        case .discover, .search, .watchlist:
             break
         }
     }
@@ -2573,8 +2650,15 @@ final class PlexHomeViewController: UIViewController {
         watchlistService.$watchlistItems
             .receive(on: DispatchQueue.main)
             .sink { [weak self] items in
-                self?.setNeedsSnapshotApply()
-                self?.prewarmWatchlistArtwork(Array(items.prefix(20)))
+                guard let self else { return }
+                self.setNeedsSnapshotApply()
+                // Watchlist mode renders NOTHING else, so removing the last
+                // entry empties the collection: re-evaluate the state overlay
+                // or the surface is left blank with no focusable content.
+                if case .watchlist = self.mode { self.updateHomeState() }
+                // Only the row's leading tiles are worth prewarming; the grid's
+                // cells fetch their own art as they scroll into view.
+                self.prewarmWatchlistArtwork(Array(items.prefix(20)))
             }
             .store(in: &dataStoreObservers)
 
@@ -2751,6 +2835,10 @@ final class PlexHomeViewController: UIViewController {
                 // item or a placeholder, so a page landing under the focused
                 // cell reconfigures it in place instead of deleting it.
                 ids = section.items.indices.map(Self.gridSlotID)
+            case .watchlistGrid:
+                // Entry ids are stable and unique per watchlist entry, so a
+                // removal deletes exactly its own tile.
+                ids = section.watchlistItems.map { HomeItemID(sectionID: section.id, itemID: $0.id) }
             case .recommendationsLoading:
                 ids = [HomeItemID(sectionID: section.id, itemID: "recs-loading")]
             case .recommendationsError:
@@ -2797,8 +2885,8 @@ final class PlexHomeViewController: UIViewController {
     private func isShelfKind(_ kind: HomeSectionKind) -> Bool {
         switch kind {
         case .continueWatching, .recentlyAdded, .recommendations, .watchlist, .discoverList, .searchGrid: return true
-        case .hero, .grid, .recommendationsLoading, .recommendationsError, .sortHeader,
-             .searchPrompt, .searchState: return false
+        case .hero, .grid, .watchlistGrid, .recommendationsLoading, .recommendationsError,
+             .sortHeader, .searchPrompt, .searchState: return false
         }
     }
 
@@ -2934,8 +3022,8 @@ final class PlexHomeViewController: UIViewController {
                 cell.configure(item: section.watchlistItems[indexPath.item])
             }
             return cell
-        case .hero, .grid, .recommendationsLoading, .recommendationsError, .sortHeader,
-             .searchPrompt, .searchState:
+        case .hero, .grid, .watchlistGrid, .recommendationsLoading, .recommendationsError,
+             .sortHeader, .searchPrompt, .searchState:
             return nil
         }
     }
@@ -2979,8 +3067,8 @@ final class PlexHomeViewController: UIViewController {
             Task { await openWatchlistPreview(section: section, tappedIndex: itemIndex, indexPath: IndexPath(item: itemIndex, section: sectionIndex)) }
         case .searchGrid:
             handleSearchTap(section: section, indexPath: IndexPath(item: itemIndex, section: sectionIndex))
-        case .hero, .grid, .recommendationsLoading, .recommendationsError, .sortHeader,
-             .searchPrompt, .searchState:
+        case .hero, .grid, .watchlistGrid, .recommendationsLoading, .recommendationsError,
+             .sortHeader, .searchPrompt, .searchState:
             return
         }
     }
@@ -2992,7 +3080,7 @@ final class PlexHomeViewController: UIViewController {
         switch section.kind {
         case .continueWatching, .recentlyAdded:
             break
-        case .hero, .watchlist, .recommendations, .grid, .discoverList,
+        case .hero, .watchlist, .watchlistGrid, .recommendations, .grid, .discoverList,
              .recommendationsLoading, .recommendationsError, .sortHeader,
              .searchPrompt, .searchState, .searchGrid:
             return  // No pagination for these (matches SwiftUI hubKey == nil)
@@ -3029,8 +3117,8 @@ final class PlexHomeViewController: UIViewController {
             presentTileMenu(sections: tileMenuSections(for: item, isContinueWatching: false))
         case .watchlist:
             presentWatchlistTileMenu(sectionID: sectionID, itemIndex: itemIndex)
-        case .hero, .grid, .recommendationsLoading, .recommendationsError, .sortHeader,
-             .searchPrompt, .searchState:
+        case .hero, .grid, .watchlistGrid, .recommendationsLoading, .recommendationsError,
+             .sortHeader, .searchPrompt, .searchState:
             return  // hero / state cells don't get menus
         }
     }
@@ -3182,8 +3270,8 @@ final class PlexHomeViewController: UIViewController {
                 return nil
             }
             return playableItem(section.items[itemIndex])
-        case .watchlist, .hero, .grid, .recommendationsLoading, .recommendationsError,
-             .sortHeader, .searchPrompt, .searchState:
+        case .watchlist, .watchlistGrid, .hero, .grid, .recommendationsLoading,
+             .recommendationsError, .sortHeader, .searchPrompt, .searchState:
             return nil
         }
     }
@@ -3314,6 +3402,10 @@ final class PlexHomeViewController: UIViewController {
         if case .discover = mode {
             return computeDiscoverSections()
         }
+        if case .watchlist = mode {
+            let items = watchlistService.watchlistItems
+            return items.isEmpty ? [] : [.watchlistGrid(items: items)]
+        }
         if case .search = mode {
             return computeSearchSections()
         }
@@ -3355,7 +3447,11 @@ final class PlexHomeViewController: UIViewController {
         }
 
         // Watchlist
-        let watchlistItems = Array(watchlistService.watchlistItems.prefix(20))
+        // Uncapped: the row is the only place Home shows the watchlist, so a
+        // cap here hid entries the user added and could not otherwise reach.
+        // Tiles cost nothing until the row scrolls to them, and the tap path
+        // maps a window around the tapped entry rather than the whole list.
+        let watchlistItems = watchlistService.watchlistItems
         if !watchlistItems.isEmpty {
             sections.append(.watchlist(items: watchlistItems))
         }
@@ -3572,7 +3668,7 @@ final class PlexHomeViewController: UIViewController {
         let cacheKey: String
         let sourceHubs: [PlexHub]
         switch mode {
-        case .discover, .search:
+        case .discover, .search, .watchlist:
             return  // no Plex-hub hero on these surfaces
         case .home:
             cacheKey = "home"
@@ -3605,7 +3701,7 @@ final class PlexHomeViewController: UIViewController {
         switch mode {
         case .home: isTMDBEligible = true
         case .library: isTMDBEligible = trendingHeroType() != nil
-        case .discover, .search: isTMDBEligible = false
+        case .discover, .search, .watchlist: isTMDBEligible = false
         }
 
         if heroItems.isEmpty {
@@ -3678,7 +3774,7 @@ final class PlexHomeViewController: UIViewController {
                 items,
                 toLibraryKeys: dataStore.librariesPinnedToHome.map { $0.key }
             )
-        case .library, .discover, .search:
+        case .library, .discover, .search, .watchlist:
             return items
         }
     }
@@ -3780,7 +3876,7 @@ final class PlexHomeViewController: UIViewController {
             guard let t = trendingHeroType() else { lastUpgradedIndexGeneration = -1; return }
             cacheKey = key
             heroType = t
-        case .discover, .search:
+        case .discover, .search, .watchlist:
             return
         }
 
@@ -3880,7 +3976,7 @@ final class PlexHomeViewController: UIViewController {
         switch mode {
         case .home: sourceHubs = dataStore.hubs
         case .library(let key, _): sourceHubs = dataStore.libraryHubs[key] ?? []
-        case .discover, .search: return
+        case .discover, .search, .watchlist: return
         }
         let fallback = computeHubBackedHero(from: sourceHubs)
         if !fallback.isEmpty {
@@ -4091,6 +4187,8 @@ final class PlexHomeViewController: UIViewController {
         case .grid:
             guard let item = section.items[safe: indexPath.item], !item.isGridPlaceholder else { return }
             presentPreview(forSection: section, indexPath: indexPath)
+        case .watchlistGrid:
+            Task { await openWatchlistPreview(section: section, tappedIndex: indexPath.item, indexPath: indexPath) }
         }
     }
 
@@ -4174,12 +4272,24 @@ final class PlexHomeViewController: UIViewController {
         )
     }
 
+    /// Number of entries either side of the tapped one that get mapped for the
+    /// preview carousel. Mapping is per-entry network (a TMDB detail for
+    /// anything not owned locally) and the tap awaits all of it, so mapping a
+    /// long watchlist whole would stall the open and fire a request storm.
+    /// ponytail: fixed window, make it paged from the carousel if anyone ever
+    /// scrolls past the edge of one.
+    private static let watchlistPreviewWindow = 12
+
     private func openWatchlistPreview(section: HomeSectionData, tappedIndex: Int, indexPath: IndexPath) async {
-        let entries = section.watchlistItems
+        let allEntries = section.watchlistItems
+        guard allEntries.indices.contains(tappedIndex) else { return }
+        let window = max(0, tappedIndex - Self.watchlistPreviewWindow)
+            ..< min(allEntries.count, tappedIndex + Self.watchlistPreviewWindow + 1)
+        let entries = Array(allEntries[window])
         let pairs = await buildWatchlistMediaItems(from: entries)
         guard !pairs.isEmpty else { return }
 
-        let tapped = entries[tappedIndex]
+        let tapped = allEntries[tappedIndex]
         // Match on the originating watchlist entry id — robust across both
         // library-matched (Plex ratingKey) and TMDB-only itemID encodings,
         // and tolerant of entries that get skipped during mapping. Mirrors
@@ -4189,7 +4299,10 @@ final class PlexHomeViewController: UIViewController {
         let sourceItemIDs = pairs.map(\.sourceID)
         var sourceIndexMap: [Int: Int] = [:]
         for (previewIndex, pair) in pairs.enumerated() {
-            if let sourceIndex = entries.firstIndex(where: { $0.id == pair.sourceID }) {
+            // Indices are in SECTION coordinates (the tile the entry morphs
+            // from), so they must be looked up in the full entry list, not in
+            // the mapped window.
+            if let sourceIndex = allEntries.firstIndex(where: { $0.id == pair.sourceID }) {
                 sourceIndexMap[sourceIndex] = previewIndex
             }
         }
@@ -4574,7 +4687,7 @@ final class PlexHomeViewController: UIViewController {
 
     private func sourceItemIDs(for section: HomeSectionData) -> [String] {
         switch section.kind {
-        case .watchlist:
+        case .watchlist, .watchlistGrid:
             return section.watchlistItems.map(\.id)
         default:
             return section.items.enumerated().map { index, item in
@@ -4598,7 +4711,7 @@ final class PlexHomeViewController: UIViewController {
             })?.offset {
                 return IndexPath(item: itemIndex, section: sectionIndex)
             }
-        case .watchlist:
+        case .watchlist, .watchlistGrid:
             if let itemIndex = section.watchlistItems.firstIndex(where: { $0.id == target.itemID }) {
                 return IndexPath(item: itemIndex, section: sectionIndex)
             }
@@ -5000,7 +5113,7 @@ extension PlexHomeViewController: UICollectionViewDelegate {
         case .continueWatching, .recentlyAdded, .watchlist, .recommendations, .discoverList, .searchGrid:
             break
         case .hero, .recommendationsLoading, .recommendationsError, .sortHeader, .grid,
-             .searchPrompt, .searchState:
+             .watchlistGrid, .searchPrompt, .searchState:
             return true
         }
 
@@ -5034,8 +5147,8 @@ extension PlexHomeViewController: UICollectionViewDelegate {
         let section = sectionsSnapshot[indexPath.section]
         switch section.kind {
         case .hero, .recommendationsLoading, .recommendationsError, .sortHeader,
-             .searchPrompt, .searchState, .searchGrid:
-            return  // No pagination for these (search caps at 80 results)
+             .searchPrompt, .searchState, .searchGrid, .watchlistGrid:
+            return  // No pagination for these (the watchlist is fetched whole)
         case .continueWatching, .recentlyAdded, .recommendations, .watchlist, .discoverList:
             return  // Shelf rows paginate from their own willDisplay (shelfWillDisplay)
         case .grid:
@@ -5061,6 +5174,13 @@ extension PlexHomeViewController: UICollectionViewDelegate {
             return
         }
         let section = sectionsSnapshot[indexPath.section]
+        // Watchlist tiles are Discover entries, not library items: they get the
+        // row's own menu (More Info + Remove from Watchlist), because the
+        // library menu's actions all need a server ratingKey.
+        if case .watchlistGrid = section.kind {
+            presentWatchlistTileMenu(sectionID: section.id, itemIndex: indexPath.item)
+            return
+        }
         guard case .grid = section.kind, let item = section.items[safe: indexPath.item],
               !item.isGridPlaceholder else { return }
         presentTileMenu(sections: tileMenuSections(for: item, isContinueWatching: false))
@@ -5454,6 +5574,13 @@ extension PlexHomeViewController: UICollectionViewDelegate {
             if let indexPath = context.nextFocusedIndexPath {
                 scrollGridCellIntoView(at: indexPath)
             }
+        case .watchlistGrid:
+            // Same multi-row reason as the library grid, none of its A–Z or
+            // letter-jump bookkeeping. Falling through to `default` centred the
+            // section's FIRST item, which pinned the page on row 1.
+            if let indexPath = context.nextFocusedIndexPath {
+                scrollGridCellIntoView(at: indexPath)
+            }
         default:
             // The first row under the hero collapses the hero to a FIXED,
             // hero-derived band (not a centre of the row), so the hero's
@@ -5485,8 +5612,8 @@ extension PlexHomeViewController: UICollectionViewDelegate {
         }
         let section = sectionsSnapshot[indexPath.section]
         switch section.kind {
-        case .continueWatching, .recentlyAdded, .watchlist, .recommendations, .grid, .discoverList,
-             .searchGrid:
+        case .continueWatching, .recentlyAdded, .watchlist, .watchlistGrid, .recommendations,
+             .grid, .discoverList, .searchGrid:
             // Orthogonal rows AND the grid get the walk-back redirect:
             // point at the previous cell when it's already on screen
             // (ported from MediaLibraryViewController.updateLeftEdgeGuide).

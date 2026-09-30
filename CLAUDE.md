@@ -64,8 +64,9 @@ Rivulet/                # The tvOS app — everything below.
 │   │   ├── (PlexNetworkManager, PlexAuthManager, PlexDataStore, …)
 │   │   └── Playback/   # AetherPlayer + routing/remux (see Docs/RIVULET_PLAYER.md)
 │   │       ├── Pipeline/     # ContentRouter (routing decisions)
+│   │       ├── ContentFilter/ # Local mute/skip filter (see "Content Filter (VOD)")
 │   │       └── Subtitles/    # CaptionAppearance (system caption settings), SubtitleCue,
-│   │                          #   VTTParser (content-filter only; captions are not app-parsed)
+│   │                          #   VTT/SRT/ASS parsers (content-filter only; captions are not app-parsed)
 │   ├── LiveTV/         # PlexLiveTVProvider, IPTVProvider, LiveTVDataStore
 │   ├── IPTV/           # M3UParser, XMLTVParser, DispatcharrService
 │   ├── Insights/       # InsightsTriviaClient, InsightsShowIDResolver (in-player cast/trivia panel)
@@ -93,7 +94,8 @@ Rivulet/                # The tvOS app — everything below.
 │   ├── Discover/       # DiscoverViewModel (SwiftUI Discover* views removed; UIKit home renders Discover)
 │   ├── LiveTV/         # EPGGuideView + GuideLayoutView + LiveGuideInfoCardView (56-style guide),
 │   │                   #   LiveTVAetherPlayerViewController (UIKit live rail), LiveTVContainerView,
-│   │                   #   ChannelListView, MultiStreamViewModel, StreamSlotView, AetherSlotPlayerView
+│   │                   #   MultiStreamViewModel; UIKit/: LiveBrowseViewController ("What's On"),
+│   │                   #   LiveMultiviewViewController, LiveCardCell, LiveMiniPlayerView
 │   ├── Settings/       # SettingsDescriptors, SettingsModels, PlexAuthView
 │   │   └── UIKit/      # SettingsContainer/Page VCs, SettingsCell, SettingsPageModels (canonical)
 │   ├── Components/     # CachedAsyncImage, GlassRowStyle, WhatsNewView
@@ -285,8 +287,18 @@ focusless AND single-transport, or when a needed hand-off is press-only.
   next press took the collapse branch and worked: **every other Menu press
   did nothing at all.** `PlexHomeViewController.handleMenuBack` had the check
   from the start, which is why only the shell absorbed the press.
-- The player's tap-vs-hold sites are duration-based and deliberately
-  untouched pending InputProbe field data on IR repeat codes (#212).
+- **The VOD player's content state has ONE press owner.**
+  `PlayerContainerViewController`'s `pressesBegan`/`Ended` ("Content-state
+  presses") handle Left/Right/Up/Down/Select whenever no control holds focus,
+  reached from `ContentFocusAnchorView`, an invisible UIKit focus stop. Do not
+  put focus back on a SwiftUI layer there (arrow presses to a focused SwiftUI
+  item never reliably reached UIKit, which is why IR/CEC and clicks-only Siri
+  Remotes could not skip: #212, #232, #305), and do not add a GameController
+  listener for anything that also arrives as a `UIPress`:
+  `RemoteInputHandler.uikitOwnsPresses` limits the player's GameController path
+  to input with no `UIPress` (clickpad rotation, shoulders, X). Tap-vs-hold is
+  still duration-based (`DirectionalPressDetector`); how a held IR button
+  arrives (#212) still wants InputProbe field data.
 - **The focus engine's occlusion test is geometric, not hit-test based.** Any
   non-hidden view with alpha above zero that sits above an item's frame makes
   that item unfocusable, even with a clear background and a `hitTest`
@@ -329,8 +341,8 @@ UniversalPlayerViewModel  ← state, markers, post-video, NowPlaying, route chan
         ├── .aether → AetherPlayer, rendered via AetherVideoSurfaceView (direct-play URL exists; the default)
         └── .hls    → AVPlayer on Plex server transcode (no direct-play URL, or fallback after Aether failure)
 
-Live TV: MultiStreamViewModel / StreamSlotView instantiate AetherPlayer() per grid slot,
-         rendered via AetherSlotPlayerView (AVPlayerLayer). Up to 4 concurrent slots.
+Live TV: MultiStreamViewModel instantiates AetherPlayer() per multiview slot, rendered by
+         LiveMultiviewTileView through the engine surface. Up to 4 concurrent slots.
 ```
 
 Key components:
@@ -359,11 +371,12 @@ Key components:
   of `SubtitleManager.load` with it, leaving a permanently empty track feeding a view
   that rendered nothing. All deleted. On that route subtitles come from the server
   (burn-in, or the WebVTT rendition the client profile requests).
-- `SubtitleParser.swift` survived that cull and is NOT dead: `VTTParser` is live,
-  parsing `text/mcf+vtt` for the content filter (`ContentFilterParsers`). `SRTParser`,
-  `ASSParser` and `SubtitleFormat` in the same file have no production caller and are
-  held up only by their own unit test. Check for the type, not the filename, before
-  deleting anything here.
+- `SubtitleParser.swift` survived that cull and is NOT dead, but nothing in it
+  renders: it serves the content filter. `VTTParser` reads `text/mcf+vtt` lists
+  (`ContentFilterParsers`), and all three parsers (VTT, SRT, ASS) read a title's
+  external subtitle file in full so language muting works with subtitles off and on
+  the `hls` route (`ContentFilterSources`). Check for the type, not the filename,
+  before deleting anything here.
 
 **Playback States** (PlayerProtocol): `.idle`, `.loading`, `.playing`, `.paused`, `.buffering`, `.ended`, `.failed`
 
@@ -373,7 +386,41 @@ Key components:
 3. `.hls` — server-side transcode; primary when no direct-play URL exists, and the fallback after an Aether startup failure. `requiresVideoTranscode` codecs force a video transcode (not just remux) on this route.
 
 #### Live TV
-Routes through **AetherPlayer** per grid slot (`MultiStreamViewModel` / `StreamSlotView` instantiate `AetherPlayer()`, rendered via `AetherSlotPlayerView`). The grid supports up to 4 concurrent slots (opt-in past 2). HDHomeRun delivers a direct stream; DVB tuners require a Plex transcode URL with full client-profile parameters (see Plex Live TV section below).
+Two layouts: What's On (`LiveBrowseViewController`, the default) and the Guide (`GuideLayoutView`). Both play through `LiveTVAetherPlayerViewController` on the VOD glass rail. Multiview (`LiveMultiviewViewController`) runs **AetherPlayer** per slot (`MultiStreamViewModel` instantiates `AetherPlayer()`, each tile binds the engine surface), up to 4 concurrent slots. HDHomeRun delivers a direct stream; DVB tuners require a Plex transcode URL with full client-profile parameters (see Plex Live TV section below).
+
+### Content Filter (VOD)
+
+A local VidAngel/ClearPlay-style filter: mute language, skip scenes, never touch the
+file. Off by default (Settings → Playback → Content Filtering).
+`ContentFilterManager`, owned by `UniversalPlayerViewModel`, merges three sources and
+judges all of them against the user's settings at playback time:
+1. **The title's own subtitle file**: the English external text stream Plex serves
+   (`ContentFilterSources.transcriptStream`), fetched and scanned against
+   `ProfanityDictionary` up front. This is what makes language muting work with
+   subtitles off, and it is the only language source on the `hls` route.
+2. **The subtitles on screen**: the active cue, matched live. Covers titles whose
+   only subtitles are embedded (no `key`, so Plex can't serve them on their own).
+3. **An imported MCF/EDL list** from the user's list source, the only source of
+   scene skips. A folder source is searched by file name, IMDb id, then rating key.
+
+Rules that look wrong until you know them:
+- **moviecontentfilter.com's `.mcf` download is not in real time.** It rescales the
+  title onto 0–99:59:59.999 and leaves the player to map it back with the release's
+  own start and end, which Rivulet can't know, so such a file is rejected as
+  `.unsynchronized`. That site's EDL export takes the start and end and is the
+  supported route. An MCF file is a full annotation, not a per-user filter, which is
+  why `FilterCategory(mcfName:)` drops topics like product placement and kissing.
+- **The list cache is keyed by the URLs a list would be fetched from**, not the
+  rating key, so clearing or changing the source can't resurrect an old list. The
+  cached copy is deleted only when every candidate answers "not found" (404/410, or
+  S3's 403) or holds nothing usable; a timeout, a 5xx, a 401/429, or a page that
+  isn't a filter list at all (a captive portal) leaves it in place.
+- **Profanity Strength applies to profanity from every source**, imported lists
+  included. EDL entries carry no severity and count as strong.
+- **Only "fuck" matches inside a word.** Every other term is whole-word, because
+  every other term has an innocent host ("Scunthorpe", "cocktail", romanized names).
+- **The rail button pauses filtering for the current title only.** It shows only
+  while filtering is on in Settings, and `reset()` clears the pause on every item.
 
 ### Plex Metadata Hierarchy
 
@@ -606,7 +653,7 @@ Most tests live in `RivuletTests/Unit/` (mirrors `Rivulet/` roughly by feature �
 | Rail panel (UIKit) | `Views/Player/UIKit/PlayerRailPanelView.swift` |
 | Up Next panel (UIKit) | `Views/Player/UIKit/PlayerUpNextPanelView.swift` |
 | Player (AetherEngine adapter) | `Services/Plex/Playback/AetherPlayer.swift` |
-| Live TV slot render surface | `Views/LiveTV/AetherSlotPlayerView.swift` |
+| Live TV multiview (tiles bind the engine surface) | `Views/LiveTV/UIKit/LiveMultiviewViewController.swift` |
 | Routing decisions | `Services/Plex/Playback/Pipeline/ContentRouter.swift` |
 | Aether render surface | `Views/Player/Aether/AetherVideoSurfaceView.swift` |
 

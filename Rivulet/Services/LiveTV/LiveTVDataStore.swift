@@ -39,8 +39,18 @@ class LiveTVDataStore: ObservableObject {
     /// bound just stops an endless right-scroll from firing pointless fetches.
     private let epgMaxHoursAhead = 72
 
-    /// Favorite channel IDs
-    @Published var favoriteIds: Set<String> = [] {
+    /// Channels played lately, newest first: What's On's Recently Watched row.
+    @Published private(set) var recentChannelIds: [String] = []
+
+    /// What For You learns from, oldest first. See `LiveSuggestions`.
+    private(set) var viewings: [LiveViewing] = []
+
+    /// The Live TV setting that turns For You and its learning on and off.
+    static let suggestionsKey = "liveTVSuggestions"
+    var suggestionsEnabled: Bool { userDefaults.object(forKey: Self.suggestionsKey) as? Bool ?? true }
+
+    /// Channels favorited in Rivulet, from any source, in the viewer's order.
+    @Published private(set) var favoriteIds: [String] = [] {
         didSet {
             saveFavorites()
         }
@@ -98,6 +108,8 @@ class LiveTVDataStore: ObservableObject {
 
     private let userDefaults = UserDefaults.standard
     private let favoritesKey = "liveTVFavoriteChannelIds"
+    private let recentsKey = "liveTVRecentChannelIds"
+    private let viewingsKey = "liveTVViewings"
     private let sourcesKey = "liveTVSourceConfigurations"
 
     // MARK: - Source Configuration (Persistable)
@@ -160,11 +172,6 @@ class LiveTVDataStore: ObservableObject {
 
     // MARK: - Computed Properties
 
-    /// Channels filtered to favorites only
-    var favoriteChannels: [UnifiedChannel] {
-        channels.filter { favoriteIds.contains($0.id) }
-    }
-
     /// Channels grouped by category/group
     var channelsByGroup: [String: [UnifiedChannel]] {
         var groups: [String: [UnifiedChannel]] = [:]
@@ -192,6 +199,9 @@ class LiveTVDataStore: ObservableObject {
 
     private init() {
         loadFavorites()
+        recentChannelIds = userDefaults.stringArray(forKey: recentsKey) ?? []
+        viewings = userDefaults.data(forKey: viewingsKey)
+            .flatMap { try? JSONDecoder().decode([LiveViewing].self, from: $0) } ?? []
         loadSavedSources()
         observeAppLifecycle()
     }
@@ -786,19 +796,7 @@ class LiveTVDataStore: ObservableObject {
         let updated = channels.map { channel -> UnifiedChannel in
             guard channel.logoURL == nil, let logo = logos[channel.id] else { return channel }
             didChange = true
-            return UnifiedChannel(
-                id: channel.id,
-                sourceType: channel.sourceType,
-                sourceId: channel.sourceId,
-                channelNumber: channel.channelNumber,
-                name: channel.name,
-                callSign: channel.callSign,
-                logoURL: logo,
-                streamURL: channel.streamURL,
-                tvgId: channel.tvgId,
-                groupTitle: channel.groupTitle,
-                isHD: channel.isHD
-            )
+            return channel.withLogo(logo)
         }
         if didChange { channels = updated }
     }
@@ -923,6 +921,13 @@ class LiveTVDataStore: ObservableObject {
         return programs.first { $0.startTime <= now && $0.endTime > now }
     }
 
+    /// The programme airing on `channel` at `date`. A timeshifted viewer is
+    /// watching the past, so "current" is the programme at the playhead, not
+    /// at the wall clock.
+    func program(for channel: UnifiedChannel, at date: Date) -> UnifiedProgram? {
+        epg[channel.id]?.first { $0.startTime <= date && $0.endTime > date }
+    }
+
     /// Get the next program for a channel
     func getNextProgram(for channel: UnifiedChannel) -> UnifiedProgram? {
         guard let programs = epg[channel.id] else { return nil }
@@ -936,13 +941,140 @@ class LiveTVDataStore: ObservableObject {
         return programs.filter { $0.endTime > startDate && $0.startTime < endDate }
     }
 
+    // MARK: - DVR
+
+    /// Upcoming and in-progress recordings across every source that records.
+    /// Drives the guide's recording marks and the Recordings page; refreshed
+    /// when a Live TV surface appears and after every change made here.
+    @Published private(set) var scheduledRecordings: [LiveTVScheduledRecording] = []
+
+    private func recordingProvider(for sourceId: String) -> (any LiveTVRecordingProvider)? {
+        providers[sourceId].flatMap(Self.recorder)
+    }
+
+    /// `provider` as a recorder, when it records. Every IPTV source has the
+    /// recording methods (Dispatcharr and plain M3U share a type), but only
+    /// Dispatcharr with an API key can use them.
+    private static func recorder(_ provider: any LiveTVProvider) -> (any LiveTVRecordingProvider)? {
+        if let iptv = provider as? IPTVProvider, !iptv.supportsRecording { return nil }
+        return provider as? any LiveTVRecordingProvider
+    }
+
+    private var recordingProviders: [any LiveTVRecordingProvider] {
+        providers.values.compactMap(Self.recorder)
+    }
+
+    /// Whether any configured source can record at all.
+    var hasRecordingSources: Bool {
+        !recordingProviders.isEmpty
+    }
+
+    /// Whether `channel`'s source can record.
+    func canRecord(_ channel: UnifiedChannel) -> Bool {
+        recordingProvider(for: channel.sourceId) != nil
+    }
+
+    /// The ways `channel`'s source can record `program`.
+    func recordOptions(for program: UnifiedProgram, on channel: UnifiedChannel) async throws -> [LiveTVRecordOption] {
+        guard let provider = recordingProvider(for: channel.sourceId) else {
+            throw LiveTVRecordingError.notSupported
+        }
+        return try await provider.recordOptions(for: program, on: channel)
+    }
+
+    func record(_ option: LiveTVRecordOption, program: UnifiedProgram, on channel: UnifiedChannel) async throws {
+        guard let provider = recordingProvider(for: channel.sourceId) else {
+            throw LiveTVRecordingError.notSupported
+        }
+        try await provider.record(option, program: program, on: channel)
+        await refreshScheduledRecordings()
+    }
+
+    /// The live recording (scheduled or in progress) that covers `program`.
+    func activeRecording(for program: UnifiedProgram) -> LiveTVScheduledRecording? {
+        scheduledRecordings.first {
+            ($0.status == .scheduled || $0.status == .recording) && $0.covers(program)
+        }
+    }
+
+    /// Ids of the guide programmes set to record, for the guide's marks. Only
+    /// the channels a recording names are looked at, so this stays cheap on
+    /// a large lineup.
+    func recordingProgramIds(in guide: [String: [UnifiedProgram]]) -> Set<String> {
+        let active = scheduledRecordings.filter { $0.status == .scheduled || $0.status == .recording }
+        guard !active.isEmpty else { return [] }
+        var ids = Set<String>()
+        for (channelId, recordings) in Dictionary(grouping: active, by: { $0.channelId ?? "" })
+        where !channelId.isEmpty {
+            for program in guide[channelId] ?? [] where recordings.contains(where: { $0.covers(program) }) {
+                ids.insert(program.id)
+            }
+        }
+        return ids
+    }
+
+    func refreshScheduledRecordings() async {
+        let recorders = recordingProviders
+        guard !recorders.isEmpty else {
+            if !scheduledRecordings.isEmpty { scheduledRecordings = [] }
+            return
+        }
+        var all: [LiveTVScheduledRecording] = []
+        for provider in recorders {
+            // One source failing must not blank the others' recordings.
+            if let recordings = try? await provider.scheduledRecordings() {
+                all.append(contentsOf: recordings)
+            }
+        }
+        all.sort { $0.startTime < $1.startTime }
+        if all != scheduledRecordings { scheduledRecordings = all }
+    }
+
+    func cancel(_ recording: LiveTVScheduledRecording) async throws {
+        guard let provider = recordingProvider(for: recording.sourceId) else {
+            throw LiveTVRecordingError.notSupported
+        }
+        try await provider.cancel(recording)
+        await refreshScheduledRecordings()
+    }
+
+    /// Every standing rule, across sources.
+    func recordingRules() async -> [LiveTVRecordingRule] {
+        var rules: [LiveTVRecordingRule] = []
+        for provider in recordingProviders {
+            if let sourceRules = try? await provider.recordingRules() {
+                rules.append(contentsOf: sourceRules)
+            }
+        }
+        return rules
+    }
+
+    /// Cancel the series rule that made `recording`.
+    func cancelSeries(of recording: LiveTVScheduledRecording) async throws {
+        guard let ruleId = recording.ruleId,
+              let provider = recordingProvider(for: recording.sourceId) else {
+            throw LiveTVRecordingError.notSupported
+        }
+        try await provider.delete(LiveTVRecordingRule(id: ruleId, sourceId: recording.sourceId,
+                                                      title: recording.title, detail: nil))
+        await refreshScheduledRecordings()
+    }
+
+    func delete(_ rule: LiveTVRecordingRule) async throws {
+        guard let provider = recordingProvider(for: rule.sourceId) else {
+            throw LiveTVRecordingError.notSupported
+        }
+        try await provider.delete(rule)
+        await refreshScheduledRecordings()
+    }
+
     // MARK: - Favorites
 
     func toggleFavorite(_ channel: UnifiedChannel) {
-        if favoriteIds.contains(channel.id) {
-            favoriteIds.remove(channel.id)
+        if let index = favoriteIds.firstIndex(of: channel.id) {
+            favoriteIds.remove(at: index)
         } else {
-            favoriteIds.insert(channel.id)
+            favoriteIds.append(channel.id)
         }
     }
 
@@ -950,14 +1082,81 @@ class LiveTVDataStore: ObservableObject {
         favoriteIds.contains(channel.id)
     }
 
+    /// Moves a favorite one place earlier or later.
+    func moveFavorite(_ channelId: String, up: Bool) {
+        guard let index = favoriteIds.firstIndex(of: channelId) else { return }
+        let target = up ? index - 1 : index + 1
+        guard favoriteIds.indices.contains(target) else { return }
+        favoriteIds.swapAt(index, target)
+    }
+
+    /// The favorites among `channels`, in order.
+    func favorites(in channels: [UnifiedChannel]) -> [UnifiedChannel] {
+        Self.favorites(in: channels, order: favoriteIds)
+    }
+
+    /// Rivulet's favorites in the viewer's order, then any the source marks
+    /// (Plex account favorites) in the source's order.
+    static func favorites(in channels: [UnifiedChannel], order: [String]) -> [UnifiedChannel] {
+        let position = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return channels
+            .filter { position[$0.id] != nil || $0.isFavourite }
+            .sorted { lhs, rhs in
+                (position[lhs.id] ?? .max, lhs.favouriteRank ?? .max, lhs.channelNumber ?? .max)
+                    < (position[rhs.id] ?? .max, rhs.favouriteRank ?? .max, rhs.channelNumber ?? .max)
+            }
+    }
+
     private func loadFavorites() {
         if let saved = userDefaults.array(forKey: favoritesKey) as? [String] {
-            favoriteIds = Set(saved)
+            favoriteIds = saved
         }
     }
 
     private func saveFavorites() {
-        userDefaults.set(Array(favoriteIds), forKey: favoritesKey)
+        userDefaults.set(favoriteIds, forKey: favoritesKey)
+    }
+
+    // MARK: - Recently watched
+
+    /// `channel` started playing, full screen or in multiview: it heads
+    /// Recently Watched now, and For You learns from it once it has played a
+    /// minute, so channel surfing teaches nothing. Cancel the returned task
+    /// when it stops playing.
+    func beganWatching(_ channel: UnifiedChannel) -> Task<Void, Never> {
+        noteWatched(channel)
+        return Task { [weak self] in
+            try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled else { return }
+            self?.recordViewing(channel)
+        }
+    }
+
+    /// Erases what For You has learned. Recently Watched is untouched.
+    func forgetViewings() {
+        viewings = []
+        userDefaults.removeObject(forKey: viewingsKey)
+    }
+
+    private func noteWatched(_ channel: UnifiedChannel) {
+        var ids = recentChannelIds.filter { $0 != channel.id }
+        ids.insert(channel.id, at: 0)
+        recentChannelIds = Array(ids.prefix(12))
+        userDefaults.set(recentChannelIds, forKey: recentsKey)
+    }
+
+    /// Learns from `channel`'s programme right now, when suggestions are on.
+    private func recordViewing(_ channel: UnifiedChannel) {
+        guard suggestionsEnabled else { return }
+        let program = getCurrentProgram(for: channel).flatMap { $0.id.contains(":placeholder:") ? nil : $0 }
+        viewings.append(LiveViewing(
+            channelId: channel.id, at: Date(), title: program?.title,
+            labels: LiveGenre.specificLabels(of: program).sorted(),
+            genre: LiveGenre.of(channel, airing: program, guide: epg[channel.id] ?? [])?.rawValue))
+        viewings = Array(viewings.suffix(300))
+        if let data = try? JSONEncoder().encode(viewings) {
+            userDefaults.set(data, forKey: viewingsKey)
+        }
     }
 
     // MARK: - Stream URL

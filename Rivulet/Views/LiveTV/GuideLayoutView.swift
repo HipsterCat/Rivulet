@@ -7,7 +7,7 @@
 //
 //  UHF-style Live TV guide host. Three layers: the UIKit-backed EPG grid
 //  (bottom, virtualized, with its own pinned channel column + time ruler +
-//  now-line), the info bar on top, and the fullscreen / PiP player overlay.
+//  now-line), the info bar on top, and the corner player after Back.
 //  The grid is `EPGGuide` (see EPGGuideView.swift), ported from PlexGuide and
 //  fed by Rivulet's `LiveTVDataStore`.
 //
@@ -15,13 +15,6 @@
 import SwiftUI
 import Combine
 import UIKit
-
-/// Display mode for the Live TV player in the guide.
-enum LiveTVDisplayMode: Equatable {
-    case hidden      // No player visible
-    case fullscreen  // Player is fullscreen overlay
-    case pip         // Player is in PiP (small, top-right)
-}
 
 struct GuideLayoutView: View {
     /// Optional source ID to filter channels. nil = show all sources.
@@ -40,17 +33,51 @@ struct GuideLayoutView: View {
         return dataStore.channels
     }
 
-    /// Distinct, sorted M3U group titles used as category tabs.
+    /// Tab title for favourites: Rivulet's, from any source, then the source's
+    /// own (Plex account favourites). Not a `groupTitle`: a favourite keeps
+    /// its tuner group too, and this tab sorts by the order the user arranged
+    /// rather than by channel number.
+    static let favouritesTab = "Favorites"
+
+    /// Tabs that lead the bar regardless of the alphabet, in this order. A list
+    /// the user curated outranks a source's own grouping — burying "Favourites"
+    /// under F is the kind of correctness that reads as a bug.
+    private static let pinnedGroups = [favouritesTab]
+
+    /// Distinct group titles used as category tabs: pinned ones first, then
+    /// everything else alphabetically. Fed by an M3U's `group-title` and, for
+    /// Plex sources, by the DVR's user-set tuner name.
     private var groupTitles: [String] {
-        let groups = sourceChannels.compactMap {
-            $0.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }.filter { !$0.isEmpty }
-        return Array(Set(groups)).sorted()
+        let groups = Set(
+            sourceChannels
+                .compactMap { $0.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        var available = groups
+        // Offered only when there are favourites, so no empty tab.
+        if !dataStore.favorites(in: sourceChannels).isEmpty {
+            available.insert(Self.favouritesTab)
+        }
+        let pinned = Self.pinnedGroups.filter(available.contains)
+        let rest = available.subtracting(pinned).sorted()
+        return pinned + rest
     }
 
     /// Channels shown in the grid: source-filtered, then category-filtered.
     private var channels: [UnifiedChannel] {
-        guard let group = selectedGroup else { return sourceChannels }
+        // A tab whose channels vanished on a refresh (favourites are best
+        // effort, and a lineup can change) falls back to everything. Filtering
+        // to nothing would replace the grid AND its tab bar with a spinner and
+        // leave no way to pick another tab.
+        guard let group = selectedGroup, groupTitles.contains(group) else { return sourceChannels }
+
+        // Favourites is a view over the flags, not a group match, and it keeps
+        // the user's arrangement instead of the merged channel-number sort
+        // every other tab inherits.
+        if group == Self.favouritesTab {
+            return dataStore.favorites(in: sourceChannels)
+        }
+
         return sourceChannels.filter {
             $0.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) == group
         }
@@ -103,16 +130,20 @@ struct GuideLayoutView: View {
         return min(max(floor, loaded), ceiling)
     }
 
-    // Player state
-    @State private var activeChannel: UnifiedChannel?
-    @State private var playerSessionId = UUID()
-    @State private var displayMode: LiveTVDisplayMode = .hidden
-
     // Guide state
     @State private var timelineStart = Date()
     @State private var now = Date()
     @State private var focusedChannel: UnifiedChannel?
     @State private var focusedProgram: UnifiedProgram?
+    /// Set when the player closes, so the grid comes back on the channel that
+    /// was playing (issue #317).
+    @State private var gridFocusRequest: EPGFocusRequest?
+
+    /// The channel still playing, with sound, in the corner after Back
+    /// (issue #318). Owned here until it is handed back full screen, replaced,
+    /// or the guide goes away.
+    @State private var miniSession: LiveTVSessionHandoff?
+    @AppStorage("liveTVKeepPlayingInGuide") private var keepPlayingInGuide = true
 
     // Backdrop transition state. The wash crossfades to the new programme's
     // image while the crisp artwork fades in over it.
@@ -121,6 +152,9 @@ struct GuideLayoutView: View {
     @State private var backdropProgress: Double = 1
     @State private var displayedArtworkImage: UIImage?
     @State private var artworkOpacity: Double = 0
+    /// Unlabelled programme art measured as landscape, keyed to the programme it
+    /// was measured for so a late result never paints behind another programme.
+    @State private var resolvedLandscape: (programID: String, url: URL)?
 
     /// How long focus has to rest on a programme before its backdrop loads.
     /// Holding a direction to cross the guide should not fire an image load or
@@ -142,29 +176,36 @@ struct GuideLayoutView: View {
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
+                    // The info bar, category pills and channel column all start
+                    // `cellSpacing` into this, so they line up on the page margin.
                     guideContent
-                        .opacity(displayMode == .fullscreen ? 0 : 1)
-                        .disabled(displayMode == .fullscreen)
+                        .padding(.leading, EPGTheme.pageMargin - EPGTheme.cellSpacing)
                 }
 
                 // EPG failure banner — surfaced so an empty guide doesn't look
                 // like a Rivulet bug when the cause is a broken third-party EPG.
-                if !dataStore.epgIssues.isEmpty, displayMode != .fullscreen {
+                if !dataStore.epgIssues.isEmpty {
                     EPGIssueBanner(issues: dataStore.epgIssues)
-                        .padding(.horizontal, 40)
-                        .padding(.top, 16)
+                        .padding(.horizontal, EPGTheme.pageMargin)
+                        .padding(.top, EPGTheme.pageMargin)
                         .frame(maxWidth: .infinity, alignment: .top)
                         .allowsHitTesting(false)
                 }
 
-                // Player layer — present when a channel is active.
-                if let channel = activeChannel {
-                    liveTVPlayerLayer(channel: channel, screenSize: geo.size)
-                        .zIndex(displayMode == .fullscreen ? 100 : 10)
+                if let miniSession {
+                    LiveMiniPlayerRepresentable(session: miniSession)
+                        .frame(width: EPGTheme.miniPlayerSize.width, height: EPGTheme.miniPlayerSize.height)
+                        .padding(.top, EPGTheme.pageMargin)
+                        .padding(.trailing, EPGTheme.pageMargin)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                        .allowsHitTesting(false)
+                        .zIndex(20)
                 }
             }
         }
-        .ignoresSafeArea(edges: [.bottom, .trailing])
+        // Margins come from `EPGTheme.pageMargin`, like the rest of the app,
+        // not from the tvOS safe area (80pt leading, 60pt top).
+        .ignoresSafeArea()
         .onAppear(perform: setupStartTime)
         .task {
             if dataStore.channels.isEmpty { await dataStore.loadChannels() }
@@ -172,9 +213,20 @@ struct GuideLayoutView: View {
                 await dataStore.loadEPG(startDate: timelineStart, hours: EPGTheme.initialGuideHours)
             }
             seedFocus()
+            await dataStore.refreshScheduledRecordings()
         }
         .onChange(of: channels.count) { _, _ in seedFocus() }
         .onReceive(tick) { t in now = t }
+        .onDisappear {
+            // Leaving the guide (another tab, a full-screen page) ends the
+            // corner player. Opening the player takes the session first, so
+            // this never stops a channel that is being handed back.
+            miniSession?.stop()
+            miniSession = nil
+        }
+        .task(id: focusedProgram?.id) {
+            await resolveLandscape(for: focusedProgram)
+        }
     }
 
     // MARK: - Guide (grid + info bar)
@@ -195,7 +247,6 @@ struct GuideLayoutView: View {
                     focusedChannel = nil
                     seedFocus()
                 },
-                menuActive: displayMode == .fullscreen,
                 onFocus: { channel, program in
                     focusedChannel = channel
                     focusedProgram = program
@@ -206,7 +257,14 @@ struct GuideLayoutView: View {
                 },
                 transparent: true,                 // dark see-through boxes + rounded clipping
                 // Reserve the info bar + category bar above the ruler.
-                topInset: EPGTheme.infoBarHeight + EPGTheme.categoryBarHeight
+                topInset: EPGTheme.infoBarHeight + EPGTheme.categoryBarHeight,
+                focusRequest: gridFocusRequest,
+                onLongPress: { channel, program, frame in
+                    presentProgramMenu(channel: channel, program: program, frame: frame)
+                },
+                recordingProgramIds: dataStore.recordingProgramIds(in: dataStore.epg),
+                categoryActionTitle: dataStore.hasRecordingSources ? "Recordings" : nil,
+                onCategoryAction: { presentRecordings() }
             )
 
             GuideInfoBar(channel: focusedChannel, program: focusedProgram)
@@ -218,21 +276,43 @@ struct GuideLayoutView: View {
 
     /// The focused programme's image, strong at the top and dimming to a faint
     /// ambiance over the grid.
-    /// The guide backdrop: a 16:9 landscape programme image that is DISTINCT from
-    /// the poster artwork. If the programme's only image is a single reused one
-    /// (e.g. a channel logo serving as the programme icon), there's no real
-    /// backdrop and the stock settings background shows instead.
+    /// The guide backdrop: the programme's declared 16:9 image, else its
+    /// unlabelled art once measured as landscape. Anything else leaves the
+    /// backdrop empty and the stock settings background shows instead.
     private var guideBackdropURL: URL? {
-        guard let prog = focusedProgram, let landscape = prog.landscapeURL else { return nil }
-        guard let posterSource = prog.posterURL ?? prog.iconURL else { return landscape }
-        return landscape == posterSource ? nil : landscape
+        guard let prog = focusedProgram else { return nil }
+        if let landscape = prog.landscapeURL { return landscape }
+        if let candidate = prog.iconURL ?? prog.posterURL,
+           EPGImageClassifier.shared.isLandscape(candidate) {
+            return candidate
+        }
+        guard let resolved = resolvedLandscape, resolved.programID == prog.id else { return nil }
+        return resolved.url
+    }
+
+    /// Measures unlabelled programme art after the same settle delay as the
+    /// backdrop, so crossing the guide does not download an icon per channel.
+    private func resolveLandscape(for program: UnifiedProgram?) async {
+        guard let program, program.landscapeURL == nil,
+              let candidate = program.iconURL ?? program.posterURL,
+              EPGImageClassifier.shared.kind(for: candidate) == nil else { return }
+        do {
+            try await Task.sleep(for: backdropSettleDelay)
+        } catch {
+            return
+        }
+        let kind = await EPGImageClassifier.shared.classify(candidate) {
+            await ImageCacheManager.shared.image(for: candidate)?.size
+        }
+        guard !Task.isCancelled, kind == .landscape else { return }
+        resolvedLandscape = (program.id, candidate)
     }
 
     /// A constant full-screen layer. The backdrop image is drawn INSIDE it as an
     /// overlay, so toggling the image (as focus moves between programmes with and
     /// without a backdrop) never changes this layer's geometry — which is what
-    /// was nudging the grid. Only a genuine 16:9 image distinct from the poster
-    /// is used; otherwise the stock settings background shows through the clear.
+    /// was nudging the grid. Only landscape programme art is used; otherwise the
+    /// stock settings background shows through the clear.
     private var ambiance: some View {
         GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
@@ -355,59 +435,6 @@ struct GuideLayoutView: View {
             .scaledToFill()
     }
 
-    // MARK: - Player layer (fullscreen + PiP)
-
-    private var pipScale: CGFloat { 0.28 }
-    private var pipMargin: CGFloat { 60 }
-
-    @ViewBuilder
-    private func liveTVPlayerLayer(channel: UnifiedChannel, screenSize: CGSize) -> some View {
-        let player = LiveTVPlayerView(
-            channel: channel,
-            onDismiss: {
-                displayMode = .hidden
-                activeChannel = nil
-                playerSessionId = UUID()
-            },
-            onEnterPIP: {
-                var transaction = Transaction()
-                transaction.animation = nil
-                withTransaction(transaction) {
-                    displayMode = .pip
-                }
-            },
-            isInteractive: displayMode == .fullscreen  // Disable focus capture in PiP mode
-        )
-        // Force a fresh player session when changing channels or after exit/reopen.
-        .id("\(playerSessionId.uuidString)-\(channel.id)")
-        .transaction { transaction in
-            transaction.animation = nil
-        }
-        .animation(nil, value: displayMode)
-
-        if displayMode == .pip {
-            // PiP: a small 16:9 box pinned top-right. Integral 16px width steps
-            // avoid fractional scaling artifacts (a thin bottom strip).
-            let pipWidth = max(16, floor((screenSize.width * pipScale) / 16.0) * 16.0)
-            let pipHeight = pipWidth * 9.0 / 16.0
-            player
-                .frame(width: pipWidth, height: pipHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 10)
-                .position(x: screenSize.width - pipMargin - pipWidth / 2,
-                          y: pipMargin + pipHeight / 2)
-                .allowsHitTesting(false)
-        } else {
-            // Fullscreen: fill the true screen and ignore the guide's safe-area
-            // inset. Sizing to the GeometryReader's (inset) size is what made the
-            // player render as a centered box instead of edge-to-edge.
-            player
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
-                .allowsHitTesting(true)
-        }
-    }
-
     // MARK: - Selection
 
     private func selectChannel(_ channel: UnifiedChannel) {
@@ -415,17 +442,54 @@ struct GuideLayoutView: View {
         // straight to AVPlayer, everything else is remuxed by the engine.
         // Presented as a full-screen modal so it escapes the guide's
         // TabView / safe-area insets.
-        guard let scene = UIApplication.shared.connectedScenes
-                .compactMap({ $0 as? UIWindowScene }).first,
-              let root = (scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first)?.rootViewController
-        else { return }
+        guard let top = LiveProgramMenu.topViewController() else { return }
 
-        var top = root
-        while let presented = top.presentedViewController { top = presented }
+        // The corner player's channel comes back full screen as it is, with
+        // no new tune. Any other channel replaces it.
+        var adopting: LiveTVSessionHandoff?
+        if let mini = miniSession {
+            miniSession = nil
+            if mini.channel.id == channel.id {
+                adopting = mini
+            } else {
+                mini.stop()
+            }
+        }
 
-        let vc = LiveTVAetherPlayerViewController(channel: channel)
+        let vc = LiveTVAetherPlayerViewController(channel: channel, adopting: adopting)
         vc.modalPresentationStyle = .fullScreen
+        if keepPlayingInGuide {
+            vc.onMinimize = { session in
+                miniSession = session
+            }
+        }
+        vc.onDismiss = { lastChannel in
+            // The viewer may have changed channels in the player; land on the
+            // one that was on screen, at the programme airing now.
+            if !channels.contains(where: { $0.id == lastChannel.id }) {
+                selectedGroup = nil
+            }
+            gridFocusRequest = EPGFocusRequest(channelId: lastChannel.id, token: UUID())
+        }
         top.present(vc, animated: true)
+    }
+
+    // MARK: - Programme menu and recordings
+
+    private func presentProgramMenu(channel: UnifiedChannel, program: UnifiedProgram?, frame: CGRect?) {
+        guard let top = LiveProgramMenu.topViewController() else { return }
+        LiveProgramMenu.present(program: program, channel: channel, from: top, sourceFrame: frame) { channel in
+            selectChannel(channel)
+        }
+    }
+
+    private func presentRecordings() {
+        guard let top = LiveProgramMenu.topViewController() else { return }
+        miniSession?.stop()
+        miniSession = nil
+        let recordings = LiveRecordingsViewController()
+        recordings.modalPresentationStyle = .fullScreen
+        top.present(recordings, animated: true)
     }
 
     // MARK: - Helpers
@@ -492,5 +556,26 @@ private struct EPGIssueBanner: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.08), lineWidth: 1)
         )
+    }
+}
+
+// MARK: - Corner player
+
+/// Hosts the UIKit corner player that keeps a channel going after Back.
+private struct LiveMiniPlayerRepresentable: UIViewRepresentable {
+    let session: LiveTVSessionHandoff
+
+    func makeUIView(context: Context) -> LiveMiniPlayerView {
+        let view = LiveMiniPlayerView()
+        view.show(session)
+        return view
+    }
+
+    func updateUIView(_ uiView: LiveMiniPlayerView, context: Context) {
+        uiView.show(session)
+    }
+
+    static func dismantleUIView(_ uiView: LiveMiniPlayerView, coordinator: ()) {
+        uiView.release()
     }
 }

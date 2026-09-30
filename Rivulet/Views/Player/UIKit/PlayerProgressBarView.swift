@@ -98,6 +98,8 @@ final class PlayerProgressBarView: UIView {
     private let endsAtLabel = UILabel()
     private let scrubStepLabel = UILabel()
     private let thumbnailImageView = UIImageView()
+    /// Live scrubbing reads out a clock time, not a position in a file.
+    private var liveScrubReadout: String?
     private let thumbnailContainer = UIView()
 
     /// Oversized scrub readout: replaces the old `PaddedChipLabel` chip.
@@ -463,20 +465,38 @@ final class PlayerProgressBarView: UIView {
 
     /// Live TV keeps the progress bar's existing geometry and fill treatment,
     /// but labels the programme window with wall-clock times: air start at the
-    /// left edge, air end at the right, and the current clock time following
-    /// the playhead. Non-seekable — callers never pass scrub state.
-    func updateLiveTimeline(startTime: Date, currentTime: Date, endTime: Date) {
+    /// left edge, air end at the right, and the clock time of the picture on
+    /// screen following the playhead.
+    ///
+    /// `liveEdgeTime` is "now" when the viewer is timeshifted behind it: the
+    /// stretch from the playhead to the edge is already buffered and is drawn
+    /// in the dimmer ghost, so the distance back to live is visible. nil at the
+    /// edge.
+    ///
+    /// `scrubTime` puts the bar in scrub mode on a paused, timeshifted stream:
+    /// the fill and handle go to where playback would resume, the ghost stays
+    /// at the picture on screen, and the readout and `scrubThumbnail` show the
+    /// clock time and frame there.
+    func updateLiveTimeline(startTime: Date, currentTime: Date, endTime: Date, liveEdgeTime: Date? = nil,
+                            scrubTime: Date? = nil, scrubThumbnail: UIImage? = nil) {
         let duration = endTime.timeIntervalSince(startTime)
         guard duration > 0 else { return }
+        defer {
+            // Scrubbing, the ghost marks the picture on screen instead.
+            if scrubTime == nil {
+                applyLiveEdgeGhost(startTime: startTime, duration: duration, playhead: currentTime, edge: liveEdgeTime)
+            }
+        }
 
         let elapsed = min(max(0, currentTime.timeIntervalSince(startTime)), duration)
+        liveScrubReadout = scrubTime.map { Self.endsAtFormatter.string(from: $0) }
         update(
             currentTime: elapsed,
             duration: duration,
-            isScrubbing: false,
-            scrubTime: 0,
+            isScrubbing: scrubTime != nil,
+            scrubTime: scrubTime.map { min(max(0, $0.timeIntervalSince(startTime)), duration) } ?? 0,
             scrubStepLabelText: nil,
-            scrubThumbnail: nil,
+            scrubThumbnail: scrubThumbnail,
             markers: [],
             chapters: []
         )
@@ -487,7 +507,8 @@ final class PlayerProgressBarView: UIView {
         endsAtLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
         endsAtLabel.textColor = UIColor.white.withAlphaComponent(0.82)
         endsAtLabel.textAlignment = .center
-        endsAtLabel.isHidden = false
+        // The scrub readout carries the time while scrubbing.
+        endsAtLabel.isHidden = scrubTime != nil
 
         // Follow the playhead, but keep the clock label fully on the track and
         // fade out whichever edge label it would otherwise collide with.
@@ -504,6 +525,24 @@ final class PlayerProgressBarView: UIView {
         let endLabelWidth = remainingTimeLabel.intrinsicContentSize.width
         currentTimeLabel.alpha = (x - half) < (startLabelWidth + clearance) ? 0 : 1
         remainingTimeLabel.alpha = (x + half) > (width - endLabelWidth - clearance) ? 0 : 1
+    }
+
+    /// The buffered-ahead stretch of a timeshifted live session, in the ghost
+    /// the scrub state otherwise uses (it sits under the fill, so only the part
+    /// past the playhead shows). Assigned after `update(...)`, which hides the
+    /// ghost whenever it is not scrubbing.
+    private func applyLiveEdgeGhost(startTime: Date, duration: TimeInterval, playhead: Date, edge: Date?) {
+        guard let edge, edge.timeIntervalSince(playhead) > 1 else {
+            currentPositionGhost.isHidden = true
+            return
+        }
+        let edgeProgress = min(max(0, edge.timeIntervalSince(startTime)), duration) / duration
+        currentPositionGhost.isHidden = false
+        currentPositionGhost.frame = CGRect(
+            x: 0, y: 0,
+            width: trackBackground.bounds.width * CGFloat(edgeProgress),
+            height: trackHeightConstraint.constant
+        )
     }
 
     /// Loading placeholder: keeps the locked geometry and vertical rhythm
@@ -690,7 +729,7 @@ final class PlayerProgressBarView: UIView {
                 attributes: [.kern: 16 * 0.12]
             )
         }
-        readoutTimecodeLabel.text = Self.formatTime(displayTime)
+        readoutTimecodeLabel.text = liveScrubReadout ?? Self.formatTime(displayTime)
 
         readoutEyebrowLabel.sizeToFit()
         readoutTimecodeLabel.sizeToFit()

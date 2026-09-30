@@ -24,16 +24,17 @@ actor DispatcharrService {
     /// not something the API token implies: `apps/output/urls.py` routes
     /// `^m3u(?:/(?P<profile_name>[^/]+))?/?$`, and `generate_m3u` only filters on
     /// `channelprofilemembership__channel_profile` when that segment is present.
-    /// A DRF `Authorization: Token` header authenticates the request but does not
-    /// scope it, so without this segment the server correctly returns every
-    /// channel regardless of which profiles exist. See GitHub issue #246.
+    /// The API key does not scope the playlist (the output endpoints do not
+    /// even authenticate), so without this segment the server correctly returns
+    /// every channel regardless of which profiles exist. See GitHub issue #246.
     let channelProfile: String?
 
-    private let session: URLSession
+    let session: URLSession
 
     // MARK: - Initialization
 
-    init(baseURL: URL, apiToken: String? = nil, channelProfile: String? = nil) {
+    init(baseURL: URL, apiToken: String? = nil, channelProfile: String? = nil,
+         session: URLSession? = nil) {
         self.baseURL = baseURL
         self.apiToken = apiToken
         self.channelProfile = Self.normalizedProfile(channelProfile)
@@ -42,7 +43,7 @@ actor DispatcharrService {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 120  // EPG files can be large
-        self.session = URLSession(configuration: config)
+        self.session = session ?? URLSession(configuration: config)
     }
 
     /// Create a DispatcharrService from a URL string, cleaning up the URL if needed
@@ -183,18 +184,73 @@ actor DispatcharrService {
         return try await parser.parse(data: data)
     }
 
+    /// Signs in as a Dispatcharr user and returns that user's API key, so
+    /// nobody types a 54-character key on a TV remote. The password is used
+    /// for this exchange only and never stored.
+    ///
+    /// A key is created only when the account has none: Dispatcharr's
+    /// generate REPLACES the user's key, which would break every other app
+    /// already using it.
+    func fetchAPIKey(username: String, password: String) async throws -> String {
+        struct Tokens: Decodable { let access: String }
+        struct Key: Decodable { let key: String? }
+
+        var login = URLRequest(url: baseURL.appendingPathComponent("api/accounts/token", isDirectory: true))
+        login.httpMethod = "POST"
+        login.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        login.httpBody = try JSONEncoder().encode(["username": username, "password": password])
+        let (tokenData, tokenResponse) = try await session.data(for: login)
+        try validateResponse(tokenResponse)
+        let access = try JSONDecoder().decode(Tokens.self, from: tokenData).access
+
+        func keyRequest(_ path: String, method: String) -> URLRequest {
+            var request = URLRequest(url: baseURL.appendingPathComponent(path, isDirectory: true))
+            request.httpMethod = method
+            request.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+            return request
+        }
+        let (data, response) = try await session.data(for: keyRequest("api/accounts/api-keys", method: "GET"))
+        try validateResponse(response)
+        if let key = try JSONDecoder().decode(Key.self, from: data).key, !key.isEmpty {
+            return key
+        }
+        let (newData, newResponse) = try await session.data(
+            for: keyRequest("api/accounts/api-keys/generate", method: "POST"))
+        try validateResponse(newResponse)
+        guard let key = try JSONDecoder().decode(Key.self, from: newData).key, !key.isEmpty else {
+            throw DispatcharrError.invalidResponse
+        }
+        return key
+    }
+
     // MARK: - Private Methods
 
-    private func authenticatedRequest(for url: URL, method: String = "GET") -> URLRequest {
+    func authenticatedRequest(for url: URL, method: String = "GET") -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
-        if let token = apiToken, !token.isEmpty {
-            request.setValue("Token \(token)", forHTTPHeaderField: "Authorization")
+        if let token = apiToken, let header = Self.authorizationHeader(for: token) {
+            request.setValue(header.value, forHTTPHeaderField: header.field)
         }
         return request
     }
 
-    private func validateResponse(_ response: URLResponse) throws {
+    /// How Dispatcharr wants `token` presented. Its API authenticates an API
+    /// key (what its UI generates, sent as `X-API-Key`) or a JWT access token
+    /// (`Authorization: Bearer`). It has never accepted DRF's
+    /// `Authorization: Token`, which is what this used to send; nobody noticed
+    /// because the playlist and guide are not authenticated at all (they are
+    /// allowed by network), and nothing else here called the API.
+    static func authorizationHeader(for token: String) -> (field: String, value: String)? {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let segments = trimmed.split(separator: ".", omittingEmptySubsequences: false)
+        if segments.count == 3, trimmed.hasPrefix("eyJ") {
+            return ("Authorization", "Bearer \(trimmed)")
+        }
+        return ("X-API-Key", trimmed)
+    }
+
+    func validateResponse(_ response: URLResponse) throws {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw DispatcharrError.invalidResponse
         }

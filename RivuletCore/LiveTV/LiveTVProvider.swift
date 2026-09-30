@@ -50,6 +50,19 @@ struct UnifiedChannel: Identifiable, Hashable, Sendable {
     let tvgId: String?
     let groupTitle: String?
     let isHD: Bool
+    let httpHeaders: [String: String]?
+
+    /// Marked a favourite on the source (Plex "Favourite Channels").
+    ///
+    /// Separate from `groupTitle` rather than being another group name, for two
+    /// reasons the group field cannot express: a favourite stays in its tuner's
+    /// group as well, and the guide has to honour the ORDER the user arranged
+    /// on the source, which is not channel-number order.
+    let isFavourite: Bool
+
+    /// Position within the source's favourites list. Lower sorts first; nil
+    /// falls to the end, ordered by channel number as usual.
+    let favouriteRank: Int?
 
     init(
         id: String,
@@ -62,7 +75,10 @@ struct UnifiedChannel: Identifiable, Hashable, Sendable {
         streamURL: URL? = nil,
         tvgId: String? = nil,
         groupTitle: String? = nil,
-        isHD: Bool = false
+        isHD: Bool = false,
+        httpHeaders: [String: String]? = nil,
+        isFavourite: Bool = false,
+        favouriteRank: Int? = nil
     ) {
         self.id = id
         self.sourceType = sourceType
@@ -75,11 +91,39 @@ struct UnifiedChannel: Identifiable, Hashable, Sendable {
         self.tvgId = tvgId
         self.groupTitle = groupTitle
         self.isHD = isHD
+        self.httpHeaders = httpHeaders
+        self.isFavourite = isFavourite
+        self.favouriteRank = favouriteRank
     }
 
     /// Create a unique identifier combining source and channel
     nonisolated static func makeId(sourceType: LiveTVSourceType, sourceId: String, channelId: String) -> String {
         "\(sourceType.rawValue):\(sourceId):\(channelId)"
+    }
+
+    /// This channel with a different logo and every other field carried over.
+    ///
+    /// The one place a channel is rebuilt field by field. Hand-rolled copies
+    /// compile cleanly when a defaulted field is added and then silently reset
+    /// it: the XMLTV logo pass dropped playlist headers and the favourite rank
+    /// exactly that way.
+    func withLogo(_ logo: URL?) -> UnifiedChannel {
+        UnifiedChannel(
+            id: id,
+            sourceType: sourceType,
+            sourceId: sourceId,
+            channelNumber: channelNumber,
+            name: name,
+            callSign: callSign,
+            logoURL: logo,
+            streamURL: streamURL,
+            tvgId: tvgId,
+            groupTitle: groupTitle,
+            isHD: isHD,
+            httpHeaders: httpHeaders,
+            isFavourite: isFavourite,
+            favouriteRank: favouriteRank
+        )
     }
 }
 
@@ -102,6 +146,12 @@ struct UnifiedProgram: Identifiable, Hashable, Sendable {
     let landscapeURL: URL?
     let episodeNumber: String?
     let isNew: Bool
+    /// The source's own identifier for what is airing (Plex `plex://episode/…`).
+    /// DVR scheduling is keyed by it; nil for sources without one.
+    let sourceGuid: String?
+    let year: Int?
+    let contentRating: String?
+    let isMovie: Bool
 
     init(
         id: String,
@@ -116,7 +166,11 @@ struct UnifiedProgram: Identifiable, Hashable, Sendable {
         posterURL: URL? = nil,
         landscapeURL: URL? = nil,
         episodeNumber: String? = nil,
-        isNew: Bool = false
+        isNew: Bool = false,
+        sourceGuid: String? = nil,
+        year: Int? = nil,
+        contentRating: String? = nil,
+        isMovie: Bool = false
     ) {
         self.id = id
         self.channelId = channelId
@@ -131,6 +185,10 @@ struct UnifiedProgram: Identifiable, Hashable, Sendable {
         self.landscapeURL = landscapeURL
         self.episodeNumber = episodeNumber
         self.isNew = isNew
+        self.sourceGuid = sourceGuid
+        self.year = year
+        self.contentRating = contentRating
+        self.isMovie = isMovie
     }
 
     /// Check if this program is currently airing
@@ -277,7 +335,8 @@ extension M3UParser.ParsedChannel {
             streamURL: streamURL,
             tvgId: tvgId,
             groupTitle: groupTitle,
-            isHD: isHD
+            isHD: isHD,
+            httpHeaders: httpHeaders.isEmpty ? nil : httpHeaders
         )
     }
 }

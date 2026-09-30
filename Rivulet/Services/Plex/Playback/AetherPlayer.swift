@@ -716,7 +716,8 @@ final class AetherPlayer: PlayerProtocol {
     }
 
     /// Live TV load. Sets `isLive` so the engine treats the source as live
-    /// (seek becomes a no-op, live-edge/reconnect behavior). HLS sources use
+    /// (live-edge tracking, reconnect behavior, and seeks confined to the
+    /// rewind window set below). HLS sources use
     /// `nativeRemoteHLS` so AVPlayer plays the remote playlist directly (no
     /// demuxer probe / loopback — "HLS straight to AVPlayer"); everything else
     /// (raw MPEG-TS, etc.) goes through the engine's demux/remux to a loopback
@@ -726,42 +727,99 @@ final class AetherPlayer: PlayerProtocol {
     /// demuxer opens the playlist instead — used as a fallback when AVPlayer's
     /// native path fails against a server (e.g. a Plex transcode session that
     /// rejects AVPlayer's request pattern).
-    func loadLive(url: URL, headers: [String: String]?, forceEngineDemux: Bool = false) async throws {
+    /// What a live load is for.
+    enum LiveLoadRole {
+        /// The one channel on screen: full rewind window, and the software
+        /// deinterlacer wherever the channel may be interlaced.
+        case fullscreen
+        /// One of up to four multiview tiles decoding at once. Keeps the
+        /// engine's own decode routing (it still sends MPEG-2 and declared
+        /// interlace to software) rather than forcing four software decodes,
+        /// and a short rewind window, since a tile is never scrubbed.
+        case multiviewSlot
+    }
+
+    /// Whether the last live load handed the origin's HLS to AVPlayer as is
+    /// (who renders its captions depends on it). Travels with the player when
+    /// a session moves between surfaces.
+    private(set) var isOnNativeLiveRoute = false
+
+    func loadLive(url: URL, headers: [String: String]?, forceEngineDemux: Bool = false,
+                  role: LiveLoadRole = .fullscreen) async throws {
         let isHLS = Self.liveRoute(for: url, forceEngineDemux: forceEngineDemux) == .nativeHLS
-        let options = LoadOptions(
-            suppressDisplayCriteria: false,
-            httpHeaders: headers ?? [:],
-            // Same rich config as VOD, plus the live-specific flags.
-            matchContentEnabled: true,
-            panelIsInHDRMode: Self.panelIsInHDRMode(),
-            audioBridgeMode: .lossless,
-            isLive: true,
-            // ~30-minute DVR rewind window (engine retains it disk-backed).
-            dvrWindowSeconds: 1800,
-            nativeRemoteHLS: isHLS,
-            preserveASSMarkup: true,
-            probesize: 5 * 1024 * 1024,
-            maxAnalyzeDuration: 5_000_000,
-            // Honor the user's saved audio/subtitle language preferences, same
-            // as VOD, so the right tracks are picked on the first frame.
-            preferredAudioLanguages: Self.livePreferredAudioLanguages(),
-            preferredSubtitleLanguages: Self.livePreferredSubtitleLanguages(),
-            // DVB teletext caption page. libzvbi auto-detect (nil) only finds a
-            // page the broadcast FLAGS as a subtitle page; AU FTA channels carry
-            // captions on 801 without that flag, so auto-detect returns nothing.
-            // Region-default to 801 for AU, otherwise auto-detect.
-            teletextPage: Self.regionTeletextPage(),
-            // Broadcast H.264 routinely mis-signals interlaced content as
-            // progressive (codecpar fieldOrder=0; MBAFF is only flagged
-            // per-frame), which routes it down the engine's NATIVE path with
-            // no deinterlacer — visible combing. Ask for the software path on
-            // live demux sessions: bwdif deinterlaces genuinely interlaced
-            // frames and passes true progressive through untouched, so a
-            // correctly-signalled progressive channel only pays a SW decode.
-            // The engine ignores this on the native-HLS shortcut, which never
-            // enters the demux dispatch, so it is scoped to `!isHLS` anyway.
-            preferredDecodePath: isHLS ? .automatic : .software
-        )
+        isOnNativeLiveRoute = isHLS
+        // Forced onto the engine demuxer AND the source is a playlist: the Plex
+        // direct-play case. See the ingest branch below.
+        let usesHLSIngest = !isHLS && Self.isHLSURL(url)
+        let httpHeaders = headers ?? [:]
+        // A wireless receiver (HomePod, an AirPlay speaker) buffers about two
+        // seconds before its first sample sounds. A join that starts the clock
+        // the moment a frame is ready plays that stretch as silent picture and
+        // then snaps into sync (issue #319). Mount paused instead, and let the
+        // start wait for the route: see the priming step after the load.
+        let joinsWirelessAudio = Self.isWirelessAudioRoute()
+
+        func makeOptions(nativeRemoteHLS: Bool) -> LoadOptions {
+            var options = LoadOptions(
+                suppressDisplayCriteria: false,
+                httpHeaders: httpHeaders,
+                // Same rich config as VOD, plus the live-specific flags.
+                matchContentEnabled: true,
+                panelIsInHDRMode: Self.panelIsInHDRMode(),
+                audioBridgeMode: .lossless,
+                isLive: true,
+                // ~30-minute DVR rewind window (engine retains it disk-backed).
+                dvrWindowSeconds: role == .fullscreen ? 1800 : 120,
+                nativeRemoteHLS: nativeRemoteHLS,
+                preserveASSMarkup: true,
+                probesize: 5 * 1024 * 1024,
+                maxAnalyzeDuration: 5_000_000,
+                // Honor the user's saved audio/subtitle language preferences, same
+                // as VOD, so the right tracks are picked on the first frame.
+                preferredAudioLanguages: Self.livePreferredAudioLanguages(),
+                preferredSubtitleLanguages: Self.livePreferredSubtitleLanguages(),
+                // DVB teletext caption page. libzvbi auto-detect (nil) only finds a
+                // page the broadcast FLAGS as a subtitle page; AU FTA channels carry
+                // captions on 801 without that flag, so auto-detect returns nothing.
+                // Region-default to 801 for AU, otherwise auto-detect.
+                teletextPage: Self.regionTeletextPage(),
+                // Broadcast H.264 routinely mis-signals interlaced content as
+                // progressive (codecpar fieldOrder=0; MBAFF is only flagged
+                // per-frame), which routes it down the engine's NATIVE path with
+                // no deinterlacer — visible combing. Ask for the software path on
+                // live demux sessions: bwdif deinterlaces genuinely interlaced
+                // frames and passes true progressive through untouched.
+                //
+                // ...but only where the channel is known to need it. PMS reports
+                // the scan type on the tune, so the answer is known before the
+                // load (see `needsDeinterlacing`). Every other source is left to
+                // the engine's own check, which reads the SPS for exactly this
+                // mis-signalling (#150).
+                // The engine ignores this on the native-HLS shortcut, which never
+                // enters the demux dispatch.
+                preferredDecodePath: (role == .fullscreen && !nativeRemoteHLS && Self.needsDeinterlacing(url))
+                    ? .software : .automatic
+            )
+            if role == .multiviewSlot {
+                // A tile never scrubs and zaps often: segments cut at every
+                // keyframe join in seconds rather than waiting out the
+                // standard ~18s holdback, and field-rate deinterlacing on a
+                // quarter-screen tile only doubles decoder output for nothing.
+                options.liveJoinProfile = .fastZap
+                options.deinterlaceFieldRate = .frame
+            }
+            if joinsWirelessAudio {
+                // AVPlayer's own start-up wait is what rides out the receiver's
+                // buffer on the native routes; the one-shot that cuts it short
+                // is exactly wrong here.
+                options.liveJoinStartsImmediately = false
+                options.autoplay = false
+            }
+            return options
+        }
+
+        let options = makeOptions(nativeRemoteHLS: isHLS)
+
         // Same reason as the VOD path: a zap is new content, and broadcast
         // mixes 4:3 SD with 16:9 HD channel to channel, so a reused slot must
         // not measure the new channel against the old one's picture rect.
@@ -769,7 +827,53 @@ final class AetherPlayer: PlayerProtocol {
         userIntendsToPlay = true
         pendingReloadSince = nil
         do {
-            try await engine.load(url: url, startPosition: nil, options: options)
+            // A Plex direct-play part key is an HLS PLAYLIST
+            // (/livetv/sessions/{uuid}/{consumer}/index.m3u8), not the raw
+            // transport stream the engine's raw live path expects. Handing it
+            // an m3u8 body fails closed by design (AE#140), and the host's
+            // fallback then re-tuned and landed on nativeRemoteHLS — so every
+            // granted direct play was quietly played by AVPlayer, which cannot
+            // decode mp2 or DVB teletext. Those two are the entire reason for
+            // wanting direct play here, so the grant was being thrown away.
+            //
+            // HLSLiveIngestReader demuxes the playlist's underlying MPEG-TS, so
+            // teletext and broadcast audio reach the engine and our own caption
+            // renderer. It is also why this route costs ONE tune: the old path
+            // needed a second grab to discover it had to fall back.
+            if usesHLSIngest {
+                // The reader does its own HTTP on its own session, so the
+                // headers have to be handed to it here: `LoadOptions.httpHeaders`
+                // never reaches a custom IOReader (AE#119).
+                let reader = HLSLiveIngestReader(playlistURL: url, httpHeaders: httpHeaders)
+                do {
+                    try await engine.load(source: .custom(reader, formatHint: "mpegts"), options: options)
+                } catch {
+                    // The reader does not throw out of `read`: it records why it
+                    // gave up and the probe fails as a `DemuxerError`, so the
+                    // error type says nothing. Its own verdict does. Encryption or
+                    // an fMP4 playlist it will not open: retry natively on the
+                    // SAME session rather than letting the host fall back, which
+                    // costs another tune and, on a single-tuner box, competes with
+                    // the grab we are already holding.
+                    guard reader.terminalError != nil, !isCancellationError(error) else { throw error }
+                    try await engine.load(
+                        url: url,
+                        startPosition: nil,
+                        options: makeOptions(nativeRemoteHLS: true)
+                    )
+                }
+            } else {
+                try await engine.load(url: url, startPosition: nil, options: options)
+            }
+            if joinsWirelessAudio && isOnSoftwareRoute {
+                // The software backend renders on a sample-buffer synchronizer
+                // with no player to wait on the route, so hold the mounted,
+                // paused session for the receiver's latency. A live source keeps
+                // filling while paused, so when the caller's play() starts the
+                // clock the audio renderer already has that much queued and the
+                // receiver starts in sync instead of catching up.
+                try? await Task.sleep(for: .seconds(Self.wirelessAudioPrimeSeconds()))
+            }
         } catch {
             // The caller left the slot / retuned while the load was in flight.
             // Rethrow untouched so the type survives; wrapping it in a
@@ -779,6 +883,21 @@ final class AetherPlayer: PlayerProtocol {
             errorSubject.send(pe)
             throw pe
         }
+    }
+
+    /// Whether audio is leaving this device for an AirPlay receiver.
+    private static func isWirelessAudioRoute() -> Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+    }
+
+    /// How long a software-route live join holds for a wireless receiver: the
+    /// route's own reported latency, bounded so a route that reports nothing
+    /// useful still gets the typical two seconds and a bad reading cannot
+    /// stall the join.
+    private static func wirelessAudioPrimeSeconds() -> Double {
+        let reported = AVAudioSession.sharedInstance().outputLatency
+        guard reported > 0.2 else { return 2.0 }
+        return min(max(reported, 1.0), 3.0)
     }
 
     /// Which path `loadLive` will take for this URL. Single source of truth: the
@@ -791,6 +910,26 @@ final class AetherPlayer: PlayerProtocol {
     /// is inert on `.nativeHLS`.
     static func liveRoute(for url: URL, forceEngineDemux: Bool) -> LiveJoinRoute {
         (isHLSURL(url) && !forceEngineDemux) ? .nativeHLS : .loopback
+    }
+
+    /// Whether this live source has to take the deinterlacing path.
+    ///
+    /// Reads `rivuletLiveScanType`, which `PlexLiveTVProvider` puts on the URL
+    /// from the tune response — the same carry-on-the-URL trick the keepalive's
+    /// ratingKey uses, so nothing has to be threaded through LiveTVDataStore.
+    ///
+    /// **Absence means no.** A missing scan type used to force the software
+    /// path, which put every Dispatcharr and playlist channel (none carries
+    /// one) on it. Measured on an Apple TV 4K (2nd gen) with a 4K60 HEVC
+    /// channel: the layer dropped about 14 frames a second, the decoder fell
+    /// further behind every second, and a HomePod played the sound about 3s
+    /// late. The engine's own dispatch catches mis-signalled interlaced H.264
+    /// from the SPS (#150), so only Plex's explicit answer overrides it.
+    static func needsDeinterlacing(_ url: URL) -> Bool {
+        guard let scan = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "rivuletLiveScanType" })?.value?
+            .lowercased() else { return false }
+        return scan != "progressive"
     }
 
     private static func isHLSURL(_ url: URL) -> Bool {
@@ -857,7 +996,8 @@ final class AetherPlayer: PlayerProtocol {
         // (VOD MKVs with broken duration headers are too common), so the
         // host must declare live sources. Enables the engine's live path:
         // clock live-edge tracking, LiveReloadPolicy reconnect, and
-        // seek(to:) becoming a no-op.
+        // seek(to:) becoming a no-op (this load sets no rewind window;
+        // `loadLive` does).
         // externalSubtitles: registered at load (not addExternalSubtitleTrack)
         // so the engine can also serve them as native WebVTT renditions if
         // that path is ever enabled; httpHeaders nil inherits the media's
@@ -962,6 +1102,23 @@ final class AetherPlayer: PlayerProtocol {
         engine.unbind(view: view)
     }
 
+    /// A render surface typed as a plain view, so a host can show video
+    /// without naming the engine's own view type. Bind it with
+    /// `bind(surface:)`.
+    static func makeRenderSurface() -> UIView {
+        AetherPlayerView()
+    }
+
+    func bind(surface: UIView) {
+        guard let view = surface as? AetherPlayerView else { return }
+        engine.bind(view: view)
+    }
+
+    func unbind(surface: UIView) {
+        guard let view = surface as? AetherPlayerView else { return }
+        engine.unbind(view: view)
+    }
+
     /// Mute/unmute the underlying AVPlayer. Persisted in `isMuted` so it's
     /// reapplied when Aether swaps its player across internal reloads.
     func setMuted(_ muted: Bool) {
@@ -974,6 +1131,103 @@ final class AetherPlayer: PlayerProtocol {
         currentAVPlayer?.isMuted = muted
     }
     func seek(to time: TimeInterval) async { await engine.seek(to: time) }
+
+    // MARK: - Live timeshift
+
+    /// The live rewind window, as a host draws it. Every time here is on the
+    /// session axis, the one `currentTime` reports and `seek(to:)` takes on a
+    /// live session. Never `sourceTime`: on the software live path that axis is
+    /// offset by the session zero.
+    struct LiveTimeshift: Equatable {
+        /// What a seek can reach. nil when the session has no rewind window
+        /// (a live-only load, or before the first segment lands).
+        var seekableRange: ClosedRange<Double>?
+        var edgeTime: Double
+        var playhead: Double
+        var behindLiveSeconds: Double
+        var isAtLiveEdge: Bool
+
+        /// No session yet: nothing to rewind, and nothing behind.
+        static let idle = LiveTimeshift(seekableRange: nil, edgeTime: 0, playhead: 0,
+                                        behindLiveSeconds: 0, isAtLiveEdge: true)
+    }
+
+    /// A snapshot of the live window. Cheap: these are the clock's own
+    /// published values, which the engine keeps current even while paused.
+    var liveTimeshift: LiveTimeshift {
+        let clock = engine.clock
+        return LiveTimeshift(
+            seekableRange: clock.seekableLiveRange,
+            edgeTime: clock.liveEdgeTime,
+            playhead: clock.currentTime,
+            behindLiveSeconds: clock.behindLiveSeconds,
+            isAtLiveEdge: clock.isAtLiveEdge
+        )
+    }
+
+    /// Move a live session by `seconds`, clamped to what the rewind window
+    /// still holds. Landing within a second of the edge snaps to the edge
+    /// itself, so skipping forward to "now" reads as live rather than as one
+    /// second behind. False when there is no window to move in.
+    @discardableResult
+    func seekLive(by seconds: Double) async -> Bool {
+        await seekLive(to: liveTimeshift.playhead + seconds)
+    }
+
+    /// Move a live session to `sessionSeconds` on the session axis (the one
+    /// `liveTimeshift` reports), with the same clamping and snap to live.
+    @discardableResult
+    func seekLive(to sessionSeconds: Double) async -> Bool {
+        let shift = liveTimeshift
+        guard let range = shift.seekableRange else { return false }
+        let target = min(max(sessionSeconds, range.lowerBound), shift.edgeTime)
+        if shift.edgeTime - target < 1 {
+            await engine.seekToLiveEdge()
+        } else {
+            await engine.seek(to: target)
+        }
+        return true
+    }
+
+    /// Back to the live edge. Works without a rewind window too.
+    func seekToLiveEdge() async {
+        await engine.seekToLiveEdge()
+    }
+
+    /// A still from the rewind window at `sessionSeconds`, decoded from what
+    /// the session already holds (no network). nil outside the window, on the
+    /// remote-HLS bypass, or across a channel change.
+    func liveThumbnail(atSessionSeconds sessionSeconds: Double, maxWidth: Int = 320) async -> CGImage? {
+        await engine.liveScrubThumbnail(atSessionSeconds: sessionSeconds, maxWidth: maxWidth)
+    }
+
+    /// Fires when the engine has given up on a live source (a transcode that
+    /// respawned from byte 0, a frozen playlist, the reopen budget spent). The
+    /// session is parked; only a fresh URL and a new load revive it, which for
+    /// Plex means a new tune. Without a subscriber a dead channel just looks
+    /// slow forever.
+    var liveSourceResets: AnyPublisher<Void, Never> {
+        engine.liveSourceReset.eraseToAnyPublisher()
+    }
+
+    /// Seconds skipped when resuming a paused live session whose rewind window
+    /// had already dropped the paused position.
+    var liveResumeSkips: AnyPublisher<Double, Never> {
+        engine.liveResumeClamped.map(\.skippedSeconds).eraseToAnyPublisher()
+    }
+
+    /// The DVB teletext page captions come from; nil means the engine's
+    /// auto-detect. Changing it re-decodes at once.
+    var teletextPage: Int? { engine.teletextPage }
+
+    func setTeletextPage(_ page: Int?) {
+        engine.setTeletextPage(page)
+    }
+
+    /// True while the software backend is serving the session. Live joins use
+    /// it: that backend has no player of its own to ride out a wireless audio
+    /// route's start-up latency (see `loadLive`).
+    var isOnSoftwareRoute: Bool { engine.videoRoute == .software }
 
     // MARK: - Tracks
 
