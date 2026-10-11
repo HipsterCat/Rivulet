@@ -351,7 +351,7 @@ final class PreviewCarouselViewController: UIViewController {
             let page = MediaItemDetailPageViewController(
                 item: episode,
                 seriesTitle: nil,
-                onPlay: { [weak self] ep in self?.playMediaItem(ep) })
+                onPlay: { [weak self] ep, sourceID in self?.playMediaItem(ep, sourceID: sourceID) })
             self.present(page, animated: true)
         }
 
@@ -376,7 +376,7 @@ final class PreviewCarouselViewController: UIViewController {
                 seriesTitle: show?.kind == .show ? show?.title : nil,
                 // playHeroItem, not playMediaItem: a season key has no media, so
                 // Play must resolve to its first unplayed episode.
-                onPlay: { [weak self] season in self?.playHeroItem(season) })
+                onPlay: { [weak self] season, _ in self?.playHeroItem(season) })
             self.present(page, animated: true)
         }
         // Cast / crew cell Select → person detail page (full-screen).
@@ -807,6 +807,13 @@ final class PreviewCarouselViewController: UIViewController {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // A presented VC's next responder is its presenter, so a press the
+        // Watched prompt or the episode page declines bubbles up to here. It
+        // belongs to them, not to the carousel underneath.
+        guard presentedViewController == nil else {
+            super.pressesBegan(presses, with: event)
+            return
+        }
         for press in presses {
             switch press.type {
             // .menu is owned by the menu gesture recognizer (see viewDidLoad).
@@ -1012,6 +1019,20 @@ final class PreviewCarouselViewController: UIViewController {
     /// Present an item's FULL expanded detail standalone (no carousel) — reuses
     /// this same VC in `standaloneDetail` mode. Used for Related drill-ins.
     private func presentStandaloneDetail(_ item: MediaItem) {
+        // A collection tile opens the collection page. Arm the shelf row's
+        // restore first, while the tile still exists: the carousel cannot
+        // resolve focus while the page is up, and on dismissal the engine
+        // may resolve before any callback runs. The page's onDismiss re-arms
+        // and applies it, so focus returns to the tile with the row unscrolled.
+        // No focus request here: focus is still on the tile, so a request
+        // would be honoured now and spend the row's one-shot tile index.
+        if item.kind == .collection {
+            expandedDetail.restoreShelfRowFocusIfNeeded(requestingFocus: false)
+            PlexHomeViewController.openCollectionIfNeeded(item, from: self) { [weak self] in
+                self?.restoreBelowFoldFocusAfterReturn()
+            }
+            return
+        }
         // The standalone detail is presented .overFullScreen, so THIS controller
         // never disappears and therefore never re-appears — viewDidAppear does
         // not fire on the way back. Restore focus from the dismiss callback,
@@ -1026,6 +1047,30 @@ final class PreviewCarouselViewController: UIViewController {
         var top: UIViewController = self
         while let presented = top.presentedViewController { top = presented }
         top.present(detail, animated: true)
+    }
+
+    /// "Go to Show" from an episode: the SHOW's own detail, so its Watched
+    /// button acts on the whole show. `show` skips the fetch when the caller
+    /// already has it. From a page this show's detail presented, goes back to
+    /// that detail instead of stacking a second one.
+    static func openShowDetail(_ showRef: MediaItemRef, show: MediaItem? = nil, from presenter: UIViewController) {
+        if let below = presenter.presentingViewController as? PreviewCarouselViewController,
+           below.items.indices.contains(below.selectedIndex),
+           below.items[below.selectedIndex].ref == showRef {
+            presenter.dismiss(animated: true)
+            return
+        }
+        Task { @MainActor [weak presenter] in
+            var resolved = show
+            if resolved == nil, let provider = MediaProviderRegistry.shared.provider(for: showRef.providerID) {
+                resolved = try? await provider.fullDetail(for: showRef).item
+            }
+            guard var top = presenter, let resolved else { return }
+            while let presented = top.presentedViewController { top = presented }
+            top.present(PreviewCarouselViewController(
+                items: [resolved], selectedIndex: 0, sourceFrame: .zero, sourceTarget: nil,
+                standaloneDetail: true, onDismiss: { _ in }), animated: true)
+        }
     }
 
     /// Put focus back where it was in the below-fold after returning from a
@@ -1076,9 +1121,15 @@ final class PreviewCarouselViewController: UIViewController {
         }
     }
 
-    private func playMediaItem(_ item: MediaItem) {
+    private func playMediaItem(_ item: MediaItem, sourceID: String? = nil) {
+        // presentPlayer resolves a Plex ratingKey; any other item plays through
+        // its own provider.
+        if !item.ref.isPlex {
+            ProviderPlayer.play(item, fromBeginning: false, sourceID: sourceID, from: self, onDismiss: nil)
+            return
+        }
         let offsetSec = item.userState.viewOffset
-        presentPlayer(ratingKey: item.ref.itemID, resumeOffset: offsetSec > 0 ? offsetSec : nil)
+        presentPlayer(ratingKey: item.ref.itemID, resumeOffset: offsetSec > 0 ? offsetSec : nil, mediaID: sourceID)
     }
 
     /// Resolve a Plex ratingKey → metadata → present the player. Used for the
@@ -1088,7 +1139,7 @@ final class PreviewCarouselViewController: UIViewController {
     /// metadata we fetch here is the only place a library-addressable extra's
     /// resume point appears (issue #303 — extras always restarted), and it is
     /// also fresher than a MediaItem's cached userState.
-    private func presentPlayer(ratingKey: String, resumeOffset: Double?) {
+    private func presentPlayer(ratingKey: String, resumeOffset: Double?, mediaID: String? = nil) {
         Task { [weak self] in
             guard let serverURL = PlexAuthManager.shared.selectedServerURL,
                   let token = PlexAuthManager.shared.selectedServerToken else {
@@ -1118,7 +1169,7 @@ final class PreviewCarouselViewController: UIViewController {
                 : nil
             await MainActor.run {
                 self?.present(playItem: playItem, serverURL: serverURL, token: token,
-                              resumeOffset: resumeOffset ?? serverResume)
+                              resumeOffset: resumeOffset ?? serverResume, mediaID: mediaID)
             }
         }
     }
@@ -1199,12 +1250,14 @@ final class PreviewCarouselViewController: UIViewController {
         )
     }
 
-    private func present(playItem: PlexMetadata, serverURL: String, token: String, resumeOffset: Double?) {
+    private func present(playItem: PlexMetadata, serverURL: String, token: String, resumeOffset: Double?,
+                         mediaID: String? = nil) {
         let viewModel = UniversalPlayerViewModel(
             metadata: playItem,
             serverURL: serverURL,
             authToken: token,
-            startOffset: resumeOffset
+            startOffset: resumeOffset,
+            preferredMediaID: mediaID
         )
         // Presents from the topmost VC so Play works both directly on the
         // carousel AND from the episode detail page presented over it.
@@ -1754,6 +1807,8 @@ extension PreviewCarouselViewController: UIGestureRecognizerDelegate {
     /// recognizer has already stolen the gesture.
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard let swipe = gestureRecognizer as? UISwipeGestureRecognizer else { return true }
+        // Touch twin of the pressesBegan guard: nothing pages or scrolls under a prompt.
+        guard presentedViewController == nil else { return false }
         if verticalSwipeRecognizers.contains(where: { $0 === swipe }) {
             return verticalSwipeWouldNavigate(swipe.direction)
         }
@@ -1777,6 +1832,7 @@ extension PreviewCarouselViewController: UICollectionViewDataSource, UICollectio
             cell.item = items[indexPath.item]
         }
         cell.onPlay = { [weak self] item in self?.playHeroItem(item) }
+        cell.onPlayVersion = { [weak self] item, sourceID in self?.playMediaItem(item, sourceID: sourceID) }
         cell.onShowInfo = { [weak self] detail in self?.presentInfoPopup(detail) }
         // Default to non-current; if this dequeued cell happens to be
         // at selectedIndex (e.g. on first viewport population), the

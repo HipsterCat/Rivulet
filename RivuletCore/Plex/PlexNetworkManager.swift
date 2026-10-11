@@ -96,8 +96,20 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
     /// the decode on the global executor; Data is Sendable, T must be.
     nonisolated private static func decodeDetached<T: Decodable & Sendable>(_ data: Data) async throws -> T {
         try await Task.detached(priority: .userInitiated) {
-            try JSONDecoder().decode(T.self, from: data)
+            try decodeRepairingUTF8(T.self, from: data)
         }.value
+    }
+
+    /// PMS can echo a file path holding a non-UTF-8 byte (a Latin-1 "é"), and
+    /// JSONDecoder then rejects the whole response, so a Home row goes blank
+    /// (RIVULET-18). On that failure only, swap bad bytes for U+FFFD and retry.
+    nonisolated static func decodeRepairingUTF8<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            guard String(data: data, encoding: .utf8) == nil else { throw error }
+            return try JSONDecoder().decode(type, from: Data(String(decoding: data, as: UTF8.self).utf8))
+        }
     }
 
     func request<T: Decodable & Sendable>(
@@ -137,20 +149,20 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             // walls of NSURLErrorDomain text. Attach the request identity.
             let nsError = error as NSError
             let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - netStart) * 1000)
-            // -999 is a user-cancelled request (navigating away); it's already
-            // dropped in beforeSend, so don't pay to capture it.
+            // -999 is a user-cancelled request (navigating away). The rest is
+            // almost always the user's server being down or unreachable, so it
+            // is a log, not an error: it was ~60% of the error quota.
             if nsError.code != NSURLErrorCancelled {
-                SentryBridge.capture(error: error) { scope in
-                    scope.setTag(value: "plex_network", key: "component")
-                    scope.setTag(value: "transport", key: "error_type")
-                    scope.setTag(value: endpoint, key: "endpoint")
-                    scope.setTag(value: method, key: "method")
-                    scope.setTag(value: String(nsError.code), key: "urlerror_code")
-                    scope.setExtra(value: url.path, key: "path")
-                    scope.setExtra(value: url.host ?? "unknown", key: "host")
-                    scope.setExtra(value: elapsedMs, key: "elapsed_ms")
-                    scope.setExtra(value: self.defaultTimeout, key: "timeout_interval")
-                }
+                SentryBridge.log(.warn, "Plex request failed", attributes: [
+                    "component": "plex_network",
+                    "error_type": "transport",
+                    "endpoint": endpoint,
+                    "method": method,
+                    "urlerror_code": nsError.code,
+                    "path": url.path,
+                    "host": url.host ?? "unknown",
+                    "elapsed_ms": elapsedMs,
+                ])
             }
             throw error
         }
@@ -170,8 +182,19 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             print("🌐 PlexNetwork: ❌ HTTP Error \(httpResponse.statusCode)")
             let error = PlexAPIError.httpError(statusCode: httpResponse.statusCode, data: data)
 
-            // Capture HTTP errors to Sentry (skip 401/403 auth errors and 5xx server errors)
-            if httpResponse.statusCode != 401 && httpResponse.statusCode != 403 && !(500...599).contains(httpResponse.statusCode) {
+            // 404 is an item the server deleted or rematched, 421 a connection
+            // address now answered by another server (RIVULET-2): server state,
+            // so a log. Other 4xx can mean we sent a bad request, so capture.
+            let status = httpResponse.statusCode
+            if status == 404 || status == 421 {
+                SentryBridge.log(.warn, "Plex request returned \(status)", attributes: [
+                    "component": "plex_network",
+                    "error_type": "http",
+                    "endpoint": endpoint,
+                    "method": method,
+                    "status_code": status,
+                ])
+            } else if status != 401 && status != 403 && !(500...599).contains(status) {
                 SentryBridge.capture(error: error) { scope in
                     scope.setTag(value: "plex_network", key: "component")
                     scope.setTag(value: "http", key: "error_type")
@@ -596,13 +619,16 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return container.MediaContainer.Metadata?.first
     }
 
-    /// Get related items (similar content)
+    /// The hubs `/library/metadata/{rk}/related` returns, raw: at most one
+    /// `collection.related.*` hub per library section, then people and
+    /// similar-title hubs. The caller decides which hub feeds which row.
+    /// `limit` is the per-hub `count`.
     func getRelatedItems(
         serverURL: String,
         authToken: String,
         ratingKey: String,
         limit: Int = 12
-    ) async throws -> [PlexMetadata] {
+    ) async throws -> [PlexHub] {
         guard var components = URLComponents(string: "\(serverURL)/library/metadata/\(ratingKey)/related") else {
             throw PlexAPIError.invalidURL
         }
@@ -620,18 +646,13 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             headers: plexHeaders(authToken: authToken)
         )
 
-        // The /related endpoint nests items inside related Hubs (e.g. "Related
-        // Movies", "More with …"); the top-level Metadata is usually empty. Flatten
-        // the hubs (deduped by ratingKey), falling back to top-level Metadata.
+        // Items normally arrive inside the hubs, with the top-level Metadata
+        // empty. When no hub holds any, fall back to the top-level Metadata as
+        // one untitled hub.
         let mc = container.MediaContainer
-        let fromHubs = (mc.Hub ?? []).flatMap { $0.Metadata ?? [] }
-        let merged = fromHubs.isEmpty ? (mc.Metadata ?? []) : fromHubs
-        var seen = Set<String>()
-        let deduped = merged.filter { item in
-            guard let key = item.ratingKey else { return true }
-            return seen.insert(key).inserted
-        }
-        return Array(deduped.prefix(limit))
+        let hubs = mc.Hub ?? []
+        if hubs.contains(where: { !($0.Metadata ?? []).isEmpty }) { return hubs }
+        return [PlexHub(Metadata: mc.Metadata ?? [])]
     }
 
     /// Get extras (trailers, behind the scenes, etc.)
@@ -652,24 +673,24 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return container.MediaContainer.Metadata ?? []
     }
 
-    /// Get items in a collection (other movies in the same collection)
-    /// - Parameters:
-    ///   - sectionId: The library section ID containing the collection
-    ///   - collectionId: The collection filter ID (from Collection[].id in metadata)
-    ///   - excludeRatingKey: Optional ratingKey to exclude from results (typically current movie)
-    func getCollectionItems(
+    /// The collection a `collection.related` hub points at. A title's
+    /// Collection tag id (the hub key's `tagId`) is the collection's `index`,
+    /// not its ratingKey. Scoped to the hub's section because same-named
+    /// collections in Movies and TV share one tag: `/library/all?type=18&index=`
+    /// returns both, movie first.
+    func getCollection(
         serverURL: String,
         authToken: String,
         sectionId: String,
-        collectionId: String,
-        excludeRatingKey: String? = nil
-    ) async throws -> [PlexMetadata] {
+        tagId: String
+    ) async throws -> PlexMetadata? {
         guard var components = URLComponents(string: "\(serverURL)/library/sections/\(sectionId)/all") else {
             throw PlexAPIError.invalidURL
         }
 
         components.queryItems = [
-            URLQueryItem(name: "collection", value: collectionId)
+            URLQueryItem(name: "type", value: "18"),
+            URLQueryItem(name: "index", value: tagId)
         ]
 
         guard let url = components.url else {
@@ -680,15 +701,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             url,
             headers: plexHeaders(authToken: authToken)
         )
-
-        var items = container.MediaContainer.Metadata ?? []
-
-        // Filter out the excluded item (current movie)
-        if let exclude = excludeRatingKey {
-            items = items.filter { $0.ratingKey != exclude }
-        }
-
-        return items
+        return container.MediaContainer.Metadata?.first
     }
 
     /// Get children of an item (seasons for shows, episodes for seasons, albums for artists)
@@ -838,16 +851,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         userId: Int? = nil,
         count: Int = 50
     ) async throws -> PlexHub? {
-        guard var components = URLComponents(string: "\(serverURL)/hubs/continueWatching") else {
-            throw PlexAPIError.invalidURL
-        }
-
-        components.queryItems = [
-            URLQueryItem(name: "X-Plex-Container-Start", value: "0"),
-            URLQueryItem(name: "X-Plex-Container-Size", value: "\(count)")
-        ]
-
-        guard let url = components.url else {
+        guard let url = Self.continueWatchingURL(serverURL: serverURL, count: count) else {
             throw PlexAPIError.invalidURL
         }
 
@@ -857,6 +861,23 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         )
 
         return container.MediaContainer.Hub?.first
+    }
+
+    /// The Continue Watching URL, unique per call. PMS 1.43.4 caches this
+    /// response per URL and `Accept-Language`, and a removal does not clear
+    /// it: with tvOS's `en-US,en;q=0.9` the server kept answering with an item
+    /// removed two hours earlier, while the same request without the header,
+    /// or with any extra query item, came back current. The 30s poll may be
+    /// what keeps the entry alive. The `_` item makes every request miss that
+    /// cache; PMS ignores it.
+    static func continueWatchingURL(serverURL: String, count: Int, now: Date = Date()) -> URL? {
+        guard var components = URLComponents(string: "\(serverURL)/hubs/continueWatching") else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "X-Plex-Container-Start", value: "0"),
+            URLQueryItem(name: "X-Plex-Container-Size", value: "\(count)"),
+            URLQueryItem(name: "_", value: String(Int(now.timeIntervalSince1970 * 1000)))
+        ]
+        return components.url
     }
 
     /// Get recently added items
@@ -952,13 +973,55 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return container.MediaContainer.Hub ?? []
     }
 
+    /// URL for one page of a hub.
+    ///
+    /// The hub key's own query is kept and the paging parameters are appended.
+    /// Many keys ARE their row's definition (`movie.recentlyadded.1` is
+    /// `/library/sections/1/all?sort=addedAt:desc`, a genre row carries
+    /// `unwatched=1&genre=80&audienceRating>=7.0`), so replacing the query
+    /// pages the whole library in title order instead.
+    ///
+    /// Returns nil for `/hubs/items` without an identifier (Plex answers 404)
+    /// or a key URLComponents cannot parse.
+    nonisolated static func hubItemsURL(
+        serverURL: String,
+        hubKey: String,
+        hubIdentifier: String?,
+        start: Int,
+        count: Int
+    ) -> URL? {
+        // The hubKey might be a full path like "/hubs/sections/1/continueWatching"
+        // or just the section like "hub.movies.recentlyadded"
+        let fullPath = hubKey.hasPrefix("/") ? "\(serverURL)\(hubKey)" : "\(serverURL)/\(hubKey)"
+        guard var components = URLComponents(string: fullPath) else { return nil }
+
+        // Start and Size go together: Plex ignores X-Plex-Container-Size unless
+        // X-Plex-Container-Start comes with it.
+        var queryItems = (components.queryItems ?? []) + [
+            URLQueryItem(name: "X-Plex-Container-Start", value: "\(start)"),
+            URLQueryItem(name: "X-Plex-Container-Size", value: "\(count)")
+        ]
+
+        // The /hubs/items endpoint requires an identifier parameter to specify which hub
+        // Without it, Plex returns 404. See: https://plexapi.dev/api-reference/hubs/get-a-hubs-items
+        if hubKey == "/hubs/items" || hubKey.hasSuffix("/hubs/items") {
+            guard let hubIdentifier, !hubIdentifier.isEmpty else { return nil }
+            queryItems.append(URLQueryItem(name: "identifier", value: hubIdentifier))
+        }
+
+        components.queryItems = queryItems
+        return components.url
+    }
+
     /// Get more items from a hub using its key (for pagination/infinite scroll)
     /// - Parameters:
     ///   - hubKey: The hub's key path (e.g., "/hubs/sections/1/continueWatching")
     ///   - hubIdentifier: The hub's identifier (e.g., "home.movies.recent") - required when hubKey is "/hubs/items"
     ///   - start: Starting index for pagination
     ///   - count: Number of items to fetch
-    /// - Returns: Tuple of (items, totalSize) where totalSize indicates if more items exist
+    /// - Returns: The page's items and the hub's total under its own query
+    ///   (`totalSize`, or the page's `size` when the server sends no total).
+    ///   `loadMoreIfNeeded` ends the row once it has loaded that many.
     func getHubItems(
         serverURL: String,
         authToken: String,
@@ -972,40 +1035,19 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             return KinoPubDemoPlexFixtures.hubItems(hubKey: hubKey, start: start, count: count)
         }
         #endif
-        // The hubKey might be a full path like "/hubs/sections/1/continueWatching"
-        // or just the section like "hub.movies.recentlyadded"
-        let fullPath: String
-        if hubKey.hasPrefix("/") {
-            fullPath = "\(serverURL)\(hubKey)"
-        } else {
-            fullPath = "\(serverURL)/\(hubKey)"
-        }
-
-        guard var components = URLComponents(string: fullPath) else {
-            throw PlexAPIError.invalidURL
-        }
-
-        var queryItems = [
-            URLQueryItem(name: "X-Plex-Container-Start", value: "\(start)"),
-            URLQueryItem(name: "X-Plex-Container-Size", value: "\(count)")
-        ]
-
-        // The /hubs/items endpoint requires an identifier parameter to specify which hub
-        // Without it, Plex returns 404. See: https://plexapi.dev/api-reference/hubs/get-a-hubs-items
-        if hubKey == "/hubs/items" || hubKey.hasSuffix("/hubs/items") {
-            if let identifier = hubIdentifier, !identifier.isEmpty {
-                queryItems.append(URLQueryItem(name: "identifier", value: identifier))
-            } else {
-                // No identifier available - this request will fail, so skip it
-                print("⚠️ PlexNetworkManager: Cannot paginate /hubs/items without hubIdentifier")
-                return (items: [], totalSize: nil)
-            }
-        }
-
-        components.queryItems = queryItems
-
-        guard let url = components.url else {
-            throw PlexAPIError.invalidURL
+        guard let url = Self.hubItemsURL(
+            serverURL: serverURL,
+            hubKey: hubKey,
+            hubIdentifier: hubIdentifier,
+            start: start,
+            count: count
+        ) else {
+            // Two cases reach here: /hubs/items without an identifier (Plex
+            // answers 404) and a key URLComponents cannot parse. Neither can
+            // ever page, so this returns an empty page and the caller ends the
+            // row, where an unparseable key used to throw.
+            print("⚠️ PlexNetworkManager: Cannot build a page URL for this hub")
+            return (items: [], totalSize: nil)
         }
 
         let container: PlexMediaContainerWrapper = try await request(
@@ -1014,7 +1056,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         )
 
         let items = container.MediaContainer.Metadata ?? []
-        let totalSize = container.MediaContainer.size
+        let totalSize = container.MediaContainer.totalSize ?? container.MediaContainer.size
 
         return (items, totalSize)
     }
@@ -1628,6 +1670,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         serverURL: String,
         authToken: String,
         ratingKey: String,
+        mediaIndex: Int = 0,
         offsetMs: Int = 0,
         hasHDR: Bool = false,
         useDolbyVision: Bool = true,
@@ -1704,7 +1747,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         var items: [URLQueryItem] = [
             URLQueryItem(name: "X-Plex-Client-Profile-Name", value: clientProfileName),
             URLQueryItem(name: "path", value: "/library/metadata/\(ratingKey)"),
-            URLQueryItem(name: "mediaIndex", value: "0"),
+            URLQueryItem(name: "mediaIndex", value: "\(mediaIndex)"),
             URLQueryItem(name: "partIndex", value: "0"),
             URLQueryItem(name: "offset", value: "\(offsetMs / 1000)"),
             URLQueryItem(name: "protocol", value: "hls"),
@@ -2178,7 +2221,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         let containers: [GridContainer?] = await fetchConcurrently(
             requests.map(\.url),
             headers: plexHeaders(authToken: authToken)
-        )
+        ).map { try? $0.get() }
 
         // Extract unique channels from all programs' Media arrays, across every
         // DVR. Dedupe is by channel identifier and FIRST WINS: a channel two
@@ -2264,27 +2307,29 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return channels
     }
 
-    /// Fetches several pages at once and returns them in input order, nil for a
-    /// page that failed. Order is the point: callers dedupe first-wins across
-    /// the pages, so the answer must not depend on which request landed first.
+    /// Fetches several pages at once and returns them in input order. Order is
+    /// the point: callers dedupe first-wins across the pages, so the answer must
+    /// not depend on which request landed first. Failures keep their error so a
+    /// caller that gives up can throw the real one: a superseded load must still
+    /// read as a cancellation, which the guide and Sentry both drop.
     private func fetchConcurrently<T: Decodable & Sendable>(
         _ urls: [URL],
         headers: [String: String]
-    ) async -> [T?] {
-        await withTaskGroup(of: (Int, T?).self) { group in
+    ) async -> [Result<T, Error>] {
+        await withTaskGroup(of: (Int, Result<T, Error>).self) { group in
             for (index, url) in urls.enumerated() {
                 group.addTask {
                     do {
                         let value: T = try await self.request(url, headers: headers)
-                        return (index, Optional(value))
+                        return (index, .success(value))
                     } catch {
-                        return (index, nil)
+                        return (index, .failure(error))
                     }
                 }
             }
-            var results = [T?](repeating: nil, count: urls.count)
-            for await (index, value) in group {
-                results[index] = value
+            var results = [Result<T, Error>](repeating: .failure(CancellationError()), count: urls.count)
+            for await (index, result) in group {
+                results[index] = result
             }
             return results
         }
@@ -2393,16 +2438,17 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         // Some PMS variants answer a FAILED tune with HTTP 200 and a container
         // carrying status -1 plus a message ("Could not tune...").
         if let status = mediaContainer["status"] as? Int, status != 0, status != 200 {
+            let serverMessage = String((mediaContainer["message"] as? String ?? "").prefix(200))
             let breadcrumb = Breadcrumb(level: .warning, category: "plex_livetv")
             breadcrumb.message = "Tune returned failure status"
             breadcrumb.data = [
                 "dvr": dvrKey,
                 "channel": channelId,
                 "status": status,
-                "server_message": (mediaContainer["message"] as? String ?? "").prefix(200)
+                "server_message": serverMessage
             ]
             SentryBridge.addBreadcrumb(breadcrumb)
-            throw PlexAPIError.invalidResponse
+            throw PlexLiveTuneError(serverMessage: serverMessage)
         }
 
         // PRIMARY: the live session's Metadata.key (/livetv/sessions/{uuid}).
@@ -2718,16 +2764,17 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             let endsAt: Int?
         }
 
-        let containers: [GridEPGContainer?] = await fetchConcurrently(
+        let results: [Result<GridEPGContainer, Error>] = await fetchConcurrently(
             gridURLs,
             headers: plexHeaders(authToken: authToken)
         )
+        let containers = results.compactMap { try? $0.get() }
         // Every DVR failing is a failure; some failing is a partial guide.
-        guard containers.contains(where: { $0 != nil }) else {
-            throw PlexAPIError.invalidResponse
+        if containers.isEmpty, case .failure(let error)? = results.first {
+            throw error
         }
 
-        let programs = containers.compactMap { $0 }.flatMap { $0.MediaContainer.Metadata ?? [] }
+        let programs = containers.flatMap { $0.MediaContainer.Metadata ?? [] }
 
         // Group programs by channel and convert to PlexLiveTVGuideChannel format
         // Each program can have multiple Media entries representing different time slots
@@ -3207,6 +3254,19 @@ enum PlexAPIError: LocalizedError {
             return "Network error: \(error.localizedDescription)"
         }
     }
+}
+
+/// PMS refused a Live TV tune (status -1, "Could not tune channel..."). PMS
+/// answers the same for every tuner fault, but in practice it is usually every
+/// tuner being in use.
+///
+/// Its own type rather than a `PlexAPIError` case: a new case with a payload
+/// renumbers the NSError code of every payload-free case, which is what
+/// existing Sentry issues are grouped by.
+nonisolated struct PlexLiveTuneError: LocalizedError {
+    let serverMessage: String
+
+    var errorDescription: String? { "Tune failed: \(serverMessage)" }
 }
 
 // MARK: - Playback Decision Models

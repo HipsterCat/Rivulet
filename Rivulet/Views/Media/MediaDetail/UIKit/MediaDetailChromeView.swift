@@ -106,7 +106,7 @@ final class MediaDetailChromeView: UIView {
     /// (action row is interaction-disabled). Wired in `.expandedDetail`
     /// during Iter B/D.
     var onPlay: (() -> Void)?
-    var onToggleWatched: (() -> Void)?
+    var onPlayVersion: ((String) -> Void)?
     var onToggleWatchlist: (() -> Void)?
     var onShowFullDescription: ((MediaItemDetail) -> Void)?
 
@@ -683,6 +683,23 @@ final class MediaDetailChromeView: UIView {
         } else {
             castLabel.text = nil
         }
+        addVersionsButton(detail)
+    }
+
+    /// Versions button after Info, once the detail shows two or more files.
+    private func addVersionsButton(_ detail: MediaItemDetail) {
+        let versions = VersionPicker.versions(in: detail)
+        guard !versions.isEmpty, versionsButton == nil, let info = infoButton,
+              let index = actionButtonsStack.arrangedSubviews.firstIndex(of: info) else { return }
+        let button = makeCircleButton(systemImage: "square.stack")
+        button.onPrimaryAction = { [weak self, weak button] in
+            guard let self, let button, let host = self.hostViewController else { return }
+            VersionPicker.present(versions, from: host, sourceFrame: button.convert(button.bounds, to: nil)) {
+                [weak self] id in self?.onPlayVersion?(id)
+            }
+        }
+        actionButtonsStack.insertArrangedSubview(button, at: index + 1)
+        versionsButton = button
     }
 
     // MARK: - Row builders
@@ -729,6 +746,7 @@ final class MediaDetailChromeView: UIView {
         watchlist.onPrimaryAction = { [weak self] in self?.toggleWatchlist(item) }
 
         let info = makeCircleButton(systemImage: "text.page")     // open details popup
+        infoButton = info
         info.onPrimaryAction = { [weak self] in
             guard let self, let detail = self.detail else { return }
             self.onShowFullDescription?(detail)
@@ -736,9 +754,27 @@ final class MediaDetailChromeView: UIView {
 
         actionButtonsStack.addArrangedSubview(play)
         actionButtonsStack.addArrangedSubview(watched)
-        actionButtonsStack.addArrangedSubview(watchlist)
+        // Jellyfin has no watchlist: its add throws, so the button would flip
+        // and snap back. Nil provider keeps today's behaviour.
+        if MediaProviderRegistry.shared.provider(for: item.ref.providerID)?.supportsWatchlist ?? true {
+            actionButtonsStack.addArrangedSubview(watchlist)
+        }
         actionButtonsStack.addArrangedSubview(info)
+        // An episode's Watched acts on the episode alone; the whole show is
+        // marked from the show's own page, which this opens.
+        if item.kind == .episode, let showRef = item.grandparentRef, !showRef.itemID.isEmpty {
+            let goToShow = makeCircleButton(systemImage: "tv")
+            goToShow.onPrimaryAction = { [weak self] in
+                guard let self, let host = self.hostViewController else { return }
+                PreviewCarouselViewController.openShowDetail(showRef, from: host)
+            }
+            actionButtonsStack.addArrangedSubview(goToShow)
+        }
         playButton = play
+    }
+
+    private var hostViewController: UIViewController? {
+        sequence(first: self as UIResponder, next: \.next).first { $0 is UIViewController } as? UIViewController
     }
 
     /// Metadata-only (TMDB) action row: Watchlist pill + Info. The pill
@@ -839,13 +875,37 @@ final class MediaDetailChromeView: UIView {
 
     private weak var watchedButton: FocusableActionButton?
     private weak var watchlistButton: FocusableActionButton?
+    private weak var infoButton: FocusableActionButton?
+    private weak var versionsButton: FocusableActionButton?
     private var heroWatched = false
     private var heroOnWatchlist = false
 
     private func toggleWatched(_ item: MediaItem) {
-        heroWatched.toggle()
+        // The stored item, not the one captured at build: a refresh since then
+        // carries the show's current episode counts.
+        let current = self.item ?? item
+        if current.kind == .show { confirmShowWatchChange(current); return }
+        setWatched(!heroWatched, current)
+    }
+
+    /// A show's Watched changes every episode at once, so it asks first and
+    /// says how many episodes are already watched.
+    private func confirmShowWatchChange(_ show: MediaItem) {
+        guard let host = hostViewController else { return }
+        let prompt = ShowWatchPrompt(progress: show.childProgress)
+        let alert = UIAlertController(title: show.title, message: prompt.message, preferredStyle: .alert)
+        for choice in prompt.choices {
+            alert.addAction(UIAlertAction(title: choice.title, style: .default) { [weak self] _ in
+                self?.setWatched(choice.markWatched, show)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        host.present(alert, animated: true)
+    }
+
+    private func setWatched(_ target: Bool, _ item: MediaItem) {
+        heroWatched = target
         updateWatchedIcon()
-        let target = heroWatched
         Task {
             guard let p = MediaProviderRegistry.shared.provider(for: item.ref.providerID) else { return }
             if target { try? await p.markPlayed(item.ref) } else { try? await p.markUnplayed(item.ref) }
@@ -925,6 +985,7 @@ final class MediaDetailChromeView: UIView {
             parts.append(String(year))
         }
         if let runtime = item.runtime, runtime > 0 { parts.append(Self.formatRuntime(runtime)) }
+        if let edition = detail?.item.editionTitle ?? item.editionTitle, !edition.isEmpty { parts.append(edition) }
 
         for (i, part) in parts.enumerated() {
             if i > 0 {
@@ -934,23 +995,26 @@ final class MediaDetailChromeView: UIView {
         }
 
         if let rating = detail?.rating {
-            let star = UIImageView(image: UIImage(systemName: "star.fill"))
-            star.tintColor = .systemYellow
-            star.contentMode = .scaleAspectFit
-            star.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                star.widthAnchor.constraint(equalToConstant: 20),
-                star.heightAnchor.constraint(equalToConstant: 20)
-            ])
-            let ratingLabel = Self.makeCaptionLabel(String(format: "%.1f", rating), alpha: 1, bold: true)
-            let starStack = UIStackView(arrangedSubviews: [star, ratingLabel])
+            let ratingLabel = Self.makeCaptionLabel(rating.badgeText, alpha: 1, bold: true)
+            let starStack = UIStackView(arrangedSubviews: [ratingLabel])
+            if rating.showsStar {
+                let star = UIImageView(image: UIImage(systemName: "star.fill"))
+                star.tintColor = .systemYellow
+                star.contentMode = .scaleAspectFit
+                star.translatesAutoresizingMaskIntoConstraints = false
+                NSLayoutConstraint.activate([
+                    star.widthAnchor.constraint(equalToConstant: 20),
+                    star.heightAnchor.constraint(equalToConstant: 20)
+                ])
+                starStack.insertArrangedSubview(star, at: 0)
+            }
             starStack.axis = .horizontal
             starStack.spacing = 4
             starStack.alignment = .center
             qualityRow.addArrangedSubview(starStack)
         }
 
-        if let badges = detail?.mediaSources.first?.qualityBadges(), !badges.isEmpty {
+        if let badges = detail?.primarySource?.qualityBadges(), !badges.isEmpty {
             for badge in badges {
                 qualityRow.addArrangedSubview(Self.makeQualityBadge(badge))
             }
@@ -1191,6 +1255,34 @@ final class MediaDetailChromeView: UIView {
         return container
     }
 }
+
+/// What the show page's Watched prompt says: the watched count, and only the
+/// choices that would change an episode. Without counts it offers both.
+struct ShowWatchPrompt: Equatable {
+    struct Choice: Equatable {
+        let title: String
+        let markWatched: Bool
+    }
+
+    static let markWatched = Choice(title: "Mark All Watched", markWatched: true)
+    static let markUnwatched = Choice(title: "Mark All Unwatched", markWatched: false)
+
+    let message: String?
+    let choices: [Choice]
+
+    init(progress: ChildProgress?) {
+        guard let progress, progress.total > 0 else {
+            message = nil
+            choices = [Self.markWatched, Self.markUnwatched]
+            return
+        }
+        let total = progress.total
+        let played = min(max(progress.played, 0), total)
+        message = "\(played) of \(total) episodes watched."
+        choices = (played < total ? [Self.markWatched] : []) + (played > 0 ? [Self.markUnwatched] : [])
+    }
+}
+
 // STEAL: ALMOST IDEAL button layout/look/style, apple-like. Info button, plus, checkmark - everything. Also take the entire info sheet from this place (the one opening on info)
 #if DEBUG
 import SwiftUI

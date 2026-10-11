@@ -305,6 +305,13 @@ class LiveTVDataStore: ObservableObject {
         await updateSourceInfo()
     }
 
+    #if DEBUG
+    /// DEBUG launch hooks: a source for this run only, never saved.
+    func debugAddTransientSource(_ provider: any LiveTVProvider) {
+        providers[provider.sourceId] = provider
+    }
+    #endif
+
     /// Add a Plex Live TV source
     func addPlexSource(provider: any LiveTVProvider) async {
         providers[provider.sourceId] = provider
@@ -812,6 +819,8 @@ class LiveTVDataStore: ObservableObject {
                 return "EPG server returned HTTP \(code)"
             case .parseFailed:
                 return "EPG data could not be parsed"
+            case .tooLarge:
+                return "EPG data is too large"
             }
         }
 
@@ -1099,12 +1108,13 @@ class LiveTVDataStore: ObservableObject {
     /// (Plex account favorites) in the source's order.
     static func favorites(in channels: [UnifiedChannel], order: [String]) -> [UnifiedChannel] {
         let position = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        // Typed key: the inline tuple comparison times out Xcode 26.3's type checker.
+        let key = { (channel: UnifiedChannel) -> (Int, Int, Int) in
+            (position[channel.id] ?? .max, channel.favouriteRank ?? .max, channel.channelNumber ?? .max)
+        }
         return channels
             .filter { position[$0.id] != nil || $0.isFavourite }
-            .sorted { lhs, rhs in
-                (position[lhs.id] ?? .max, lhs.favouriteRank ?? .max, lhs.channelNumber ?? .max)
-                    < (position[rhs.id] ?? .max, rhs.favouriteRank ?? .max, rhs.channelNumber ?? .max)
-            }
+            .sorted { key($0) < key($1) }
     }
 
     private func loadFavorites() {
@@ -1166,11 +1176,11 @@ class LiveTVDataStore: ObservableObject {
     /// setup first (Plex cloud-EPG/DVB channels need a tune before the
     /// transcoder will serve them). Prefer this over `buildStreamURL(for:)`
     /// at playback time; the sync variant remains for availability checks.
-    func resolveStreamURL(for channel: UnifiedChannel) async -> URL? {
+    func resolveStreamURL(for channel: UnifiedChannel) async throws -> URL? {
         guard let provider = providers[channel.sourceId] else {
             return channel.streamURL
         }
-        return await provider.resolveStreamURL(for: channel)
+        return try await provider.resolveStreamURL(for: channel)
     }
 
     func buildStreamURL(for channel: UnifiedChannel) -> URL? {

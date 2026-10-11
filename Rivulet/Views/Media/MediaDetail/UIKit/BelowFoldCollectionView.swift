@@ -27,6 +27,7 @@ nonisolated enum BelowFoldSectionKind: Hashable, Sendable {
     case episodes
     case trailers
     case extras
+    case collection
     case related
     case cast
     case about
@@ -40,11 +41,12 @@ nonisolated enum BelowFoldItem: Hashable, Sendable {
     case seasonDivider(String)
     case trailer(String)
     case extra(String)
-    case related(String)
     /// The whole Related row as ONE item — a ShelfRowCell hosting its own
     /// horizontal collection view, so the row matches the home/library
     /// shelves exactly (geometry, peeks, pitch-aligned landings, glide).
     case relatedShelf
+    /// The collection row, hosted exactly like `.relatedShelf`.
+    case collectionShelf
     case cast(String)
     case about       // single full-width card block
     case info        // single full-width columns block
@@ -67,7 +69,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     // Same episode card, minus the episode-number / summary / footer rows — so the
     // card hugs thumbnail (245) + 8 + title block (~64).
     private static let trailerHeight: CGFloat = 318
-    private static let relatedWidth: CGFloat = MediaRowMetrics.posterWidth
     private static let castWidth: CGFloat = CastCell.circleSize   // cell == circle; labels overflow into the gap
 
     /// contentOffset.y + adjustedContentInset.top (0 at rest, grows as scrolled).
@@ -79,7 +80,8 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     var onPlayEpisode: ((MediaItem) -> Void)?
     /// Trailer / extra Select → play that video (by Plex ratingKey).
     var onPlayTrailer: ((BelowFoldTrailer) -> Void)?
-    /// Related poster Select → open that item's detail page (blur-fade).
+    /// Related or collection-row poster Select (the trailing collection tile
+    /// included) → open that item's detail page (blur-fade).
     var onShowRelatedDetails: ((MediaItem) -> Void)?
     /// Episode description Select → open the episode detail page.
     var onShowEpisodeDetails: ((MediaItem) -> Void)?
@@ -92,12 +94,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     /// the season it resolved as selected. The container builds the season pills
     /// from this instead of fetching `/children` a second time of its own.
     var onSeasonsLoaded: (([MediaItem], Int) -> Void)?
-    /// Per-season watched counts recomputed from the refreshed episodes, keyed by
-    /// season ref itemID. A watch-state refresh reconfigures episode cells and
-    /// nothing else — it never re-runs the seasons fetch — so anything showing a
-    /// season's played count needs this to repaint (CLAUDE.md: "Changing watch
-    /// state must repaint").
-    var onSeasonProgressRefreshed: (([String: ChildProgress]) -> Void)?
 
     /// Which sub-target of the focused episode card is focused (thumb vs
     /// description). Set from the cell's focus reporting.
@@ -122,7 +118,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     private var episodesByID: [String: MediaItem] = [:]
     private var trailersByID: [String: BelowFoldTrailer] = [:]
     private var extrasByID: [String: BelowFoldTrailer] = [:]
-    private var relatedByID: [String: MediaItem] = [:]
     private var castEntriesByID: [String: CastEntry] = [:]
     private var multiSeason = false
     /// Full detail for the About + Information/Languages/Accessibility blocks.
@@ -140,7 +135,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         backgroundColor = .clear
 
         collectionView = FocusScrollControlledCollectionView(frame: bounds, collectionViewLayout: makeLayout())
-        collectionView.topBand = detailsTopY
+        collectionView.topBand = Self.detailsTopY
         // Disable the collection's own (vertical) scrolling so the focus engine
         // can't spin up its centering "focus scroll animator". We drive all
         // vertical scroll ourselves (slide on entry, didUpdateFocus per section).
@@ -159,7 +154,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         collectionView.register(EpisodeCollectionCell.self, forCellWithReuseIdentifier: EpisodeCollectionCell.reuseID)
         collectionView.register(SeasonDividerCell.self, forCellWithReuseIdentifier: SeasonDividerCell.reuseID)
         collectionView.register(TrailerCollectionCell.self, forCellWithReuseIdentifier: TrailerCollectionCell.reuseID)
-        collectionView.register(RelatedPosterCell.self, forCellWithReuseIdentifier: RelatedPosterCell.reuseID)
         collectionView.register(ShelfRowCell.self, forCellWithReuseIdentifier: ShelfRowCell.reuseID)
         collectionView.register(CastCollectionCell.self, forCellWithReuseIdentifier: CastCollectionCell.reuseID)
         collectionView.register(AboutCollectionCell.self, forCellWithReuseIdentifier: AboutCollectionCell.reuseID)
@@ -205,7 +199,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         // Small top inset = where episodes land in details (so the focus engine
         // aligns them there). The carousel-stable peek offset is provided by the
         // large TOP INSET on the episodes section (see makeLayout), not by this.
-        let topInset = detailsTopY
+        let topInset = Self.detailsTopY
         if collectionView.contentInset.top != topInset {
             collectionView.contentInset = UIEdgeInsets(top: topInset, left: 0, bottom: 0, right: 0)
             collectionView.setContentOffset(CGPoint(x: 0, y: -topInset), animated: false)
@@ -230,7 +224,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
             // the first section, movies (Trailers first) had a tiny inset, so the
             // slide barely moved and the blur/fade never triggered.
             let isPrimary = (index == 0)
-            let peek = max(0, self.bounds.height - Self.episodePeek - self.detailsTopY)
+            let peek = max(0, self.bounds.height - Self.episodePeek - Self.detailsTopY)
             switch self.sectionKinds[index] {
             // Episodes: LEFT-aligned (ATV+), first card at the metadata inset
             // (leading 128). The collection's small contentInset.top (= detailsTopY)
@@ -264,7 +258,9 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
                     headerHeight: 44,
                     sectionBottomInset: 96
                 )
-            case .related:
+            case .related, .collection:
+                // The collection row shares this: on a movie with no trailers
+                // or extras it is the primary peek row, so it needs the same lift.
                 // Home-identical shelf: one full-width ShelfRowCell hosting
                 // the posters (margin 40, symmetric peeks, pitch landings).
                 // As the primary row, lift the section by its own header (+ the
@@ -456,40 +452,16 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
                     cell.onPlay = { [weak self] in self?.onPlayTrailer?(extra) }
                 }
                 return cell
-            case .related(let id):
-                let cell = cv.dequeueReusableCell(withReuseIdentifier: RelatedPosterCell.reuseID, for: indexPath) as! RelatedPosterCell
-                if let it = self.relatedByID[id] { cell.configure(item: it) }
+            case .collectionShelf:
+                let cell = cv.dequeueReusableCell(withReuseIdentifier: ShelfRowCell.reuseID, for: indexPath) as! ShelfRowCell
+                let row = self.collectionRow
+                self.configurePosterShelf(cell, section: .collection, title: row?.title ?? "",
+                                          items: row?.members ?? [], trailing: row?.collection)
                 return cell
-
             case .relatedShelf:
                 let cell = cv.dequeueReusableCell(withReuseIdentifier: ShelfRowCell.reuseID, for: indexPath) as! ShelfRowCell
-                let items = self.relatedItems
-                var hasher = Hasher()
-                for it in items { hasher.combine(it.ref.itemID) }
-                cell.cellProvider = { innerCV, ip in
-                    let poster = innerCV.dequeueReusableCell(withReuseIdentifier: PosterCell.reuseID, for: ip) as! PosterCell
-                    if ip.item < items.count { poster.configure(item: items[ip.item]) }
-                    return poster
-                }
-                cell.onSelect = { [weak self] idx in
-                    guard let self, idx < self.relatedItems.count else { return }
-                    self.onShowRelatedDetails?(self.relatedItems[idx])
-                }
-                cell.onWillDisplayItem = nil
-                cell.onLongPressItem = nil
-                cell.onOffsetChanged = nil
-                // Self-align to the screen's rowLeading (robust to the
-                // below-fold's state-dependent translation), and draw the
-                // header in-cell so it aligns with the tiles.
-                cell.screenAlignsLeading = true
-                cell.headerTitle = "Related"
-                cell.configure(
-                    kind: .poster,
-                    realCount: items.count,
-                    hasSkeleton: false,
-                    contentToken: hasher.finalize(),
-                    initialOffset: 0
-                )
+                self.configurePosterShelf(cell, section: .related, title: "Related",
+                                          items: self.relatedItems, trailing: nil)
                 return cell
             case .cast(let id):
                 let cell = cv.dequeueReusableCell(withReuseIdentifier: CastCollectionCell.reuseID, for: indexPath) as! CastCollectionCell
@@ -519,10 +491,55 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
             case .extras:  header.configure(title: "Extras")
             case .related: header.configure(title: "Related")
             case .cast:    header.configure(title: "Cast & Crew")
-            case .episodes, .about, .info: header.configure(title: "")
+            case .episodes, .collection, .about, .info: header.configure(title: "")
             }
             return header
         }
+    }
+
+    /// One body for both poster shelves (Collection, Related) so they cannot
+    /// drift. Every tile, the trailing collection tile included, opens through
+    /// `onShowRelatedDetails`; `presentStandaloneDetail` routes a collection
+    /// to its page. The content token hashes each tile's ratingKey and watch
+    /// state, so a watch-state refresh reloads the row (under the shelf's
+    /// cross-dissolve) only when a glyph moved. The row keeps its horizontal
+    /// offset across that reload and across host-cell reuse.
+    private func configurePosterShelf(_ cell: ShelfRowCell,
+                                      section: BelowFoldSectionKind,
+                                      title: String,
+                                      items: [MediaItem],
+                                      trailing: MediaItem?) {
+        let tiles = items + (trailing.map { [$0] } ?? [])
+        var hasher = Hasher()
+        for tile in tiles {
+            hasher.combine(tile.ref.itemID)
+            hasher.combine(tile.userState.isPlayed)
+            hasher.combine(tile.userState.viewOffset)
+        }
+        cell.cellProvider = { innerCV, ip in
+            let poster = innerCV.dequeueReusableCell(withReuseIdentifier: PosterCell.reuseID, for: ip) as! PosterCell
+            if ip.item < tiles.count { poster.configure(item: tiles[ip.item]) }
+            return poster
+        }
+        cell.onSelect = { [weak self] idx in
+            guard let self, idx < tiles.count else { return }
+            self.onShowRelatedDetails?(tiles[idx])
+        }
+        cell.onWillDisplayItem = nil
+        cell.onLongPressItem = nil
+        cell.onOffsetChanged = { [weak self] offset in self?.shelfOffsets[section] = offset }
+        // Self-align to the screen's rowLeading (robust to the
+        // below-fold's state-dependent translation), and draw the
+        // header in-cell so it aligns with the tiles.
+        cell.screenAlignsLeading = true
+        cell.headerTitle = title
+        cell.configure(
+            kind: .poster,
+            realCount: tiles.count,
+            hasSkeleton: false,
+            contentToken: hasher.finalize(),
+            initialOffset: shelfOffsets[section] ?? 0
+        )
     }
 
     // MARK: - Configure (fetch + populate)
@@ -533,7 +550,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         loadToken &+= 1
         let token = loadToken
         configuredItem = item
-        setDetailsTopY(forKind: item.kind)
         Task { [weak self] in
             guard let self else { return }
             let content = await self.loader.load(for: item, detail: detail)
@@ -571,7 +587,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         loadToken &+= 1
         let token = loadToken
         configuredItem = item
-        setDetailsTopY(forKind: item.kind)
         let showRef: MediaItemRef?
         switch item.kind {
         case .show: showRef = item.ref
@@ -625,6 +640,10 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         refreshToken &+= 1
         let refresh = refreshToken
         let load = loadToken
+        // Nothing to repaint in the carousel-stable episodes-only phase
+        // (`ingestEpisodesOnly` clears both), so skip /related and the
+        // collection fetch. Read before the await: the stores can change under it.
+        let hasShelves = collectionRow != nil || !cachedRelated.isEmpty
         Task { [weak self] in
             guard let self else { return }
             let eps: [MediaItem]
@@ -635,12 +654,44 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
             } else {
                 eps = []
             }
-            guard self.refreshToken == refresh, self.loadToken == load, !eps.isEmpty else { return }
-            self.applyRefreshedEpisodes(eps)
+            guard self.refreshToken == refresh, self.loadToken == load else { return }
+            if !eps.isEmpty { self.applyRefreshedEpisodes(eps) }
+            // Collection and Related tiles carry watch glyphs too. Same call
+            // and same kinds as the loader's collection row; it runs after the
+            // rail repaint so the rail never waits on a second GET.
+            guard hasShelves, item.kind == .movie || item.kind == .show,
+                  let fresh = try? await provider.related(for: item.ref, kind: item.kind),
+                  self.refreshToken == refresh, self.loadToken == load else { return }
+            self.applyRefreshedShelves(fresh)
         }
     }
 
     private var refreshToken: UInt64 = 0
+
+    /// Swap refreshed Collection members and Related items into their stores
+    /// and reconfigure the two shelf host cells in place, which re-runs
+    /// `configurePosterShelf` on the EXISTING cells. The collection row keeps
+    /// its title and trailing tile from the load: only watch state is news.
+    // ponytail: a refresh never adds or removes a row, so a collection or
+    // Related row that appears or empties between load and refresh waits for
+    // the next open; insert/delete with a focus hand-off if that ever matters.
+    private func applyRefreshedShelves(_ fresh: RelatedContent) {
+        var snapshot = dataSource.snapshot()
+        let present = snapshot.itemIdentifiers
+        var targets: [BelowFoldItem] = []
+        if present.contains(.collectionShelf), let row = collectionRow,
+           let members = fresh.collection?.members, !members.isEmpty {
+            collectionRow = CollectionRow(title: row.title, members: members, collection: row.collection)
+            targets.append(.collectionShelf)
+        }
+        if present.contains(.relatedShelf), !fresh.items.isEmpty {
+            relatedItems = fresh.items
+            targets.append(.relatedShelf)
+        }
+        guard !targets.isEmpty else { return }
+        snapshot.reconfigureItems(targets)
+        dataSource.apply(snapshot, animatingDifferences: false)
+    }
 
     /// Swap freshly-fetched episodes into the lookup and reconfigure only the
     /// identifiers whose content actually changed.
@@ -654,10 +705,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
             changed.append(.episode(id))
         }
         guard !changed.isEmpty else { return }
-        // Published before the cell reconfigure so every watch-derived surface
-        // moves together. Derived from these same episodes rather than a second
-        // seasons fetch — the counts are already in hand.
-        onSeasonProgressRefreshed?(Self.seasonProgress(from: episodes))
         var snapshot = dataSource.snapshot()
         // Only reconfigure identifiers the snapshot still holds — a refresh can
         // land after the rail has been re-configured for a different show.
@@ -668,23 +715,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 
-    /// Group episodes into per-season played/total counts, keyed by season ref
-    /// itemID. Mirrors Plex's leafCount / viewedLeafCount, which is where
-    /// `MediaItem.childProgress` comes from on the seasons fetch, so a refreshed
-    /// count and a fetched one mean the same thing. `isPlayed` is the played
-    /// flag, not a resume fraction — this is a count, not a progress rule.
-    private static func seasonProgress(from episodes: [MediaItem]) -> [String: ChildProgress] {
-        var counts: [String: (played: Int, total: Int)] = [:]
-        for episode in episodes {
-            guard let seasonID = episode.parentRef?.itemID else { continue }
-            var count = counts[seasonID] ?? (played: 0, total: 0)
-            count.total += 1
-            if episode.userState.isPlayed { count.played += 1 }
-            counts[seasonID] = count
-        }
-        return counts.mapValues { ChildProgress(played: $0.played, total: $0.total) }
-    }
-
     private func ingestEpisodesOnly(_ episodes: [MediaItem]) {
         // Match the full-ingest label format: a multi-season show shows "S01E01"
         // prefixes, not "Episode N". (Derived from the episodes themselves since
@@ -693,8 +723,9 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         episodesByID = Dictionary(episodes.map { ($0.ref.itemID, $0) }, uniquingKeysWith: { a, _ in a })
         cachedEpisodes = buildRailItems(from: episodes)
         // Cast/related/about are loaded only on expand.
-        trailersByID = [:]; extrasByID = [:]; relatedByID = [:]; castEntriesByID = [:]
+        trailersByID = [:]; extrasByID = [:]; castEntriesByID = [:]
         cachedTrailers = []; cachedExtras = []; cachedRelated = []; cachedCastOrder = []
+        collectionRow = nil; shelfOffsets = [:]
         detail = nil
     }
 
@@ -705,7 +736,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         episodesByID = Dictionary(content.episodes.map { ($0.ref.itemID, $0) }, uniquingKeysWith: { a, _ in a })
         trailersByID = Dictionary(content.trailers.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         extrasByID = Dictionary(content.extras.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        relatedByID = Dictionary(content.related.map { ($0.ref.itemID, $0) }, uniquingKeysWith: { a, _ in a })
 
         var entries: [String: CastEntry] = [:]
         cachedCastOrder = []
@@ -733,6 +763,8 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         cachedExtras = content.extras.map { BelowFoldItem.extra($0.id) }
         relatedItems = content.related
         cachedRelated = content.related.isEmpty ? [] : [BelowFoldItem.relatedShelf]
+        collectionRow = content.collection
+        shelfOffsets = [:]
 
         // Publish the seasons once everything else is ingested, so a handler that
         // reads back from this view sees a consistent state. The loader has
@@ -787,6 +819,12 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     private var cachedRelated: [BelowFoldItem] = []
     /// Ordered Related items backing the shelf (index == shelf tile index).
     private var relatedItems: [MediaItem] = []
+    /// The collection row (Plex's hub title, members, optional trailing
+    /// collection tile). nil or no members: no row.
+    private var collectionRow: CollectionRow?
+    /// Each poster shelf's resting horizontal offset, so a content reload or
+    /// a reused host cell does not throw the row back to its first tile.
+    private var shelfOffsets: [BelowFoldSectionKind: CGFloat] = [:]
     private var cachedCastOrder: [(String, BelowFoldItem)] = []
 
     private func applySnapshot() {
@@ -801,6 +839,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         if !cachedEpisodes.isEmpty { add(.episodes, cachedEpisodes) }
         if !cachedTrailers.isEmpty { add(.trailers, cachedTrailers) }
         if !cachedExtras.isEmpty { add(.extras, cachedExtras) }
+        if let row = collectionRow, !row.members.isEmpty { add(.collection, [.collectionShelf]) }
         if !cachedRelated.isEmpty { add(.related, cachedRelated) }
         if !cachedCastOrder.isEmpty { add(.cast, cachedCastOrder.map { $0.1 }) }
         // About + Information/Languages/Accessibility — only when the full detail
@@ -920,39 +959,19 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     }
 
     func resetScroll() {
-        collectionView.setContentOffset(CGPoint(x: 0, y: -detailsTopY), animated: false)
+        collectionView.setContentOffset(CGPoint(x: 0, y: -Self.detailsTopY), animated: false)
     }
 
     /// Screen-y where the first episode lands in details (under the logo + the
     /// season-pills row, per the ATV+ reference). Also the collection's
     /// contentInset.top, so the focus engine aligns the focused episode here.
-    /// Per content kind since the season info strip: show-family pages land the
-    /// rail lower to reserve the strip's room between the pills and the rail;
-    /// movies keep the original landing. The REST (peek) position is invariant
-    /// either way — the episodes section's top inset is derived from this, and
-    /// the two cancel at rest (first cards at bounds.height − episodePeek).
-    static let movieDetailsTopY: CGFloat = 230
-    static let showDetailsTopY: CGFloat = 396
-    private(set) var detailsTopY: CGFloat = BelowFoldCollectionView.movieDetailsTopY
-
-    /// Set the details landing for the item kind being configured. On a change
-    /// the layout re-derives the peek inset and `layoutSubviews` re-applies the
-    /// content inset (kind changes only happen at carousel-stable rest).
-    private func setDetailsTopY(forKind kind: MediaKind) {
-        let y: CGFloat = (kind == .show || kind == .season || kind == .episode)
-            ? Self.showDetailsTopY : Self.movieDetailsTopY
-        guard detailsTopY != y else { return }
-        detailsTopY = y
-        collectionView.topBand = y
-        collectionView.collectionViewLayout.invalidateLayout()
-        setNeedsLayout()
-    }
+    static let detailsTopY: CGFloat = 230
 
     /// The `onScroll` value when the episodes sit at their details-rest (topBand)
     /// position — i.e. where the season-pills row is at its resting Y. Above this
     /// the pills scroll UP with the rail; below it (entry/collapse) they follow it
     /// down. Equals the episodes section's top inset (the carousel peek).
-    var detailsRestOff: CGFloat { max(0, bounds.height - Self.episodePeek - detailsTopY) }
+    var detailsRestOff: CGFloat { max(0, bounds.height - Self.episodePeek - Self.detailsTopY) }
 
     /// Whether focus is on the episodes (top) row vs a lower section. Drives the
     /// Up handler: episodes → pills; lower section → let the engine move up.
@@ -1012,7 +1031,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
         // Scroll so the first episode lands at detailsTopY — which is the focus
         // engine's preferred position (contentInset.top == detailsTopY), so
         // handing focus in afterward causes no re-scroll bounce.
-        let targetY = max(0, bounds.height - Self.episodePeek - 2 * detailsTopY)
+        let targetY = max(0, bounds.height - Self.episodePeek - 2 * Self.detailsTopY)
         guard animated else { setOffsetY(targetY); completion?(); return }
         animateOffsetY(to: targetY, duration: 0.6, completion: completion)
     }
@@ -1020,7 +1039,7 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     /// Reverse of slideToDetailsTop: slide the episodes back down to the hero
     /// peek rest (drives the reverse choreography). Completion fires at the end.
     func slideToHeroRest(animated: Bool, completion: (() -> Void)? = nil) {
-        let targetY = -detailsTopY
+        let targetY = -Self.detailsTopY
         guard animated else { setOffsetY(targetY); completion?(); return }
         animateOffsetY(to: targetY, duration: 0.6, completion: completion)
     }
@@ -1110,11 +1129,6 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        // Related poster Select → open that item's detail page.
-        if case let .related(id) = dataSource.itemIdentifier(for: indexPath),
-           let item = relatedByID[id] {
-            onShowRelatedDetails?(item)
-        }
         // Cast / crew cell Select → open the person detail page.
         if case let .cast(id) = dataSource.itemIdentifier(for: indexPath),
            let entry = castEntriesByID[id] {
@@ -1134,21 +1148,26 @@ final class BelowFoldCollectionView: UIView, UICollectionViewDelegate {
     /// can't do this itself: it's a pure query called mid-update, and returning
     /// the host cell's path would hand focus to the nested collection, which
     /// restarts at item 0.
-    func restoreShelfRowFocusIfNeeded() {
-        // Find the shelf host by identity, not by `lastFocusedIndexPath`: a shelf
-        // row is ONE cell, so its index path is the same value for every tile in
-        // it and can never say which tile had focus. The tile index lives on the
-        // row itself (`lastFocusedItemIndex`).
-        guard let shelf = collectionView.visibleCells
-            .compactMap({ $0 as? ShelfRowCell })
-            .first(where: { $0.lastFocusedItemIndex != nil }),
+    func restoreShelfRowFocusIfNeeded(requestingFocus: Bool = true) {
+        // The collection's last focused index path names the ROW (a shelf row is
+        // ONE cell, so every tile in it shares that path); the tile index lives
+        // on the row itself (`lastFocusedItemIndex`). Do not pick the first
+        // visible shelf with a tile index instead: `ShelfRowCell` clears it only
+        // in `prepareForReuse`, so with Collection and Related both on screen
+        // the row focus left earlier can still carry one and win.
+        guard let path = collectionView.lastFocusedIndexPath,
+              let shelf = collectionView.cellForItem(at: path) as? ShelfRowCell,
               let item = shelf.lastFocusedItemIndex else { return }
         // The row's target cell may not be realized yet (the trace showed
         // cellRealized=false), and prepareFocusRestore silently no-ops when it
         // can't find the cell. Lay the collection out first so the tile exists.
         collectionView.layoutIfNeeded()
         // Position the row's horizontal window and arm the tile...
-        shelf.prepareFocusRestore(on: item)
+        if requestingFocus {
+            shelf.prepareFocusRestore(on: item)
+        } else {
+            shelf.armFocusRestore(on: item)
+        }
         // ...and route the pending focus update INTO this cell, so the engine
         // asks the row which tile it wants instead of picking the first
         // focusable cell in the whole collection (the primary row).

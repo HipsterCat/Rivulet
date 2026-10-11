@@ -79,7 +79,11 @@ enum PlexMediaMapper {
         if path.hasPrefix("http://") || path.hasPrefix("https://") {
             return URL(string: path)
         }
-        return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(authToken)")
+        // A collection's composite poster carries its own query
+        // (`/library/collections/{rk}/composite/{ts}?width=400&height=600`).
+        // A second '?' folds the token into `height` and PMS answers 401.
+        let separator = path.contains("?") ? "&" : "?"
+        return URL(string: "\(serverURL)\(path)\(separator)X-Plex-Token=\(authToken)")
     }
 
     /// Build a tokenized URL for a PLAYABLE Plex key (a Part key, an extra key).
@@ -284,13 +288,17 @@ enum PlexMediaMapper {
             isMusic: isMusic,
             parentRef: parentRef,
             grandparentRef: grandparentRef,
+            seriesTitle: mediaKind == .episode ? meta.grandparentTitle
+                : (mediaKind == .season ? meta.parentTitle : nil),
             episodeNumber: episodeNumber,
             seasonNumber: seasonNumber,
             childProgress: childProgress,
             userState: userState(meta),
             artwork: artwork(meta, serverURL: serverURL, authToken: authToken),
             parentArtwork: parentArtwork,
-            grandparentArtwork: grandparentArtwork
+            grandparentArtwork: grandparentArtwork,
+            versionCount: meta.Media.map { Set($0.map(\.id)).count },
+            editionTitle: meta.editionTitle
         )
     }
 
@@ -444,12 +452,44 @@ enum PlexMediaMapper {
             trailerURL: trailerURL,
             contentRating: meta.contentRating,
             regionOfOrigin: meta.Country?.first?.tag,
-            rating: meta.rating,
+            rating: Self.rating(meta),
             nextEpisode: nextEpisode,
             collections: collections,
             extras: extras,
-            contentAdvisory: meta.CommonSenseMedia?.first.map(Self.contentAdvisory(from:))
+            contentAdvisory: meta.CommonSenseMedia?.first.map(Self.contentAdvisory(from:)),
+            externalIDs: externalIDs(meta.Guid)
         )
+    }
+
+    /// `rating` is the critic score and `audienceRating` the audience score,
+    /// each tagged by an image URI naming its source
+    /// ("rottentomatoes://image.rating.ripe", "imdb://image.rating",
+    /// "themoviedb://image.rating"). Legacy agents send `rating` with no image.
+    static func rating(_ meta: PlexMetadata) -> MediaRating? {
+        func source(_ image: String?) -> MediaRating.Source {
+            switch image?.split(separator: ":").first {
+            case "rottentomatoes": .rottenTomatoes
+            case "imdb": .imdb
+            case "themoviedb": .tmdb
+            default: .unknown
+            }
+        }
+        return MediaRating.preferred(
+            critic: MediaRating(meta.rating, source: source(meta.ratingImage)),
+            audience: MediaRating(meta.audienceRating, source: source(meta.audienceRatingImage))
+        )
+    }
+
+    /// `Guid` ids ("tmdb://603", "imdb://tt0133093", "tvdb://169") keyed
+    /// lowercase, parsed by PlexMetadata's guid helpers. First match wins.
+    static func externalIDs(_ guids: [PlexGuid]?) -> [String: String] {
+        var out: [String: String] = [:]
+        for raw in (guids ?? []).compactMap(\.id) {
+            if out["tmdb"] == nil, let id = PlexMetadata.extractTmdbId(from: raw) { out["tmdb"] = String(id) }
+            if out["tvdb"] == nil, let id = PlexMetadata.extractTvdbId(from: raw) { out["tvdb"] = String(id) }
+            if out["imdb"] == nil, let id = PlexMetadata.extractImdbId(from: raw) { out["imdb"] = id }
+        }
+        return out
     }
 
     // MARK: - Hub

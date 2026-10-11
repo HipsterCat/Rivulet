@@ -15,7 +15,6 @@
 //
 
 import UIKit
-import TVUIKit
 
 // MARK: - Episode
 
@@ -272,72 +271,6 @@ final class CastCollectionCell: UICollectionViewCell {
     }
 }
 
-// MARK: - Related poster (agnostic MediaItem; the existing PosterCell needs PlexMetadata)
-
-final class RelatedPosterCell: UICollectionViewCell {
-    static let reuseID = "RelatedPosterCell"
-    static let posterWidth: CGFloat = 260
-    static let posterHeight: CGFloat = 390
-
-    private let cornerRadius: CGFloat = 16
-    // Same TVUIKit poster widget the home rows use (native focus parallax/scale/
-    // glow), titleless to match the home aesthetic. The home `PosterCell` can't be
-    // reused directly (it takes PlexMetadata + Plex overlays); this shares the
-    // underlying widget instead.
-    private let posterView = TVPosterView()
-    private var imageToken: UInt64 = 0
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        contentView.clipsToBounds = false
-        clipsToBounds = false
-
-        // Drop shadow on the cell (matches the home PosterCell).
-        contentView.layer.shadowColor = UIColor.black.cgColor
-        contentView.layer.shadowOpacity = 0.35
-        contentView.layer.shadowRadius = 8
-        contentView.layer.shadowOffset = CGSize(width: 0, height: 6)
-
-        posterView.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(posterView)
-        NSLayoutConstraint.activate([
-            posterView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            posterView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            posterView.widthAnchor.constraint(equalToConstant: Self.posterWidth),
-            posterView.heightAnchor.constraint(equalToConstant: Self.posterHeight),
-        ])
-    }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError() }
-
-    func configure(item: MediaItem) {
-        imageToken &+= 1
-        let token = imageToken
-        posterView.image = nil
-        if let url = item.artwork.poster ?? item.artwork.thumbnail {
-            Task { [weak self] in
-                let image = await ImageCacheManager.shared.image(for: url)
-                await MainActor.run {
-                    guard let self, self.imageToken == token else { return }
-                    self.posterView.image = image
-                }
-            }
-        }
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        contentView.layer.shadowPath = UIBezierPath(
-            roundedRect: posterView.frame, cornerRadius: cornerRadius).cgPath
-    }
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        imageToken &+= 1
-        posterView.image = nil
-    }
-}
-
 // MARK: - Section header
 
 final class BelowFoldSectionHeader: UICollectionReusableView {
@@ -368,7 +301,7 @@ final class BelowFoldSectionHeader: UICollectionReusableView {
 /// Slim, non-focusable boundary marker between seasons in the flat episode
 /// rail: a broken vertical hairline through the thumb band with a compact
 /// season chip ("S3" / "SP") in the gap. Structure only — the season's full
-/// identity lives in the info strip and the pills. The focus engine skips it
+/// identity lives in the pills. The focus engine skips it
 /// (canBecomeFocused false + the collection's canFocusItemAt exclusion), so
 /// the rail's focus order is unchanged.
 final class SeasonDividerCell: UICollectionViewCell {

@@ -145,21 +145,20 @@ struct GuideLayoutView: View {
     @State private var miniSession: LiveTVSessionHandoff?
     @AppStorage("liveTVKeepPlayingInGuide") private var keepPlayingInGuide = true
 
-    // Backdrop transition state. The wash crossfades to the new programme's
-    // image while the crisp artwork fades in over it.
+    // Backdrop transition state. Each image is one layer (wash plus crisp
+    // artwork), and the incoming layer fades in over the outgoing one.
     @State private var outgoingBackdropImage: UIImage?
     @State private var incomingBackdropImage: UIImage?
     @State private var backdropProgress: Double = 1
-    @State private var displayedArtworkImage: UIImage?
-    @State private var artworkOpacity: Double = 0
-    /// Unlabelled programme art measured as landscape, keyed to the programme it
-    /// was measured for so a late result never paints behind another programme.
-    @State private var resolvedLandscape: (programID: String, url: URL)?
+    /// The measured backdrop for unlabelled programme art: its URL when it is
+    /// landscape, nil when not. Keyed to the programme it was measured for so a
+    /// late result never paints behind another programme.
+    @State private var resolvedLandscape: (programID: String, url: URL?)?
 
     /// How long focus has to rest on a programme before its backdrop loads.
     /// Holding a direction to cross the guide should not fire an image load or
     /// a transition per channel.
-    private let backdropSettleDelay = Duration.milliseconds(180)
+    private let backdropSettleDelay = Duration.milliseconds(300)
     private let backdropFadeDuration = 0.35
 
     private let tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -190,16 +189,6 @@ struct GuideLayoutView: View {
                         .padding(.top, EPGTheme.pageMargin)
                         .frame(maxWidth: .infinity, alignment: .top)
                         .allowsHitTesting(false)
-                }
-
-                if let miniSession {
-                    LiveMiniPlayerRepresentable(session: miniSession)
-                        .frame(width: EPGTheme.miniPlayerSize.width, height: EPGTheme.miniPlayerSize.height)
-                        .padding(.top, EPGTheme.pageMargin)
-                        .padding(.trailing, EPGTheme.pageMargin)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                        .allowsHitTesting(false)
-                        .zIndex(20)
                 }
             }
         }
@@ -233,6 +222,14 @@ struct GuideLayoutView: View {
 
     private var guideContent: some View {
         ZStack(alignment: .topLeading) {
+            // Under the grid's container, which draws nothing in this band
+            // except the corner player: above it, the bar would make that
+            // player unfocusable.
+            GuideInfoBar(channel: focusedChannel, program: focusedProgram)
+                .frame(height: EPGTheme.infoBarHeight)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .allowsHitTesting(false)
+
             EPGGuide(
                 channels: channels,
                 programsByChannel: programsByChannel,
@@ -264,30 +261,50 @@ struct GuideLayoutView: View {
                 },
                 recordingProgramIds: dataStore.recordingProgramIds(in: dataStore.epg),
                 categoryActionTitle: dataStore.hasRecordingSources ? "Recordings" : nil,
-                onCategoryAction: { presentRecordings() }
+                onCategoryAction: { presentRecordings() },
+                miniSession: miniSession,
+                onMiniPlayerSelect: { miniSession.map { selectChannel($0.channel) } }
             )
-
-            GuideInfoBar(channel: focusedChannel, program: focusedProgram)
-                .frame(height: EPGTheme.infoBarHeight)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .allowsHitTesting(false)
         }
     }
 
-    /// The focused programme's image, strong at the top and dimming to a faint
-    /// ambiance over the grid.
-    /// The guide backdrop: the programme's declared 16:9 image, else its
-    /// unlabelled art once measured as landscape. Anything else leaves the
-    /// backdrop empty and the stock settings background shows instead.
-    private var guideBackdropURL: URL? {
-        guard let prog = focusedProgram else { return nil }
-        if let landscape = prog.landscapeURL { return landscape }
-        if let candidate = prog.iconURL ?? prog.posterURL,
-           EPGImageClassifier.shared.isLandscape(candidate) {
-            return candidate
+    /// What the backdrop should show for the focused programme: its declared
+    /// 16:9 image, else its unlabelled art once measured as landscape, else
+    /// nothing (the stock settings background). `settled` means the settle
+    /// delay already passed while the art was measured.
+    enum BackdropTarget: Equatable {
+        /// Unlabelled art still being measured. The current backdrop stays;
+        /// treating this as "no art" faded to the bare background and back.
+        case pending
+        case image(URL?, settled: Bool)
+    }
+
+    private var backdropTarget: BackdropTarget {
+        let candidate = focusedProgram.flatMap { $0.iconURL ?? $0.posterURL }
+        return Self.backdropTarget(for: focusedProgram, resolved: resolvedLandscape,
+                                   kind: EPGImageClassifier.shared.kind(for: candidate))
+    }
+
+    /// `kind` is the classifier's cached verdict on the programme's icon or
+    /// poster, nil when it has not been measured.
+    static func backdropTarget(for program: UnifiedProgram?, resolved: (programID: String, url: URL?)?,
+                               kind: EPGImageKind?) -> BackdropTarget {
+        guard let program else { return .image(nil, settled: false) }
+        if let landscape = program.landscapeURL { return .image(landscape, settled: false) }
+        guard let candidate = program.iconURL ?? program.posterURL else { return .image(nil, settled: false) }
+        if let resolved, resolved.programID == program.id { return .image(resolved.url, settled: true) }
+        switch kind {
+        case .landscape?: return .image(candidate, settled: false)
+        case .portrait?: return .image(nil, settled: false)
+        case nil: return .pending
         }
-        guard let resolved = resolvedLandscape, resolved.programID == prog.id else { return nil }
-        return resolved.url
+    }
+
+    /// The outgoing layer stays opaque under an incoming image, so the page
+    /// behind never shows through mid-fade (two layers at 50% each cover only
+    /// 75%, which read as a dip to black). With no incoming image it fades out.
+    static func outgoingBackdropOpacity(progress: Double, hasIncoming: Bool) -> Double {
+        hasIncoming ? 1 : 1 - progress
     }
 
     /// Measures unlabelled programme art after the same settle delay as the
@@ -304,8 +321,9 @@ struct GuideLayoutView: View {
         let kind = await EPGImageClassifier.shared.classify(candidate) {
             await ImageCacheManager.shared.image(for: candidate)?.size
         }
-        guard !Task.isCancelled, kind == .landscape else { return }
-        resolvedLandscape = (program.id, candidate)
+        guard !Task.isCancelled else { return }
+        // Recorded either way: a non-landscape verdict must end `.pending` too.
+        resolvedLandscape = (program.id, kind == .landscape ? candidate : nil)
     }
 
     /// A constant full-screen layer. The backdrop image is drawn INSIDE it as an
@@ -317,25 +335,31 @@ struct GuideLayoutView: View {
         GeometryReader { geo in
             ZStack(alignment: .topTrailing) {
                 if let outgoingBackdropImage {
-                    blurredBackdrop(outgoingBackdropImage, size: geo.size)
-                        .opacity(1 - backdropProgress)
+                    backdropLayer(outgoingBackdropImage, size: geo.size)
+                        .opacity(Self.outgoingBackdropOpacity(progress: backdropProgress,
+                                                              hasIncoming: incomingBackdropImage != nil))
                 }
 
                 if let incomingBackdropImage {
-                    blurredBackdrop(incomingBackdropImage, size: geo.size)
+                    backdropLayer(incomingBackdropImage, size: geo.size)
                         .opacity(backdropProgress)
-                }
-
-                if let displayedArtworkImage {
-                    crispArtwork(displayedArtworkImage, size: geo.size)
-                        .opacity(artworkOpacity)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topTrailing)
         }
         .ignoresSafeArea()
-        .task(id: guideBackdropURL) {
-            await transitionBackdrop(to: guideBackdropURL)
+        .task(id: backdropTarget) {
+            guard case .image(let url, let settled) = backdropTarget else { return }
+            await transitionBackdrop(to: url, settle: !settled)
+        }
+    }
+
+    /// The wash with the crisp artwork over it, crossfaded as one layer so the
+    /// artwork never blinks out ahead of the wash.
+    private func backdropLayer(_ image: UIImage, size: CGSize) -> some View {
+        ZStack(alignment: .topTrailing) {
+            blurredBackdrop(image, size: size)
+            crispArtwork(image, size: size)
         }
     }
 
@@ -376,41 +400,41 @@ struct GuideLayoutView: View {
             )
     }
 
-    private func transitionBackdrop(to newURL: URL?) async {
+    private func transitionBackdrop(to newURL: URL?, settle: Bool) async {
         // Settle first, and mutate nothing before it. `.task(id:)` cancels this
         // on every focus change, so anything written ahead of the first suspend
-        // survives a cancel while the rest of the transition never runs —
-        // browsing the guide would leave the artwork faded out indefinitely.
+        // survives a cancel while the rest of the transition never runs.
         // Returning here instead leaves the current backdrop exactly as it is.
-        do {
-            try await Task.sleep(for: backdropSettleDelay)
-        } catch {
-            return
+        if settle {
+            do {
+                try await Task.sleep(for: backdropSettleDelay)
+            } catch {
+                return
+            }
         }
 
         let newImage = await loadBackdrop(newURL)
         guard !Task.isCancelled else { return }
 
-        // Seed the crossfade without animating: the outgoing wash at full
+        // Same image (a programme change on one channel can reuse its art):
+        // nothing to fade.
+        guard newImage !== incomingBackdropImage else { return }
+
+        // Seed the crossfade without animating: the outgoing layer at full
         // opacity, the incoming at zero. A plain assignment here can be
-        // coalesced into the animation below and jump straight to the new blur.
+        // coalesced into the animation below and jump straight to the new image.
         var seed = Transaction()
         seed.disablesAnimations = true
         withTransaction(seed) {
-            // Continue from the most recently shown wash, rather than briefly
-            // restoring an older programme's image.
+            // Continue from the most recently shown image, rather than briefly
+            // restoring an older programme's.
             outgoingBackdropImage = incomingBackdropImage ?? outgoingBackdropImage
             incomingBackdropImage = newImage
-            displayedArtworkImage = newImage
             backdropProgress = 0
-            artworkOpacity = 0
         }
 
-        // Wash and artwork move together. Staging them sequentially reads as a
-        // slow reveal and holds two full-screen blurs on screen for longer.
         withAnimation(.easeInOut(duration: backdropFadeDuration)) {
             backdropProgress = 1
-            artworkOpacity = newImage == nil ? 0 : 1
         }
 
         do {
@@ -420,7 +444,7 @@ struct GuideLayoutView: View {
         }
         guard !Task.isCancelled else { return }
 
-        // Drop the outgoing wash so only one blurred layer stays composited.
+        // Drop the outgoing layer so only one blurred layer stays composited.
         outgoingBackdropImage = nil
     }
 
@@ -456,12 +480,21 @@ struct GuideLayoutView: View {
             }
         }
 
-        let vc = LiveTVAetherPlayerViewController(channel: channel, adopting: adopting)
+        presentPlayer(LiveTVAetherPlayerViewController(channel: channel, adopting: adopting), from: top)
+    }
+
+    /// The same player and multiview What's On opens, wired the same way.
+    /// `animated: false` when multiview has just grown a tile full screen.
+    private func presentPlayer(_ vc: LiveTVAetherPlayerViewController, from top: UIViewController,
+                               animated: Bool = true) {
         vc.modalPresentationStyle = .fullScreen
         if keepPlayingInGuide {
             vc.onMinimize = { session in
                 miniSession = session
             }
+        }
+        vc.onOpenMultiview = { session in
+            presentMultiview(adopting: session, adding: nil, fromPlayer: true)
         }
         vc.onDismiss = { lastChannel in
             // The viewer may have changed channels in the player; land on the
@@ -471,16 +504,50 @@ struct GuideLayoutView: View {
             }
             gridFocusRequest = EPGFocusRequest(channelId: lastChannel.id, token: UUID())
         }
-        top.present(vc, animated: true)
+        top.present(vc, animated: animated)
+    }
+
+    /// Multiview with `session` (the player's channel, or the corner one) and
+    /// `channel`. A tile taken full screen comes back in the player.
+    /// `fromPlayer`: the full-screen player just closed without animation, and
+    /// multiview takes over its picture (see `entersFromFullScreen`).
+    private func presentMultiview(adopting session: LiveTVSessionHandoff?, adding channel: UnifiedChannel?,
+                                  fromPlayer: Bool = false) {
+        guard let top = LiveProgramMenu.topViewController() else {
+            session?.stop()
+            return
+        }
+        let multiview = LiveMultiviewViewController(adopting: session, adding: channel,
+                                                    sourceIdFilter: sourceIdFilter)
+        multiview.entersFromFullScreen = fromPlayer
+        multiview.onWatchFullScreen = { session in
+            guard let top = LiveProgramMenu.topViewController() else {
+                session.stop()
+                return
+            }
+            presentPlayer(LiveTVAetherPlayerViewController(channel: session.channel, adopting: session),
+                          from: top, animated: false)
+        }
+        top.present(multiview, animated: !fromPlayer)
     }
 
     // MARK: - Programme menu and recordings
 
     private func presentProgramMenu(channel: UnifiedChannel, program: UnifiedProgram?, frame: CGRect?) {
         guard let top = LiveProgramMenu.topViewController() else { return }
-        LiveProgramMenu.present(program: program, channel: channel, from: top, sourceFrame: frame) { channel in
-            selectChannel(channel)
-        }
+        LiveProgramMenu.present(
+            program: program,
+            channel: channel,
+            from: top,
+            sourceFrame: frame,
+            onWatch: { channel in selectChannel(channel) },
+            onMultiview: { channel in
+                // The corner channel joins as the first tile, as on What's On.
+                let corner = miniSession
+                miniSession = nil
+                presentMultiview(adopting: corner, adding: channel)
+            }
+        )
     }
 
     private func presentRecordings() {
@@ -556,26 +623,5 @@ private struct EPGIssueBanner: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(.white.opacity(0.08), lineWidth: 1)
         )
-    }
-}
-
-// MARK: - Corner player
-
-/// Hosts the UIKit corner player that keeps a channel going after Back.
-private struct LiveMiniPlayerRepresentable: UIViewRepresentable {
-    let session: LiveTVSessionHandoff
-
-    func makeUIView(context: Context) -> LiveMiniPlayerView {
-        let view = LiveMiniPlayerView()
-        view.show(session)
-        return view
-    }
-
-    func updateUIView(_ uiView: LiveMiniPlayerView, context: Context) {
-        uiView.show(session)
-    }
-
-    static func dismantleUIView(_ uiView: LiveMiniPlayerView, coordinator: ()) {
-        uiView.release()
     }
 }

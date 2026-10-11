@@ -149,6 +149,25 @@ struct WhatsNewView: View {
     // MARK: - Changelog Data
 
     static let changelogs: [(version: String, features: [String])] = [
+        ("1.0.6 (92)", [
+            "Painstakingly recreated Apple's player chrome.",
+            "Added multi-file support for Plex.",
+            "Added long press Go to Show option.",
+            "Added ability to mark a show as watched/unwatched.",
+            "Live TV program art shows more often (vs the channel logo).",
+            "Updated AetherEngine to 7.25.3.",
+            "Bug fixes.",
+        ]),
+        ("1.0.6 (91)", [
+            "Initial support for Jellyfin. WIP. Please report bugs and issues on GitHub.",
+            "Scrubbing shows previews even with thumbnail generation off.",
+            "Removing a title from CW keeps it removed.",
+            "Live TV multiview available from Guide.",
+            "Improved Guide design, performance, and layout.",
+            "Added Plex collection support. Each library has a Collections row. Long press for Pin options.",
+            "Better support for ASS/SSA subtitles.",
+            "Fix: a crash when long-pressing a Home tile.",
+        ]),
         ("1.0.6 (90)", [
             "Favorite any Live TV channel: hold Select on it in What's On or the guide",
             "Favorites from every source share one list, in the order you choose",

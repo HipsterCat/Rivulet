@@ -83,6 +83,9 @@ struct SettingsRowItem {
     /// mode). Called with `up` to move it one slot and persist the new order.
     var onReorder: ((_ up: Bool) -> Void)?
     var isReorderable: Bool { onReorder != nil }
+    /// Reorder only slides between rows of the same group (Plex vs Jellyfin
+    /// libraries, each ordered within its own server). nil == nil as before.
+    var reorderGroup: String? = nil
     /// A row whose meaning depends on another row's state renders dimmed and
     /// unfocusable while that state is off. Evaluated live (not cached at build
     /// time) so flipping the row it depends on takes effect without a rebuild.
@@ -150,6 +153,20 @@ struct SettingsRowItem {
 @MainActor
 enum SettingsContent {
 
+    /// The run headers when both servers are listed (Home Rows, Sidebar
+    /// Libraries). Two servers with one name would read as the same server
+    /// twice, so then each also names its server type.
+    static func serverRunHeaders(plex: String, jellyfin: String) -> (plex: String, jellyfin: String) {
+        guard plex == jellyfin else { return (plex, jellyfin) }
+        return ("\(plex) (\(MediaProviderKind.plex.displayName))",
+                "\(jellyfin) (\(MediaProviderKind.jellyfin.displayName))")
+    }
+
+    private static var currentServerRunHeaders: (plex: String, jellyfin: String) {
+        serverRunHeaders(plex: PlexAuthManager.shared.savedServerName ?? "Plex",
+                         jellyfin: JellyfinDataStore.shared.account?.serverName ?? "Jellyfin")
+    }
+
     static func rows(for page: SettingsPage) -> [SettingsRowItem] {
         switch page {
         case .root:        return root
@@ -159,6 +176,7 @@ enum SettingsContent {
         case .music:       return music
         case .servers:     return servers
         case .plex:        return plex
+        case .jellyfin:    return jellyfin
         case .libraries:   return libraries
         case .homeRows:    return homeRows
         case .cache:       return cache
@@ -404,8 +422,9 @@ enum SettingsContent {
     }
 
     /// Rivulet's favourite channels in order: hold Select to move one, Select
-    /// to remove it. The row goes at once, so a move never passes a channel
-    /// that is no longer a favourite.
+    /// asks before removing it (the Pinned Collections pattern). A removed row
+    /// goes at once, so a move never passes a channel that is no longer a
+    /// favourite.
     private static var liveTVFavorites: [SettingsRowItem] {
         let store = LiveTVDataStore.shared
         let byId = Dictionary(store.channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -422,11 +441,15 @@ enum SettingsContent {
             let title = [channel.channelNumber.map(String.init), channel.name, sourceNames[channel.sourceId].map { "· \($0)" }]
                 .compactMap { $0 }
                 .joined(separator: " ")
-            return SettingsRowItem(id: "fav_\(channel.id)", title: title, kind: .toggle(
-                get: { store.isFavorite(channel) },
-                set: { _ in store.toggleFavorite(channel) },
-                didChange: { _, vc in (vc as? SettingsPageViewController)?.reloadRows() }),
-                onReorder: { up in store.moveFavorite(channel.id, up: up) })
+            return SettingsRowItem(id: "fav_\(channel.id)", title: title,
+                                   kind: .action(destructive: false, handler: { vc in
+                presentConfirm(on: vc, title: "Remove \"\(channel.name)\"?",
+                               message: "This removes the channel from your favorites. You can add it again by holding Select on it in What's On or the guide.",
+                               confirmTitle: "Remove", destructive: true) {
+                    if store.isFavorite(channel) { store.toggleFavorite(channel) }
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }), onReorder: { up in store.moveFavorite(channel.id, up: up) })
         }
     }
 
@@ -473,7 +496,12 @@ enum SettingsContent {
 
     private static var servers: [SettingsRowItem] {
         [
-            SettingsRowItem(id: "plexServer", title: "Plex Server", kind: .navigation(.plex))
+            SettingsRowItem(id: "plexServer", title: "Plex Server", kind: .navigation(.plex)),
+            SettingsRowItem(
+                id: "jellyfinServer", title: "Jellyfin Server",
+                kind: .navigationAction(.jellyfin,
+                                        value: { JellyfinSession.account?.serverName ?? "" },
+                                        prepare: { addSourceDraft = AddSourceDraft() }))
         ]
     }
 
@@ -510,6 +538,17 @@ enum SettingsContent {
 
     // MARK: Home Rows (local subtractive filter over the server's row set)
 
+    /// Jellyfin's Home rows for the Home Rows page, titled the way Home titles
+    /// them: Continue Watching, then each sidebar-visible library's row in
+    /// sidebar order. Rows hidden here stay listed so they can be switched
+    /// back on; rows of libraries hidden from the sidebar never draw on Home,
+    /// so they are not offered.
+    static func jellyfinHomeRowEntries() -> [(id: String, title: String)] {
+        JellyfinDataStore.shared.homeRowsInSidebarOrder.compactMap { row in
+            row.hubIdentifier.map { ($0, row.title) }
+        }
+    }
+
     /// One toggle per row Plex currently offers Home, in the order Home draws
     /// them.
     ///
@@ -540,17 +579,24 @@ enum SettingsContent {
             return [(id, cw.title ?? id)]
         }()
 
-        let entries: [(id: String, title: String)] =
+        let plexEntries: [(id: String, title: String)] =
             continueWatching
             + visible.compactMap { row in
-                guard let id = row.hubIdentifier else { return nil }
+                // Pinned collections are listed below with an Unpin action,
+                // never as a hide toggle.
+                guard let id = row.hubIdentifier, !id.hasPrefix("rivulet.pin.") else { return nil }
                 return (id, row.title)
             }
             + hiddenRows
+        let jellyfinEntries = jellyfinHomeRowEntries()
 
-        guard !entries.isEmpty else {
+        let pinRows = pinnedCollectionRows(store: store)
+        guard !plexEntries.isEmpty || !jellyfinEntries.isEmpty else {
+            // A pin can outlive every Plex row (its library taken off Home),
+            // and this page is the only place left to unpin it.
+            guard pinRows.isEmpty else { return pinRows }
             return [SettingsRowItem(id: "noHomeRows",
-                                    title: "Connect to a Plex server to manage Home rows",
+                                    title: "Connect a server to manage Home rows",
                                     kind: .info(value: { "" }))]
         }
 
@@ -561,13 +607,47 @@ enum SettingsContent {
                 (vc as? SettingsPageViewController)?.reloadRows()
             }))
         ]
+        // Both servers listed: each run under its server's name, as Sidebar
+        // Libraries does.
+        let labelsRuns = !plexEntries.isEmpty && !jellyfinEntries.isEmpty
         // De-dupe defensively: Continue Watching can be reported by both the
         // dedicated hub and the projection.
         var seen = Set<String>()
-        for entry in entries where seen.insert(entry.id).inserted {
-            rows.append(SettingsRowItem(id: "homeRow_\(entry.id)", title: entry.title, kind: .toggle(
-                get: { !HomeRowSettings.isHidden(entry.id) },
-                set: { shown in HomeRowSettings.setHidden(!shown, for: entry.id) })))
+        let headers = currentServerRunHeaders
+        for (header, entries) in [(headers.plex, plexEntries), (headers.jellyfin, jellyfinEntries)] {
+            if labelsRuns { rows.append(.header(header)) }
+            for entry in entries where seen.insert(entry.id).inserted {
+                rows.append(SettingsRowItem(id: "homeRow_\(entry.id)", title: entry.title, kind: .toggle(
+                    get: { !HomeRowSettings.isHidden(entry.id) },
+                    set: { shown in HomeRowSettings.setHidden(!shown, for: entry.id) })))
+            }
+        }
+        return rows + pinRows
+    }
+
+    /// The Pinned Collections group: every pin on the current server, not only
+    /// the rows Home or a library page draws, so an emptied pin, or one whose
+    /// library was taken off Home, can still be unpinned. Omitted when there
+    /// are none. Show All never touches pins. Home Rows lists the Home pins,
+    /// Libraries the library-page pins.
+    private static func pinnedCollectionRows(store: PlexDataStore,
+                                             in destination: HomeCollectionPins.Destination = .home) -> [SettingsRowItem] {
+        let serverLibraries = Set(store.libraries.map(\.uuid))
+        let pins = HomeCollectionPins.pins(in: destination).filter { serverLibraries.contains($0.libraryUUID) }
+        guard !pins.isEmpty else { return [] }
+        var rows: [SettingsRowItem] = [.header("Pinned Collections")]
+        for pin in pins {
+            // Same as the sidebar libraries: hold Select to reorder, Select
+            // asks before unpinning.
+            rows.append(SettingsRowItem(id: "pinnedCollection_\(destination)_\(pin.id)", title: pin.title,
+                                        kind: .action(destructive: false, handler: { vc in
+                presentConfirm(on: vc, title: "Unpin \"\(pin.title)\"?",
+                               message: "This removes the row from \(destination == .home ? "Home" : "its library"). You can pin it again from the collection in its library.",
+                               confirmTitle: "Unpin", destructive: true) {
+                    HomeCollectionPins.unpin(ratingKey: pin.ratingKey, libraryUUID: pin.libraryUUID, in: destination)
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }), onReorder: { up in HomeCollectionPins.move(pin, up: up, in: destination) }))
         }
         return rows
     }
@@ -577,12 +657,16 @@ enum SettingsContent {
     private static var libraries: [SettingsRowItem] {
         let mgr = LibrarySettingsManager.shared
         let libs = mgr.sortLibraries(PlexDataStore.shared.libraries.filter { $0.isVideoLibrary || $0.isMusicLibrary })
-        guard !libs.isEmpty else {
+        // Jellyfin's in the user's order, hidden ones included so they can
+        // come back; each server reorders within its own run.
+        let jellyfinStore = JellyfinDataStore.shared
+        let jellyfinLibs = mgr.sort(jellyfinStore.libraries)
+        guard !libs.isEmpty || !jellyfinLibs.isEmpty else {
             return [SettingsRowItem(id: "noLibraries",
-                                    title: "Connect to a Plex server to manage libraries",
+                                    title: "Connect a server to manage libraries",
                                     kind: .info(value: { "" }))]
         }
-        let keys = libs.map { $0.key }
+        let keys = libs.map { $0.key } + jellyfinLibs.map(\.settingsKey)
         // Add All / Remove All live at the TOP of the list, above the per-library
         // toggles, so the bulk actions are the first thing the user lands on.
         var rows: [SettingsRowItem] = [
@@ -597,15 +681,33 @@ enum SettingsContent {
                 (vc as? SettingsPageViewController)?.reloadRows()
             }))
         ]
+        // Both servers listed: each run under its server's name. A header is
+        // not reorderable, so a move stops at it.
+        let labelsRuns = !libs.isEmpty && !jellyfinLibs.isEmpty
+        let headers = currentServerRunHeaders
+        if labelsRuns { rows.append(.header(headers.plex)) }
         rows += libs.map { lib in
             // Hold Select to grab + reorder (Apple-Home style). The page VC
             // animates the slot change; this just persists the new order.
             SettingsRowItem(id: "lib_\(lib.key)", title: lib.title, kind: .toggle(
                 get: { LibrarySettingsManager.shared.isLibraryVisible(lib.key) },
                 set: { _ in LibrarySettingsManager.shared.toggleVisibility(for: lib.key) }),
-                onReorder: { up in moveMediaLibrary(key: lib.key, up: up) })
+                onReorder: { up in moveMediaLibrary(key: lib.key, up: up) }, reorderGroup: "plex")
         }
-        return rows
+        if labelsRuns { rows.append(.header(headers.jellyfin)) }
+        rows += jellyfinLibs.map { lib in
+            SettingsRowItem(id: "lib_\(lib.settingsKey)", title: lib.title, kind: .toggle(
+                get: { LibrarySettingsManager.shared.isLibraryVisible(lib.settingsKey) },
+                set: { _ in LibrarySettingsManager.shared.toggleVisibility(for: lib.settingsKey) }),
+                // Order re-read per move: the page is not rebuilt between moves.
+                onReorder: { up in
+                    let mgr = LibrarySettingsManager.shared
+                    mgr.moveLibrary(key: lib.settingsKey, up: up,
+                                    among: mgr.sort(JellyfinDataStore.shared.libraries).map(\.settingsKey))
+                },
+                reorderGroup: "jellyfin")
+        }
+        return rows + pinnedCollectionRows(store: PlexDataStore.shared, in: .library)
     }
 
     /// Move a media library one slot up/down in the sidebar order. Reorders by
@@ -617,13 +719,7 @@ enum SettingsContent {
         let mgr = LibrarySettingsManager.shared
         let mediaLibs = mgr.sortLibraries(
             PlexDataStore.shared.libraries.filter { $0.isVideoLibrary || $0.isMusicLibrary })
-        var mediaKeys = mediaLibs.map { $0.key }
-        guard let i = mediaKeys.firstIndex(of: key) else { return }
-        let j = up ? i - 1 : i + 1
-        guard j >= 0, j < mediaKeys.count else { return }
-        mediaKeys.swapAt(i, j)
-        let nonMedia = mgr.libraryOrder.filter { !mediaKeys.contains($0) }
-        mgr.libraryOrder = mediaKeys + nonMedia
+        mgr.moveLibrary(key: key, up: up, among: mediaLibs.map { $0.key })
     }
 
     // MARK: Cache & Storage
@@ -752,14 +848,7 @@ enum SettingsContent {
         let build = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "1"
         let version = "\(short) (\(build))"
         return [
-            SettingsRowItem(id: "about_app", title: "App", kind: .info(value: { "Rivulet" })),
             SettingsRowItem(id: "about_version", title: "Version", kind: .info(value: { version })),
-            // The engine states its own version. SPM pins a revision, not a
-            // tag, so this is the only runtime-readable name for the release
-            // actually linked, and a handed-over diagnostic that quotes it
-            // cannot be guessed at from an older thread.
-            SettingsRowItem(id: "about_engine", title: "Playback Engine",
-                            kind: .info(value: { "AetherEngine \(AetherPlayer.engineVersion)" })),
             SettingsRowItem(id: "changelog", title: "Changelog", kind: .action(destructive: false, handler: { vc in
                 presentChangelog(on: vc)
             })),

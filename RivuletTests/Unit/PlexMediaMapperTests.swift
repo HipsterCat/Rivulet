@@ -13,6 +13,20 @@ final class PlexMediaMapperTests: XCTestCase {
 
     // MARK: - Library
 
+    func test_item_countsDistinctVersions() throws {
+        let json = #"{"ratingKey":"7","type":"movie","title":"Heat","Media":[{"id":1},{"id":2}]}"#
+        let meta = try JSONDecoder().decode(PlexMetadata.self, from: Data(json.utf8))
+        let item = PlexMediaMapper.item(meta, providerID: "plex:abc", serverURL: "http://s", authToken: "t")
+        XCTAssertEqual(item.versionCount, 2)
+    }
+
+    func test_item_mapsEditionTitle() throws {
+        let json = #"{"ratingKey":"7","type":"movie","title":"Blade Runner","editionTitle":"Final Cut"}"#
+        let meta = try JSONDecoder().decode(PlexMetadata.self, from: Data(json.utf8))
+        let item = PlexMediaMapper.item(meta, providerID: "plex:abc", serverURL: "http://s", authToken: "t")
+        XCTAssertEqual(item.editionTitle, "Final Cut")
+    }
+
     func test_library_maps_movies() {
         let plex = PlexLibrary(
             key: "1", type: "movie", title: "Movies", agent: "x",
@@ -134,6 +148,38 @@ final class PlexMediaMapperTests: XCTestCase {
         XCTAssertEqual(item.seasonNumber, 1)
     }
 
+    func test_item_seriesTitle_episodeFromGrandparent_seasonFromParent() {
+        var ep = PlexMetadata()
+        ep.ratingKey = "9001"
+        ep.type = "episode"
+        ep.grandparentTitle = "Abbott Elementary"
+        ep.parentTitle = "Season 1"
+        var season = PlexMetadata()
+        season.ratingKey = "500"
+        season.type = "season"
+        season.parentTitle = "Abbott Elementary"
+        var movie = PlexMetadata()
+        movie.ratingKey = "1"
+        movie.type = "movie"
+        movie.parentTitle = "ignored"
+        func map(_ m: PlexMetadata) -> MediaItem {
+            PlexMediaMapper.item(m, providerID: "plex:abc", serverURL: "https://x", authToken: "T")
+        }
+        XCTAssertEqual(map(ep).seriesTitle, "Abbott Elementary")
+        XCTAssertEqual(map(season).seriesTitle, "Abbott Elementary")
+        XCTAssertNil(map(movie).seriesTitle)
+    }
+
+    func test_detail_guids_becomeExternalIDs() {
+        var meta = PlexMetadata()
+        meta.ratingKey = "1"
+        meta.type = "movie"
+        meta.Guid = [PlexGuid(id: "tmdb://603"), PlexGuid(id: "imdb://tt0133093"),
+                     PlexGuid(id: "tvdb://169"), PlexGuid(id: "plex://movie/abc")]
+        let detail = PlexMediaMapper.detail(meta, providerID: "plex:abc", serverURL: "https://x", authToken: "T")
+        XCTAssertEqual(detail.externalIDs, ["tmdb": "603", "imdb": "tt0133093", "tvdb": "169"])
+    }
+
     func test_item_season_pullsSeasonNumberFromIndex() {
         // Regression: seasonNumber was read from parentIndex for every kind,
         // which made every season pill render "Season 1" because Plex stores
@@ -217,5 +263,35 @@ final class PlexMediaMapperTests: XCTestCase {
         meta.type = "episode"
         meta.viewCount = 1
         XCTAssertTrue(PlexMediaMapper.userState(meta).isPlayed)
+    }
+
+    // MARK: - Artwork
+
+    /// A collection with no custom poster carries a composite thumb with its
+    /// own query. Measured on PMS 1.43.4: with a second '?' the token lands
+    /// inside `height` and the server answers 401; with '&' it answers 200.
+    func test_artworkURL_pathWithQuery_appendsTokenWithAmpersand() {
+        let url = PlexMediaMapper.artworkURL(
+            "/library/collections/63794/composite/1581446773?width=400&height=600",
+            serverURL: "https://example.plex.direct:32400",
+            authToken: "TOK"
+        )
+        XCTAssertEqual(
+            url?.absoluteString,
+            "https://example.plex.direct:32400/library/collections/63794/composite/1581446773?width=400&height=600&X-Plex-Token=TOK"
+        )
+        XCTAssertEqual(url?.absoluteString.filter { $0 == "?" }.count, 1)
+    }
+
+    func test_artworkURL_pathWithoutQuery_isUnchanged() {
+        let url = PlexMediaMapper.artworkURL(
+            "/library/metadata/9144/thumb/1790714299",
+            serverURL: "https://example.plex.direct:32400",
+            authToken: "TOK"
+        )
+        XCTAssertEqual(
+            url?.absoluteString,
+            "https://example.plex.direct:32400/library/metadata/9144/thumb/1790714299?X-Plex-Token=TOK"
+        )
     }
 }

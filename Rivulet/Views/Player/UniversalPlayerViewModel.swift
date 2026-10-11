@@ -104,10 +104,12 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// content layer is not focusable, directional input is left to the
     /// focus engine, and controls do not auto-hide.
     @Published var controlsFocusActive = false
+    /// The scrub bar itself holds focus (a subset of `controlsFocusActive`).
+    var scrubberOwnsFocus = false
     @Published var isScrubbing = false
 
     /// True while iPod-style circular clickpad rotation is actively
-    /// driving the scrub (see `handleWheelRotation(_:)`). Distinct from
+    /// driving the scrub (see `handleWheelScrub(by:)`). Distinct from
     /// `isScrubbing`, which also covers swipe/click-step scrubbing — this
     /// flag is only for the wheel-specific ring indicator in
     /// `PlayerProgressBarView`. Cleared 0.8s after the last rotation tick,
@@ -134,12 +136,46 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// `PlexNetworkManager.buildThumbnailURL` applies (the TV renders it at
     /// native size, full-bleed).
     var ambientBackdropURL: URL? {
-        guard let art = metadata.art,
-              var components = URLComponents(string: "\(serverURL)\(art)") else { return nil }
-        components.queryItems = (components.queryItems ?? []) + [
-            URLQueryItem(name: "X-Plex-Token", value: authToken)
-        ]
-        return components.url
+        artworkURL(
+            plex: {
+                guard let art = metadata.art,
+                      var components = URLComponents(string: "\(serverURL)\(art)") else { return nil }
+                components.queryItems = (components.queryItems ?? []) + [
+                    URLQueryItem(name: "X-Plex-Token", value: authToken)
+                ]
+                return components.url
+            },
+            provider: { $0.item.artwork.backdrop ?? $0.item.grandparentArtwork?.backdrop }
+        )
+    }
+
+    /// Every image the player loads picks its URL here. A Plex path is
+    /// server-relative and needs the server and token; a provider's art is
+    /// already absolute and never gets a Plex token.
+    private func artworkURL(plex: () -> URL?, provider: (ProviderPlayback) -> URL?) -> URL? {
+        switch source {
+        case .plex: return plex()
+        case .provider(let playback): return provider(playback)
+        }
+    }
+
+    /// A Plex server-relative image path with the token.
+    private func plexImageURL(_ path: String?) -> URL? {
+        guard let path else { return nil }
+        return URL(string: "\(serverURL)\(path)?X-Plex-Token=\(authToken)")
+    }
+
+    /// Now Playing artwork: an episode shows its season or show poster.
+    var nowPlayingArtworkURL: URL? {
+        artworkURL(
+            plex: {
+                let path = metadata.type == "episode"
+                    ? metadata.parentThumb ?? metadata.grandparentThumb ?? metadata.thumb
+                    : metadata.thumb ?? metadata.art
+                return plexImageURL(path)
+            },
+            provider: { $0.item.grandparentArtwork?.poster ?? $0.item.artwork.poster ?? $0.item.artwork.thumbnail }
+        )
     }
 
     /// Title logo (clearArt) for the transport bar, resolved once per item:
@@ -163,7 +199,17 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// outgoing item's BIF can be released on teardown and across episode swaps —
     /// a BIF holds every trickplay frame of the item, so a binge would otherwise
     /// accumulate them for the process lifetime.
-    private var preloadedThumbnailPartId: Int?
+    private(set) var preloadedThumbnailPartId: Int?
+
+    /// Where scrub stills come from: the Plex server's BIF, or frames the
+    /// engine decodes from the playing file.
+    enum ScrubThumbnailSource { case server, engine }
+
+    /// The engine decode loop. One decode runs at a time (each one seeks the
+    /// file, a range request when it is remote); a scrub that moves meanwhile
+    /// parks its time in `pendingEngineThumbnailTime`, the next decode.
+    private var engineThumbnailTask: Task<Void, Never>?
+    private var pendingEngineThumbnailTime: TimeInterval?
 
     // MARK: - Skip Marker State
     @Published private(set) var activeMarker: PlexMarker?
@@ -217,6 +263,10 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// rule as `insightsCast`. Loaded in the same per-item flow as cast by
     /// `loadInsightsTrivia()`; reset on item swap.
     @Published private(set) var insightsTrivia: TitleTrivia?
+    #if DEBUG
+    /// Stands in for the Worker's trivia, which the simulator can't fetch.
+    func debugSetInsightsTrivia(_ trivia: TitleTrivia?) { insightsTrivia = trivia }
+    #endif
     /// Fact ids the Worker has auto-hidden after enough user reports.
     /// Fetched alongside trivia; empty on any failure (fail-open — showing
     /// a fact is acceptable, failing closed is not required for this list).
@@ -233,7 +283,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     @Published var isCountdownPaused: Bool = false
     private var countdownTimer: Timer?
     @Published var scrubThumbnail: UIImage?
-    @Published private(set) var scrubSpeed: Int = 0  // -3...3 shuttle level (0 = not shuttling); see ShuttleGrammar
+    @Published private(set) var scrubSpeed: Int = 0  // -8...8 shuttle level (0 = not shuttling); see ShuttleGrammar
     private var scrubStartTime: Date?  // When scrubbing started (for YouTube-style acceleration)
     @Published private(set) var audioTracks: [MediaTrack] = []
     @Published private(set) var subtitleTracks: [MediaTrack] = []
@@ -279,6 +329,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// publishers in bindAetherPublishers(); rendered by `CaptionOverlayView`,
     /// which PlayerContainerViewController mounts above the video surface.
     let aetherSubtitleModel = SubtitleModel()
+    /// The active ASS/SSA track's script, for the caption overlay's libass layer.
+    @Published private(set) var assTrack: ASSTrackSource?
 
     /// Local content filter (VidAngel/ClearPlay-style). Mutes language found in
     /// the title's subtitle file or on screen, and skips scenes from imported
@@ -331,6 +383,14 @@ final class UniversalPlayerViewModel: ObservableObject {
     // MARK: - Metadata
 
     private(set) var metadata: PlexMetadata
+    /// Plex `Media.id` of the version playing, kept so a metadata refresh keeps it.
+    private(set) var playingMediaID: String?
+    /// That version's position in server order; Plex's transcoder picks by `mediaIndex`.
+    private(set) var playingMediaServerIndex = 0
+    /// True when the user picked a version; only then does Up Next hold a tier.
+    private let pickedVersion: Bool
+    /// The picked file's tier, read once so Up Next can't step down episode by episode.
+    private var upNextTier: Int?
     /// Bumped whenever `metadata` is swapped to a different playable item
     /// on this same view-model instance (e.g. `playNextEpisode()`), as
     /// opposed to in-place field fills like `fetchFullMetadataIfNeeded()`
@@ -389,7 +449,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// depends on when the engine happens to publish that state.
     private var currentItemHasStarted = false
     private var controlsTimer: Timer?
-    private let controlsHideDelay: TimeInterval = 5
+    /// AVKit hides its controls 8s after the last press or focus move.
+    private let controlsHideDelay: TimeInterval = 8
     private var scrubTimer: Timer?
     /// Holds the rail at a seek's target until the picture lands there. Fed by
     /// Aether's `seekEvents`; inert on the hls route, whose AVPlayer seek
@@ -448,6 +509,21 @@ final class UniversalPlayerViewModel: ObservableObject {
     let serverURL: String
     let authToken: String
     private(set) var startOffset: TimeInterval?
+    /// Where the item comes from. `.plex` is the legacy path; every
+    /// `.provider` branch below returns before any Plex request is built.
+    private(set) var source: PlaybackSource = .plex
+
+    // MARK: - Progress Reporting
+
+    private let reportingInterval: TimeInterval = 10
+    private var lastReportedTime: TimeInterval = 0
+    /// `.provider` only: the play session's reporter. Recreated when the
+    /// stream (and with it the play session) changes; nil once stopped.
+    private var providerReporter: (any ProgressReporter)?
+    private var providerReporterStarted = false
+    /// Provider reports run in call order: a progress must never reach the
+    /// server ahead of the start it follows.
+    private var providerReportTail: Task<Void, Never>?
 
     // MARK: - Loading Screen Images (passed from detail view for instant display)
 
@@ -465,7 +541,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Plex transcode session ID, extracted from HLS stream URL for cleanup on stop
     private var plexSessionId: String?
     /// Playback startup/fallback plan for Rivulet direct-play-first policy.
-    private var playbackPlan: PlaybackPlan?
+    private(set) var playbackPlan: PlaybackPlan?
     /// The route actually serving playback right now.
     ///
     /// Starts as the plan's primary and flips in `attemptRivuletHLSFallback`
@@ -499,6 +575,21 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var preloadedNextStreamURL: URL?
     private var preloadedNextStreamHeaders: [String: String] = [:]
     private var preloadedNextMetadata: PlexMetadata?
+    /// `.provider` only: the item behind each Up Next shim, by its ratingKey,
+    /// so a chosen row plays its own `MediaItem`.
+    private var providerEpisodeItems: [String: MediaItem] = [:]
+    /// `.provider` only: this item's Up Next fetch, shared by every caller
+    /// for one `itemGeneration`. A fetch that found nothing is dropped so the
+    /// next caller asks again.
+    private var providerUpNextFetch: (generation: Int, task: Task<(season: [MediaItem], next: MediaItem?), Never>)?
+    /// `.provider` only: the next episode's prepare, keyed by its ratingKey,
+    /// shared by the countdown-start prepare and the swap.
+    private var nextProviderPrepare: (key: String, task: Task<ProviderPlayback?, Never>)?
+    /// Shown on the post-video page when the next episode can't be prepared.
+    @Published private(set) var nextEpisodeError: String?
+    /// Bumped by every `stopPlayback()`, so a swap that awaited its provider
+    /// can tell the player was torn down meanwhile.
+    private var stopCount = 0
 
     // MARK: - Initialization
 
@@ -520,8 +611,17 @@ final class UniversalPlayerViewModel: ObservableObject {
         loadingArtImage: UIImage? = nil,
         loadingThumbImage: UIImage? = nil,
         initialAudioTrackId: Int? = nil,
-        initialSubtitleSelection: InitialSubtitleSelection = .auto
+        initialSubtitleSelection: InitialSubtitleSelection = .auto,
+        preferredMediaID: String? = nil
     ) {
+        // The chosen version goes first, so every `Media.first` read plays it.
+        var metadata = metadata
+        let selection = VersionRanking.select(preferredMediaID.map(VersionChoice.source) ?? .best,
+                                              in: metadata.Media ?? [])
+        if !selection.media.isEmpty { metadata.Media = selection.media }
+        self.playingMediaID = selection.media.first.map { "\($0.id)" } ?? preferredMediaID
+        self.playingMediaServerIndex = selection.serverIndex
+        self.pickedVersion = preferredMediaID != nil
         self.metadata = metadata
         self.serverURL = serverURL
         self.authToken = authToken
@@ -531,6 +631,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         self.loadingThumbImage = loadingThumbImage
         self.initialAudioTrackId = initialAudioTrackId
         self.initialSubtitleSelection = initialSubtitleSelection
+        // The server's duration until the engine reports its own, so the bar's
+        // fill shows with the first times instead of a second after them.
+        self.duration = Self.metadataDuration(metadata)
 
         let isAirPlayRoute = Self.isAirPlayOutput()
         let hasDolbyVision = metadata.hasDolbyVision
@@ -548,6 +651,67 @@ final class UniversalPlayerViewModel: ObservableObject {
         setupPlayer()
 
         addPlaybackSelectionBreadcrumb(reason: "init")
+    }
+
+    /// Play any `MediaProvider` item. The chrome reads a display-only
+    /// `PlexMetadata` shim; stream, tracks and reporting come from the provider.
+    convenience init(
+        providerPlayback: ProviderPlayback,
+        startOffset: TimeInterval?,
+        loadingArtImage: UIImage? = nil,
+        loadingThumbImage: UIImage? = nil,
+        preferredMediaID: String? = nil
+    ) {
+        self.init(
+            metadata: ProviderPlaybackMetadata.make(
+                detail: providerPlayback.detail,
+                source: providerPlayback.stream.source,
+                extras: providerPlayback.extras
+            ),
+            serverURL: "",
+            authToken: "",
+            startOffset: startOffset,
+            loadingArtImage: loadingArtImage,
+            loadingThumbImage: loadingThumbImage,
+            preferredMediaID: preferredMediaID
+        )
+        setProviderStream(providerPlayback.stream, of: providerPlayback)
+    }
+
+    /// Store the provider's current stream and a reporter for its play
+    /// session. A new stream is a new play session, so the reporter follows it.
+    private func setProviderStream(_ stream: StreamInfo, of playback: ProviderPlayback) {
+        let updated = ProviderPlayback(
+            provider: playback.provider,
+            item: playback.item,
+            detail: playback.detail,
+            stream: stream,
+            extras: playback.extras
+        )
+        source = .provider(updated)
+        providerReporter = playback.provider.progressReporter(
+            for: playback.item.ref,
+            sourceID: stream.source.id,
+            playSessionID: stream.playSessionID
+        )
+        providerReporterStarted = false
+    }
+
+    /// The provider stream's first route. A direct-play stream goes to Aether
+    /// and can fall back to a provider transcode; a transcode plays on AVPlayer
+    /// with nothing behind it. nil when the provider gave no URL.
+    static func initialRoutes(for stream: StreamInfo) -> (primary: PlaybackRoute, hasTranscodeFallback: Bool)? {
+        guard let url = stream.source.streamURL else { return nil }
+        switch stream.source.streamKind {
+        case .hlsTranscode:
+            return (.hls(url: url, headers: nil), false)
+        case .directPlay, .progressiveTranscode:
+            return (.aether(url: url, headers: nil), true)
+        }
+    }
+
+    private static func metadataDuration(_ metadata: PlexMetadata) -> TimeInterval {
+        metadata.duration.map { TimeInterval($0) / 1000 } ?? 0
     }
 
     private func setupPlayer() {
@@ -621,17 +785,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     private func contentFilterItem() -> ContentFilterItem {
         let guids = metadata.Guid?.compactMap(\.id) ?? []
         let part = metadata.Media?.first?.Part?.first
-
-        var transcript: ContentFilterItem.TranscriptSource?
-        if let stream = ContentFilterSources.transcriptStream(in: part?.Stream ?? []),
-           let key = stream.key,
-           var components = URLComponents(string: "\(serverURL)\(key)") {
-            components.queryItems = (components.queryItems ?? [])
-                + [URLQueryItem(name: "X-Plex-Token", value: authToken)]
-            if let url = components.url {
-                transcript = ContentFilterItem.TranscriptSource(url: url, format: stream.codec ?? "", streamKey: key)
-            }
-        }
+        let transcript = contentFilterTranscript()
 
         return ContentFilterItem(
             ratingKey: metadata.ratingKey,
@@ -644,14 +798,49 @@ final class UniversalPlayerViewModel: ObservableObject {
         )
     }
 
+    /// The subtitle file the content filter reads for language muting.
+    var contentFilterTranscriptURL: URL? { contentFilterTranscript()?.url }
+
+    /// A Plex stream key is server-relative and takes the token; a provider
+    /// sidecar's key is its own URL (see `ProviderPlaybackMetadata`), used as is.
+    private func contentFilterTranscript() -> ContentFilterItem.TranscriptSource? {
+        let streams = metadata.Media?.first?.Part?.first?.Stream ?? []
+        guard let stream = ContentFilterSources.transcriptStream(in: streams), let key = stream.key else { return nil }
+        let url: URL?
+        switch source {
+        case .plex:
+            guard var components = URLComponents(string: "\(serverURL)\(key)") else { return nil }
+            components.queryItems = (components.queryItems ?? [])
+                + [URLQueryItem(name: "X-Plex-Token", value: authToken)]
+            url = components.url
+        case .provider:
+            url = URL(string: key)
+        }
+        return url.map { ContentFilterItem.TranscriptSource(url: $0, format: stream.codec ?? "", streamKey: key) }
+    }
+
     /// The subtitle lines currently on screen, as plain text, for the content
     /// filter's language matching.
+    /// Cue-axis time the video shows at `hostTime`, for the libass layer's
+    /// display link. nil when there is no Aether presentation timebase.
+    func subtitleSourceTime(atHostTime hostTime: CFTimeInterval) -> Double? {
+        aetherPlayer?.sourceTime(atHostTime: hostTime)
+    }
+
     private func activeSubtitleTextForFilter() -> [String] {
         aetherSubtitleModel.activeCues.compactMap { cue in
             switch cue.body {
             case .text(let string): return string
             case .styledText(let runs): return runs.map(\.text).joined()
             case .image: return nil
+            case .assEvents(let lines):
+                // Words only: the Style, Name and Effect fields and the tag
+                // names would otherwise reach the profanity matcher as words.
+                let text = ASSEventLine.lines(in: lines)
+                    .filter { !$0.isDrawing }
+                    .map(\.plainText)
+                    .joined(separator: "\n")
+                return text.isEmpty ? nil : text
             }
         }
     }
@@ -767,13 +956,21 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
-    private func prepareStreamURL() async {
+    func prepareStreamURL() async {
         let networkManager = PlexNetworkManager.shared
 
         guard metadata.ratingKey != nil else { return }
 
         // Sticky per-item subtitle delay (OSD stepper).
         loadStoredSubtitleDelay()
+
+        // A provider item plays the stream its provider resolved. Returns
+        // before the Plex metadata fetch and ContentRouter, both of which
+        // would build Plex requests from the display shim.
+        if case .provider(let playback) = source {
+            prepareProviderStream(playback.stream)
+            return
+        }
 
         // Fetch full metadata if Media array is missing (needed for info overlay display)
         // This happens when starting playback from Continue Watching or other hubs with minimal metadata
@@ -845,6 +1042,31 @@ final class UniversalPlayerViewModel: ObservableObject {
                 print("[Player] Aether primary; HLS fallback URL prebuilt only (not playing)")
             }
         }
+    }
+
+    /// `.provider` half of `prepareStreamURL`. The provider's URL carries
+    /// its own auth, so no headers. A direct-play stream gets an `.hls`
+    /// fallback in the plan so `planHasHLSFallback` arms the Aether-failure
+    /// fallback; its URL is a placeholder nobody reads, because the transcode
+    /// is only requested from the provider when the fallback actually fires.
+    private func prepareProviderStream(_ stream: StreamInfo) {
+        rivuletFallbackURL = nil
+        rivuletFallbackHeaders = [:]
+        guard let routes = Self.initialRoutes(for: stream),
+              let url = stream.source.streamURL else { return }
+        let plan = PlaybackPlan(
+            policy: .directPlayFirst,
+            primary: routes.primary,
+            fallbacks: routes.hasTranscodeFallback ? [.hls(url: url, headers: nil)] : [],
+            reasoning: ["provider stream: \(stream.source.streamKind)"]
+        )
+        playbackPlan = plan
+        activeRoute = plan.primary
+        streamURL = url
+        streamHeaders = [:]
+        AppHangContext.setPlaybackRoute(plan.primary.description)
+        diagnostics.setMedia(metadata, route: plan.primary.description, startOffset: startOffset, isRelay: false)
+        diagnostics.step("route_selected", detail: plan.description)
     }
 
     /// Determines whether audio can be safely direct-streamed on the HLS path.
@@ -1276,6 +1498,12 @@ final class UniversalPlayerViewModel: ObservableObject {
         if !hasMarkers || !hasChapters || !hasStreamDetails {
             await fetchMarkersIfNeeded()
         }
+        // A Plex item's chapter images arrive with the fetch above; a provider
+        // item's come from its detail.
+        if case .provider = source, let chapters = metadata.Chapter {
+            chapterThumbnails = [:]
+            await fetchChapterThumbnails(chapters: chapters)
+        }
 
         // Arm the local content filter for this item: reload settings, restore
         // any cached filter list, then refresh it and read the subtitle file.
@@ -1286,7 +1514,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         // IntroDB backup markers (opt-in). Runs AFTER the Plex fetch above so
         // Plex stays authoritative — the backfill only adds kinds Plex didn't
         // provide. Detached so a slow/dead community DB can't delay start.
-        if UserDefaults.standard.bool(forKey: "useIntroDB") {
+        // A provider item's markers come from its provider (in the shim).
+        if case .plex = source, UserDefaults.standard.bool(forKey: "useIntroDB") {
             Task { [weak self] in
                 await self?.backfillMarkersFromIntroDB()
             }
@@ -1349,14 +1578,17 @@ final class UniversalPlayerViewModel: ObservableObject {
                 player?.play()
             }
 
-            // Index for Siri Suggestions
-            let activity = NSUserActivity(activityType: "com.rivulet.playMedia")
-            activity.title = metadata.title
-            activity.isEligibleForSearch = true
-            activity.userInfo = ["ratingKey": metadata.ratingKey ?? ""]
-            activity.targetContentIdentifier = "rivulet://play?ratingKey=\(metadata.ratingKey ?? "")"
-            self.userActivity = activity
-            activity.becomeCurrent()
+            // Index for Siri Suggestions. The activity replays by Plex
+            // ratingKey, so a provider item has none.
+            if case .plex = source {
+                let activity = NSUserActivity(activityType: "com.rivulet.playMedia")
+                activity.title = metadata.title
+                activity.isEligibleForSearch = true
+                activity.userInfo = ["ratingKey": metadata.ratingKey ?? ""]
+                activity.targetContentIdentifier = "rivulet://play?ratingKey=\(metadata.ratingKey ?? "")"
+                self.userActivity = activity
+                activity.becomeCurrent()
+            }
             if let dur = player?.currentItem?.duration.seconds, dur.isFinite {
                 self.duration = dur
             }
@@ -1387,7 +1619,9 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Build standard direct-play headers for FFmpeg requests.
     private func rivuletDirectPlayHeaders() -> [String: String] {
-        [
+        // A provider URL carries its own auth; no Plex header may reach it.
+        if case .provider = source { return [:] }
+        return [
             "X-Plex-Token": authToken,
             "X-Plex-Client-Identifier": PlexAPI.clientIdentifier,
             "X-Plex-Platform": PlexAPI.platform,
@@ -1398,7 +1632,9 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Build an HLS URL and headers for Rivulet fallback at the requested offset.
     private func buildRivuletHLSURL(offset: TimeInterval?) -> (url: URL, headers: [String: String], sessionId: String?)? {
-        guard let ratingKey = metadata.ratingKey else { return nil }
+        // Plex transcode only. A provider's transcode is requested from the
+        // provider in `attemptRivuletHLSFallback`.
+        guard case .plex = source, let ratingKey = metadata.ratingKey else { return nil }
         // Source video codec has no Apple TV decoder (e.g. MPEG-2): the
         // direct-play-shaped URL would hand back the raw file and the
         // local decoder would fail. Flip on forceVideoTranscode so the
@@ -1408,6 +1644,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             serverURL: serverURL,
             authToken: authToken,
             ratingKey: ratingKey,
+            mediaIndex: playingMediaServerIndex,
             offsetMs: Int((offset ?? 0) * 1000),
             hasHDR: metadata.hasHDR,
             useDolbyVision: metadata.hasDolbyVision,
@@ -1461,7 +1698,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         return .unknown
     }
 
-    private func planHasHLSFallback(_ plan: PlaybackPlan?) -> Bool {
+    func planHasHLSFallback(_ plan: PlaybackPlan?) -> Bool {
         guard let plan else { return false }
         return plan.fallbacks.contains { route in
             if case .hls = route { return true }
@@ -1747,7 +1984,24 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// NOT inside the media container, so the engine can't discover them by
     /// demuxing. Registration order == metadata stream order, which is what
     /// lets `TrackMerge` pair each sidecar with its Plex stream by ordinal.
-    private func aetherExternalSubtitles() -> [AetherPlayer.SidecarSubtitle] {
+    func aetherExternalSubtitles() -> [AetherPlayer.SidecarSubtitle] {
+        // A provider's sidecars are its external tracks, in source order (the
+        // order the shim's subtitle streams carry, which TrackMerge pairs on).
+        // Their URLs are absolute and carry the provider's own auth.
+        if case .provider(let playback) = source {
+            return playback.stream.source.subtitleTracks.filter { !$0.isEmbedded }.compactMap { track in
+                guard let url = track.externalURL else { return nil }
+                return AetherPlayer.SidecarSubtitle(
+                    url: url,
+                    name: track.extendedTitle ?? track.title,
+                    language: track.language,
+                    isForced: track.isForced,
+                    isHearingImpaired: track.isHearingImpaired,
+                    isDefault: track.isDefault,
+                    formatHint: track.codec
+                )
+            }
+        }
         guard let streams = metadata.Media?.first?.Part?.first?.Stream else { return [] }
         return streams.filter { $0.isSubtitle && $0.key != nil }.compactMap { stream in
             guard let key = stream.key,
@@ -1948,6 +2202,11 @@ final class UniversalPlayerViewModel: ObservableObject {
             }
             .store(in: &aetherCancellables)
 
+        player.$assTrack
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] track in self?.assTrack = track }
+            .store(in: &aetherCancellables)
+
         // Mirrored onto the view model because AetherPlayer is not an
         // ObservableObject: a SwiftUI view reading `aetherPlayer.videoSize`
         // directly would never re-render, since `$aetherPlayer` only fires
@@ -2113,7 +2372,10 @@ final class UniversalPlayerViewModel: ObservableObject {
         // For HLS URLs, use the manifest enricher to inject audio/subtitle track labels.
         // The enricher intercepts ONLY the master playlist (custom scheme), patches it,
         // and rewrites all sub-URLs to absolute HTTP so AVPlayer fetches them directly.
+        // Plex only: the enricher is tuned to the PMS manifest and labels
+        // tracks from Plex metadata, which a provider transcode need not match.
         if allowEnrichment,
+           case .plex = source,
            url.path.contains("start.m3u8") || url.pathExtension == "m3u8",
            let headers = headers {
             let enricher = HLSManifestEnricher(metadata: metadata, headers: headers, originalURL: url)
@@ -2249,11 +2511,11 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard metadata.type == "episode" else { return }
 
         // Try season poster first, then show poster
-        let posterPath = metadata.parentThumb ?? metadata.grandparentThumb
-        guard let path = posterPath else { return }
-
-        let urlString = "\(serverURL)\(path)?X-Plex-Token=\(authToken)"
-        guard let url = URL(string: urlString) else { return }
+        let posterURL = artworkURL(
+            plex: { plexImageURL(metadata.parentThumb ?? metadata.grandparentThumb) },
+            provider: { $0.item.parentArtwork?.poster ?? $0.item.grandparentArtwork?.poster }
+        )
+        guard let url = posterURL else { return }
 
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
@@ -2275,8 +2537,10 @@ final class UniversalPlayerViewModel: ObservableObject {
         titleLogoResolveTask?.cancel()
         titleLogoImage = nil
 
-        if let logoPath = metadata.clearLogoPath,
-           let url = URL(string: "\(serverURL)\(logoPath)?X-Plex-Token=\(authToken)") {
+        if let url = artworkURL(
+            plex: { plexImageURL(metadata.clearLogoPath) },
+            provider: { $0.item.artwork.logo ?? $0.item.grandparentArtwork?.logo }
+        ) {
             titleLogoResolveTask = Task { [weak self] in
                 guard let image = await ImageCacheManager.shared.image(for: url) else { return }
                 guard !Task.isCancelled else { return }
@@ -2290,10 +2554,18 @@ final class UniversalPlayerViewModel: ObservableObject {
 
         // TMDB-mapped items (or episodes, which carry no logo of their own —
         // fall back to the parent show's tmdbId) resolve via the shared cache.
-        guard let tmdbID = metadata.tmdbId ?? metadata.parentShowTmdbId ?? metadata.showTmdbId else { return }
+        // A provider episode's own ids are the episode's, so it asks for its show's.
+        let providerEpisode = providerEpisode
+        let knownTmdbID = providerEpisode == nil
+            ? metadata.tmdbId ?? metadata.parentShowTmdbId ?? metadata.showTmdbId
+            : nil
+        guard providerEpisode != nil || knownTmdbID != nil else { return }
         let type: TMDBMediaType = metadata.type == "movie" ? .movie : .tv
         titleLogoResolveTask = Task { [weak self] in
-            guard let url = await TMDBLogoCache.shared.logoURL(tmdbId: tmdbID, type: type) else { return }
+            var tmdbID = knownTmdbID
+            if let providerEpisode { tmdbID = await self?.providerShowTmdbID(providerEpisode) }
+            guard let tmdbID, !Task.isCancelled,
+                  let url = await TMDBLogoCache.shared.logoURL(tmdbId: tmdbID, type: type) else { return }
             guard !Task.isCancelled else { return }
             guard let image = await ImageCacheManager.shared.image(for: url) else { return }
             guard !Task.isCancelled else { return }
@@ -2341,7 +2613,10 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Fetch chapter thumbnail images from Plex with limited concurrency.
     /// Uses a concurrency limit to avoid N+1 API call patterns flagged by Sentry.
     private func fetchChapterThumbnails(chapters: [PlexChapter]) async {
-        let thumbChapters = chapters.filter { $0.thumb != nil && $0.index != nil }
+        let thumbChapters: [(index: Int, url: URL)] = chapters.compactMap { chapter in
+            guard let index = chapter.index, let url = chapterThumbnailURL(chapter) else { return nil }
+            return (index, url)
+        }
         let thumbCount = thumbChapters.count
         guard thumbCount > 0 else { return }
         print("[Chapters] Fetching \(thumbCount) chapter thumbnails (max 3 concurrent)...")
@@ -2354,11 +2629,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             var inFlight = 0
 
             // Seed initial batch
-            while inFlight < maxConcurrency, let chapter = iterator.next() {
-                guard let index = chapter.index, let thumbPath = chapter.thumb else { continue }
-                let url = URL(string: "\(serverURL)\(thumbPath)?X-Plex-Token=\(authToken)")
-                guard let url else { continue }
-
+            while inFlight < maxConcurrency, let (index, url) = iterator.next() {
                 group.addTask {
                     do {
                         let (data, _) = try await URLSession.shared.data(from: url)
@@ -2378,11 +2649,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 inFlight -= 1
 
                 // Start next fetch if available
-                if let chapter = iterator.next() {
-                    guard let nextIndex = chapter.index, let thumbPath = chapter.thumb else { continue }
-                    let url = URL(string: "\(serverURL)\(thumbPath)?X-Plex-Token=\(authToken)")
-                    guard let url else { continue }
-
+                if let (nextIndex, url) = iterator.next() {
                     group.addTask {
                         do {
                             let (data, _) = try await URLSession.shared.data(from: url)
@@ -2397,6 +2664,18 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
 
         print("[Chapters] Fetched \(chapterThumbnails.count)/\(thumbCount) chapter thumbnails")
+    }
+
+    /// A Plex chapter's own thumb path; a provider chapter's image from its
+    /// detail (the shim numbers chapters from 1 in detail order).
+    func chapterThumbnailURL(_ chapter: PlexChapter) -> URL? {
+        artworkURL(
+            plex: { plexImageURL(chapter.thumb) },
+            provider: { playback in
+                guard let index = chapter.index, playback.detail.chapters.indices.contains(index - 1) else { return nil }
+                return playback.detail.chapters[index - 1].thumbnailURL
+            }
+        )
     }
 
     /// Build navigation markers from Plex chapters (preferred) or intro/credits markers (fallback).
@@ -2474,7 +2753,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         print("[Fallback] Failed (\(failureKind.rawValue), reason=\(reason)) → HLS")
 
         let fallback: (url: URL, headers: [String: String], sessionId: String?)?
-        if resumeTime <= 0.5, let prebuiltURL = rivuletFallbackURL, !rivuletFallbackHeaders.isEmpty {
+        if case .provider = source {
+            fallback = try await switchToProviderTranscode(resumeTime: resumeTime).map { ($0, [:], nil) }
+        } else if resumeTime <= 0.5, let prebuiltURL = rivuletFallbackURL, !rivuletFallbackHeaders.isEmpty {
             let sessionId = URLComponents(url: prebuiltURL, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "session" })?.value
             fallback = (prebuiltURL, rivuletFallbackHeaders, sessionId)
@@ -2525,6 +2806,21 @@ final class UniversalPlayerViewModel: ObservableObject {
         if resumeTime > 0 {
             await player?.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 600))
         }
+    }
+
+    /// The provider's server transcode, from where playback stopped. A new
+    /// play session: the old one is stopped, and the stored stream and its
+    /// reporter follow the new one. Returns the URL to play, with no headers.
+    func switchToProviderTranscode(resumeTime: TimeInterval) async throws -> URL? {
+        guard case .provider(let playback) = source else { return nil }
+        let transcode = try await playback.provider.transcodeStream(
+            for: playback.item.ref,
+            sourceID: playback.stream.source.id,
+            startTime: resumeTime
+        )
+        await stopProviderReporter(at: resumeTime)
+        setProviderStream(transcode, of: playback)
+        return transcode.source.streamURL
     }
 
     // MARK: - RIVULET-19 Failure Probe
@@ -2725,24 +3021,25 @@ final class UniversalPlayerViewModel: ObservableObject {
         return false
     }
 
-    /// Check if a variant playlist has actual segments ready
-    private func checkVariantPlaylist(masterContent: String, baseURL: URL, headers: [String: String]) async -> Bool? {
-        // Parse the master playlist to find a variant playlist URL
-        let lines = masterContent.components(separatedBy: .newlines)
-        var variantURL: URL?
-
-        for line in lines {
+    /// The first variant playlist a master names, resolved against `baseURL`.
+    /// Matched on the path: a provider's variant line carries a query
+    /// ("main.m3u8?ApiKey=..."); PMS's has none, so it is unaffected.
+    static func firstVariantURL(inMaster masterContent: String, baseURL: URL) -> URL? {
+        for line in masterContent.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasSuffix(".m3u8") && !trimmed.hasPrefix("#") {
-                // Construct the full URL for the variant
-                if let url = URL(string: trimmed, relativeTo: baseURL) {
-                    variantURL = url.absoluteURL
-                    break
-                }
+            // An empty line would resolve to the master itself.
+            if !trimmed.isEmpty, !trimmed.hasPrefix("#"),
+               let url = URL(string: trimmed, relativeTo: baseURL),
+               url.path.hasSuffix(".m3u8") {
+                return url.absoluteURL
             }
         }
+        return nil
+    }
 
-        guard let variant = variantURL else {
+    /// Check if a variant playlist has actual segments ready
+    private func checkVariantPlaylist(masterContent: String, baseURL: URL, headers: [String: String]) async -> Bool? {
+        guard let variant = Self.firstVariantURL(inMaster: masterContent, baseURL: baseURL) else {
             print("🎬 [HLSPreflight] No variant playlist URL found in master")
             return nil
         }
@@ -2781,6 +3078,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     func stopPlayback() {
+        stopCount += 1
         streamPreparationTask?.cancel()
         streamPreparationTask = nil
         cancelAetherStallWatchdog()
@@ -2789,6 +3087,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         clearReplayWindow()
         contentFilter.reset()
         releaseThumbnailCache()
+        cancelEngineThumbnail()
 
         // Clear the active playback route and content from the App Hang scope
         // (RIVULET-41) so a later hang off the player isn't tagged with a stale
@@ -2801,6 +3100,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         aetherPlayer?.stop()
         aetherPlayer = nil
         aetherSubtitleModel.update(cues: [])
+        assTrack = nil
 
         teardownAVPlayerObservers()
         player?.pause()
@@ -2812,7 +3112,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         // Stop the Plex transcode session so the server frees resources immediately.
         // Without this, switching between DV files can timeout waiting for the init segment
         // because the server is still busy with the previous transcode.
-        if let sessionId = plexSessionId {
+        // A provider's reporter stops its own encoding on `stopped`.
+        if case .plex = source, let sessionId = plexSessionId {
             let serverURL = self.serverURL
             let authToken = self.authToken
             plexSessionId = nil
@@ -2968,6 +3269,9 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     func seekRelative(by seconds: TimeInterval) async {
         hidePausedPoster()
+        // The skip glyph shows on the press, not after the seek lands.
+        let intSeconds = Int(abs(seconds))
+        showSeekIndicator(seconds >= 0 ? .forward(intSeconds) : .backward(intSeconds))
         let base = inFlightRelativeSeekTarget ?? currentTime
         let targetTime = max(0, min(base + seconds, duration))
         inFlightRelativeSeekTarget = targetTime
@@ -2983,7 +3287,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         if seekGeneration == generation { inFlightRelativeSeekTarget = nil }
         // REFRESH the auto-hide timer when the chrome is already up; never
         // SUMMON it. A skip is a skip, not a request for chrome. The seek
-        // indicator below is the feedback for a hidden-chrome skip.
+        // indicator above is the feedback for a hidden-chrome skip.
         //
         // This is the SECOND caller on this path — `UniversalPlayerView`'s
         // `.seekRelative` case has the same call — and gating only that one left
@@ -2991,10 +3295,6 @@ final class UniversalPlayerViewModel: ObservableObject {
         // `seek(to:revealsControls:)` above already takes the decision as a
         // parameter for the same reason.
         if showControls { showControlsTemporarily() }
-
-        // Show seek indicator for tap-to-skip
-        let intSeconds = Int(abs(seconds))
-        showSeekIndicator(seconds >= 0 ? .forward(intSeconds) : .backward(intSeconds))
     }
 
     /// "What did they say?" — jump back 15s with subtitles temporarily on,
@@ -3072,15 +3372,10 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     // MARK: - Scrubbing
 
-    /// Human-readable label for current scrub speed
-    var scrubStepLabel: String? {
-        ShuttleGrammar.badge(forSpeed: scrubSpeed)
-    }
-
     /// Start or advance scrub speed in given direction via ShuttleGrammar:
     /// click-and-hold enters at level 1, same-direction clicks bump up to the
-    /// level 3 cap, opposite-direction clicks step down then cancel. Badges
-    /// show the human ladder (2x/4x/6x); real rates are 15x/60x/240x.
+    /// level 8 cap, opposite-direction clicks step down then cancel. The bar
+    /// shows the level as AVKit's scan glyph; rates run 8x to 1536x.
     /// - Parameter forward: true for forward, false for backward
     func scrubInDirection(forward: Bool) {
         hidePausedPoster()
@@ -3145,14 +3440,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         loadThumbnail(for: scrubTime)
     }
 
-    /// Handle click wheel rotation (iPod-style circular scrubbing)
-    /// - Parameter radians: Rotation amount in radians (clockwise/positive = forward)
-    func handleWheelRotation(_ radians: Float) {
-        // Convert rotation to seek time
-        // ~10 seconds per full rotation (2π radians), so ~1.6 seconds per radian
-        let secondsPerRadian: TimeInterval = 10.0
-        let seekDelta = TimeInterval(radians) * secondsPerRadian
-
+    /// Clickpad-ring rotation scrub; `seekDelta` is already converted from the rotation.
+    func handleWheelScrub(by seekDelta: TimeInterval) {
         if !isScrubbing {
             hidePausedPoster()
             isScrubbing = true
@@ -3183,6 +3472,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         wheelScrubbingTimer?.invalidate()
         wheelScrubbingTimer = Timer.scheduledTimer(withTimeInterval: wheelScrubbingIdleDelay, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
+                // A finger resting on the ring keeps it up, as AVKit's does.
+                if RemoteInputHandler.isRingJogging { self?.startWheelScrubbingIdleTimer(); return }
                 self?.wheelScrubbing = false
             }
         }
@@ -3217,6 +3508,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             scrubSpeed = 0
             scrubStartTime = nil
             scrubThumbnail = nil
+            cancelEngineThumbnail()
         }
     }
 
@@ -3228,6 +3520,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         scrubStartTime = nil
         scrubTime = currentTime
         scrubThumbnail = nil
+        cancelEngineThumbnail()
         startControlsHideTimer()
     }
 
@@ -3268,7 +3561,24 @@ final class UniversalPlayerViewModel: ObservableObject {
         loadThumbnail(for: scrubTime)
     }
 
+    static func scrubThumbnailSource(hasServerThumbnails: Bool) -> ScrubThumbnailSource {
+        hasServerThumbnails ? .server : .engine
+    }
+
+    /// A Plex part keeps its BIF unless the server answered that it has none;
+    /// then the engine takes over for the rest of the item. A provider item
+    /// never asks PlexThumbnailService (its Part is a placeholder).
+    var currentScrubThumbnailSource: ScrubThumbnailSource {
+        guard case .plex = source, let partId = metadata.Media?.first?.Part?.first?.id else { return .engine }
+        return Self.scrubThumbnailSource(
+            hasServerThumbnails: !PlexThumbnailService.shared.isUnavailable(partId: partId))
+    }
+
     private func loadThumbnail(for time: TimeInterval) {
+        guard currentScrubThumbnailSource == .server else {
+            loadEngineThumbnail(for: time)
+            return
+        }
         guard let partId = metadata.Media?.first?.Part?.first?.id else {
             print("⚠️ No part ID available for thumbnails")
             return
@@ -3281,8 +3591,39 @@ final class UniversalPlayerViewModel: ObservableObject {
                 serverURL: serverURL,
                 authToken: authToken
             )
+            // The BIF index just 404'd: this scrub, and every later one, decodes.
+            if thumbnail == nil, self.currentScrubThumbnailSource == .engine {
+                self.loadEngineThumbnail(for: time)
+                return
+            }
             self.scrubThumbnail = thumbnail
         }
+    }
+
+    /// Latest wins: while a decode runs, only the newest scrub time is kept,
+    /// and the frame that comes back shows even if the scrub has moved on,
+    /// since it is the nearest still there is.
+    private func loadEngineThumbnail(for time: TimeInterval) {
+        pendingEngineThumbnailTime = time
+        guard engineThumbnailTask == nil, let player = aetherPlayer else { return }
+        engineThumbnailTask = Task { [weak self] in
+            while !Task.isCancelled, let self, self.isScrubbing,
+                  let wanted = self.pendingEngineThumbnailTime {
+                self.pendingEngineThumbnailTime = nil
+                let frame = await player.scrubFrame(atSeconds: wanted)
+                if !Task.isCancelled, self.isScrubbing, let frame {
+                    self.scrubThumbnail = UIImage(cgImage: frame)
+                }
+            }
+            // A cancelled loop was already replaced by cancelEngineThumbnail.
+            if !Task.isCancelled { self?.engineThumbnailTask = nil }
+        }
+    }
+
+    private func cancelEngineThumbnail() {
+        engineThumbnailTask?.cancel()
+        engineThumbnailTask = nil
+        pendingEngineThumbnailTime = nil
     }
 
     /// Chapter start times in seconds, derived from Plex chapter metadata.
@@ -3305,6 +3646,9 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Preload thumbnails when playback starts
     func preloadThumbnails() {
+        // The engine caches its own decodes; prefetching would only pull bytes
+        // over the playback link.
+        guard currentScrubThumbnailSource == .server else { return }
         // Debug: Log metadata structure
         if let media = metadata.Media {
             //print("🖼️ [THUMB] Media count: \(media.count)")
@@ -4227,9 +4571,36 @@ final class UniversalPlayerViewModel: ObservableObject {
             && pausePresentation == .frame
     }
 
+    /// Puts the chosen version of a server-ordered `Media` array first and records it.
+    private func applyVersion(_ choice: VersionChoice, to media: [PlexMedia]?) {
+        guard let media, !media.isEmpty else { return }
+        let selection = VersionRanking.select(choice, in: media)
+        metadata.Media = selection.media
+        playingMediaID = selection.media.first.map { "\($0.id)" }
+        playingMediaServerIndex = selection.serverIndex
+    }
+
+    private var currentVersionChoice: VersionChoice {
+        playingMediaID.map(VersionChoice.source) ?? upNextTier.map(VersionChoice.matchingTier) ?? .best
+    }
+
+    /// Up Next plays each episode's best file unless the user picked one; then it keeps that tier.
+    func upNextVersionChoice() -> VersionChoice {
+        guard pickedVersion else { return .best }
+        if upNextTier == nil { upNextTier = playingTier }
+        return upNextTier.map(VersionChoice.matchingTier) ?? .best
+    }
+
+    /// Resolution tier of the version playing, for Up Next.
+    private var playingTier: Int {
+        if case .provider(let playback) = source { return VersionRanking.key(playback.stream.source).tier }
+        return metadata.Media?.first.map { VersionRanking.key($0).tier } ?? 0
+    }
+
     /// Fetch detailed metadata with markers if not already present
     private func fetchMarkersIfNeeded() async {
-        guard let ratingKey = metadata.ratingKey else {
+        // A provider item's shim already carries markers, chapters and streams.
+        guard case .plex = source, let ratingKey = metadata.ratingKey else {
             return
         }
 
@@ -4255,7 +4626,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             // Update Media (includes Part with stream details)
             // Hub items often lack Part/Stream data
             if let media = detailedMetadata.Media, !media.isEmpty {
-                metadata.Media = media
+                applyVersion(currentVersionChoice, to: media)
             }
 
             // Fill in missing display info (summary, genres, etc.)
@@ -4436,15 +4807,21 @@ final class UniversalPlayerViewModel: ObservableObject {
 
         // Start countdown and preload
         startAutoplayCountdown()
-        // Preload next episode in background for instant playback
+        // Preload next episode in background for instant playback. A provider
+        // episode is prepared now, so a failure shows before the countdown fires.
         Task {
-            await preloadNextEpisode()
+            if case .provider = source, let next = nextEpisode {
+                await preparedNextProviderPlayback(for: next)
+            } else {
+                await preloadNextEpisode()
+            }
         }
     }
 
     /// Fetch full metadata if parent keys or Media info are missing (e.g., from Continue Watching)
     private func fetchFullMetadataIfNeeded() async {
-        guard let ratingKey = metadata.ratingKey else {
+        // Plex metadata endpoint; a provider item's ratingKey is not a Plex key.
+        guard case .plex = source, let ratingKey = metadata.ratingKey else {
             return
         }
 
@@ -4477,7 +4854,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
             // Update Media array if missing (needed for info overlay display)
             if metadata.Media == nil || metadata.Media?.isEmpty == true {
-                metadata.Media = fullMetadata.Media
+                applyVersion(currentVersionChoice, to: fullMetadata.Media)
             }
 
             // Carry over external-id guids (fetched via includeGuids=1) so
@@ -4510,6 +4887,17 @@ final class UniversalPlayerViewModel: ObservableObject {
         let generation = itemGeneration
         guard metadata.type == "episode" else {
             upNextEpisodes = []
+            return
+        }
+        if case .provider(let playback) = source {
+            let upNext = await providerUpNext(playback)
+            guard generation == itemGeneration else { return }
+            var episodes = upNext.season
+            // Season finale: the next season's opener is the up-next row.
+            if let next = upNext.next, next.parentRef != playback.detail.item.parentRef {
+                episodes.append(next)
+            }
+            upNextEpisodes = episodes.map(ProviderPlaybackMetadata.listing(item:))
             return
         }
         if metadata.parentRatingKey == nil || metadata.index == nil {
@@ -4552,9 +4940,13 @@ final class UniversalPlayerViewModel: ObservableObject {
         // Episodes: use the SHOW's tmdb id, never the episode's own guid. Some
         // Plex agents put a per-episode tmdb:// id in the episode's Guid array,
         // which would resolve to the wrong id and silently drop TMDB cast.
-        let tmdbId = metadata.type == "episode"
+        var tmdbId = metadata.type == "episode"
             ? (metadata.parentShowTmdbId ?? metadata.showTmdbId)
             : metadata.tmdbId
+        if let providerEpisode {
+            tmdbId = await providerShowTmdbID(providerEpisode)
+            guard generation == itemGeneration else { return }
+        }
 
         var people: [MediaPerson] = []
 
@@ -4571,7 +4963,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
 
         // Plex Role fallback: item's own roles, then (episodes) the show's roles.
-        if people.isEmpty {
+        if people.isEmpty, case .plex = source {
             var roles = metadata.Role ?? []
             if roles.isEmpty, let key = metadata.ratingKey,
                let full = try? await PlexNetworkManager.shared.getFullMetadata(
@@ -4611,7 +5003,10 @@ final class UniversalPlayerViewModel: ObservableObject {
         // proxy find route) so Insights can fetch/request generation instead of
         // silently bailing. Cached per show, so this is one lookup, not per
         // episode.
-        if tmdbId == nil, metadata.type == "episode" {
+        if let providerEpisode {
+            tmdbId = await providerShowTmdbID(providerEpisode)
+            guard generation == itemGeneration else { return }
+        } else if tmdbId == nil, metadata.type == "episode" {
             let externalIDs = await resolveShowExternalIDs()
             guard generation == itemGeneration else { return }
             tmdbId = await InsightsShowIDResolver.shared.resolve(externalIDs)
@@ -4673,6 +5068,36 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard generation == itemGeneration else { return }
         insightsTrivia = trivia
         suppressedTriviaIDs = suppressed
+    }
+
+    /// `.provider` episodes only: the playback, since an episode's own ids are
+    /// the episode's and its show's come from the series.
+    private var providerEpisode: ProviderPlayback? {
+        guard case .provider(let playback) = source, metadata.type == "episode" else { return nil }
+        return playback
+    }
+
+    /// `.provider` only: the series detail's ids, fetched once per show.
+    private var providerShowIDs: (show: MediaItemRef, task: Task<[String: String], Never>)?
+
+    /// A provider episode's show TMDB id: the series' own, else resolved from
+    /// its tvdb or imdb id. nil when the episode has no show.
+    func providerShowTmdbID(_ playback: ProviderPlayback) async -> Int? {
+        guard let show = playback.item.grandparentRef else { return nil }
+        let task: Task<[String: String], Never>
+        if let cached = providerShowIDs, cached.show == show {
+            task = cached.task
+        } else {
+            let provider = playback.provider
+            task = Task { (try? await provider.fullDetail(for: show))?.externalIDs ?? [:] }
+            providerShowIDs = (show, task)
+        }
+        let ids = await task.value
+        return await InsightsShowIDResolver.shared.resolve(ShowExternalIDs(
+            tmdb: ids["tmdb"].flatMap { Int($0) },
+            tvdb: ids["tvdb"].flatMap { Int($0) },
+            imdb: ids["imdb"]
+        ))
     }
 
     /// Gather the show's external ids for an episode. Uses guids already on the
@@ -4764,8 +5189,78 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
+    /// The episode after `current`: the next by number in its season, else
+    /// the first of the next season. Episodes without a number are skipped.
+    static func nextEpisode(after current: MediaItem, in seasonEpisodes: [MediaItem],
+                            nextSeasonEpisodes: [MediaItem]?) -> MediaItem? {
+        guard let number = current.episodeNumber else { return nil }
+        return byEpisodeNumber(seasonEpisodes).first { ($0.episodeNumber ?? 0) > number }
+            ?? byEpisodeNumber(nextSeasonEpisodes ?? []).first
+    }
+
+    private static func byEpisodeNumber(_ episodes: [MediaItem]) -> [MediaItem] {
+        episodes.filter { $0.episodeNumber != nil }
+            .sorted { ($0.episodeNumber ?? 0) < ($1.episodeNumber ?? 0) }
+    }
+
+    /// `.provider` half of the next-episode lookup: the current season's
+    /// episodes in order, and the episode after the current one. Every item
+    /// returned is registered so its shim maps back to it.
+    private func providerUpNext(_ playback: ProviderPlayback) async -> (season: [MediaItem], next: MediaItem?) {
+        let generation = itemGeneration
+        let task: Task<(season: [MediaItem], next: MediaItem?), Never>
+        if let fetch = providerUpNextFetch, fetch.generation == generation {
+            task = fetch.task
+        } else {
+            task = Task { await Self.fetchProviderUpNext(playback) }
+            providerUpNextFetch = (generation, task)
+        }
+        let result = await task.value
+        if result.season.isEmpty, providerUpNextFetch?.generation == generation {
+            providerUpNextFetch = nil
+        }
+        for item in result.season + [result.next].compactMap({ $0 }) {
+            providerEpisodeItems[item.ref.itemID] = item
+        }
+        return result
+    }
+
+    /// Specials a server lists inside a season carry their own season number
+    /// and are left out, so they never become the next episode.
+    private static func fetchProviderUpNext(_ playback: ProviderPlayback) async -> (season: [MediaItem], next: MediaItem?) {
+        let current = playback.detail.item
+        let provider = playback.provider
+        guard current.kind == .episode, let seasonRef = current.parentRef,
+              let children = try? await provider.children(of: seasonRef) else { return ([], nil) }
+        let season = byEpisodeNumber(children.filter { $0.seasonNumber == current.seasonNumber })
+        var nextSeasonEpisodes: [MediaItem]?
+        if let number = current.episodeNumber, let seasonNumber = current.seasonNumber,
+           !season.contains(where: { ($0.episodeNumber ?? 0) > number }),
+           let showRef = current.grandparentRef,
+           let seasons = try? await provider.children(of: showRef),
+           let nextSeason = seasons
+               .filter({ ($0.seasonNumber ?? Int.min) > seasonNumber })
+               .min(by: { ($0.seasonNumber ?? 0) < ($1.seasonNumber ?? 0) }) {
+            nextSeasonEpisodes = try? await provider.children(of: nextSeason.ref)
+                .filter { $0.seasonNumber == nextSeason.seasonNumber }
+        }
+        return (season, nextEpisode(after: current, in: season, nextSeasonEpisodes: nextSeasonEpisodes))
+    }
+
+    /// Up Next thumbnail for a provider episode's shim, from its own artwork.
+    /// nil on the Plex path, where the views build the Plex URL.
+    func providerThumbnailURL(for episode: PlexMetadata) -> URL? {
+        guard case .provider = source, let key = episode.ratingKey,
+              let item = providerEpisodeItems[key] else { return nil }
+        return item.artwork.thumbnail ?? item.artwork.backdrop
+    }
+
     /// Fetch the next episode for TV shows
     func fetchNextEpisode() async -> PlexMetadata? {
+        if case .provider(let playback) = source {
+            return await providerUpNext(playback).next.map(ProviderPlaybackMetadata.listing(item:))
+        }
+
         // Shuffled queue: return next shuffled episode instead of sequential
         if !shuffledQueue.isEmpty {
             shuffledQueueIndex += 1
@@ -4896,6 +5391,10 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Preload the next episode's stream URL and metadata for instant playback
     private func preloadNextEpisode() async {
+        // Plex only: a provider episode is prepared from its provider at the
+        // swap (`playNextEpisode`), never from a Plex URL built here.
+        // ponytail: no provider preload; add one if the swap's start is slow.
+        guard case .plex = source else { return }
         guard let next = nextEpisode, let ratingKey = next.ratingKey else { return }
 
         let networkManager = PlexNetworkManager.shared
@@ -4913,9 +5412,11 @@ final class UniversalPlayerViewModel: ObservableObject {
             preloadedNextMetadata = next
         }
 
-        // Build stream URL for next episode
+        // Build stream URL for next episode, from the same choice the swap makes,
+        // so the warmed URL is the file that plays.
         let metadata = preloadedNextMetadata ?? next
-        if let partKey = metadata.Media?.first?.Part?.first?.key {
+        let nextMedia = VersionRanking.select(upNextVersionChoice(), in: metadata.Media ?? []).media.first
+        if let partKey = nextMedia?.Part?.first?.key {
             preloadedNextStreamURL = networkManager.buildPlaybackDirectPlayURL(
                 serverURL: serverURL,
                 authToken: authToken,
@@ -4949,6 +5450,53 @@ final class UniversalPlayerViewModel: ObservableObject {
         preloadedNextStreamURL = nil
         preloadedNextStreamHeaders = [:]
         preloadedNextMetadata = nil
+        nextProviderPrepare = nil
+        nextEpisodeError = nil
+    }
+
+    /// `.provider` only: the next episode's playback. One prepare per target,
+    /// shared by the countdown start and the swap; a failure is shown and
+    /// forgotten, so Play Now asks again.
+    @discardableResult
+    private func preparedNextProviderPlayback(for next: PlexMetadata) async -> ProviderPlayback? {
+        guard case .provider(let playback) = source else { return nil }
+        let generation = itemGeneration
+        let key = next.ratingKey ?? ""
+        let task: Task<ProviderPlayback?, Never>
+        if let pending = nextProviderPrepare, pending.key == key {
+            task = pending.task
+        } else if let item = providerEpisodeItems[key] {
+            let provider = playback.provider
+            let version = upNextVersionChoice()
+            task = Task {
+                do {
+                    return try await ProviderPlayback.prepare(item: item, provider: provider, version: version)
+                } catch {
+                    print("🎬 [PostVideo] Next provider episode failed to prepare: \(error)")
+                    return nil
+                }
+            }
+            nextProviderPrepare = (key, task)
+        } else {
+            showNextEpisodeError()
+            return nil
+        }
+        let prepared = await task.value
+        guard generation == itemGeneration else { return nil }
+        if prepared == nil {
+            if nextProviderPrepare?.key == key { nextProviderPrepare = nil }
+            showNextEpisodeError()
+        }
+        return prepared
+    }
+
+    /// Stops the countdown and says why. The post-video page shows it; with
+    /// no page up (a pick from the Up Next panel) it shows as a notice.
+    private func showNextEpisodeError() {
+        let message = "Couldn't load the next episode."
+        nextEpisodeError = message
+        cancelCountdown()
+        if postVideoState == .hidden { showCompatibilityNotice(message) }
     }
 
     /// Cancel countdown but stay on summary
@@ -4978,14 +5526,33 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Play the next episode
     func playNextEpisode() async {
         guard let next = nextEpisode else { return }
+        // A provider swap awaits its provider first, so a second call (the
+        // countdown and a Play Now press) must not start another one.
+        if case .provider = source, isSwappingItem { return }
 
         // Everything below runs while the OUTGOING episode is still playing.
         // See `isSwappingItem`.
         isSwappingItem = true
         defer { isSwappingItem = false }
 
+        // A provider episode's stream comes before anything is torn down: if
+        // the provider can't serve it, the current episode plays on.
+        var nextProviderPlayback: ProviderPlayback?
+        if case .provider = source {
+            nextEpisodeError = nil
+            let stops = stopCount
+            guard let prepared = await preparedNextProviderPlayback(for: next) else { return }
+            // The player was closed while the provider answered.
+            guard stops == stopCount else { return }
+            nextProviderPlayback = prepared
+        }
+
         // Mark current episode as watched BEFORE switching to next
         await markCurrentAsWatched()
+        // The outgoing item's play session ends here.
+        if case .provider = source {
+            await stopProviderReporter(at: currentTime)
+        }
 
         // Stop countdown and reset all countdown state
         countdownTimer?.invalidate()
@@ -4999,8 +5566,24 @@ final class UniversalPlayerViewModel: ObservableObject {
             videoFrameState = .fullscreen
         }
 
-        // Use preloaded metadata if available (has markers), otherwise use fetched next episode
-        metadata = preloadedNextMetadata ?? next
+        if let nextProviderPlayback {
+            // Source, display shim and reporter move together; the outgoing
+            // reporter was stopped above.
+            metadata = ProviderPlaybackMetadata.make(
+                detail: nextProviderPlayback.detail,
+                source: nextProviderPlayback.stream.source,
+                extras: nextProviderPlayback.extras
+            )
+            setProviderStream(nextProviderPlayback.stream, of: nextProviderPlayback)
+        } else {
+            // Preloaded metadata has markers. Choose before the swap: the choice may read the outgoing file.
+            let version = upNextVersionChoice()
+            metadata = preloadedNextMetadata ?? next
+            playingMediaID = nil
+            playingMediaServerIndex = 0
+            applyVersion(version, to: metadata.Media)
+        }
+        duration = Self.metadataDuration(metadata)
         // metadata isn't @Published (its ratingKey is the only identity
         // signal), so bump this explicitly for anything that caches
         // per-item state and needs to reset across the swap.
@@ -5142,8 +5725,154 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     // MARK: - Progress Tracking
 
+    /// Periodic progress, throttled to `reportingInterval` unless `force`.
+    func reportPlaybackProgress(time: TimeInterval, force: Bool) {
+        // Report every 10 seconds
+        guard force || abs(time - lastReportedTime) >= reportingInterval else { return }
+        lastReportedTime = time
+
+        if case .provider = source {
+            guard providerReporterStarted, let reporter = providerReporter else { return }
+            enqueueProviderReport { await reporter.progress(position: time) }
+            return
+        }
+
+        Task {
+            await PlexProgressReporter.shared.reportProgress(
+                ratingKey: self.metadata.ratingKey ?? "",
+                time: time,
+                duration: self.duration,
+                state: self.isPlaying ? "playing" : "paused"
+            )
+        }
+    }
+
+    /// Report a playback state change immediately.
+    func reportPlaybackState(_ newState: UniversalPlaybackState) {
+        if case .provider = source {
+            reportProviderState(newState)
+            return
+        }
+
+        // Only report significant state changes
+        let plexState: String?
+        switch newState {
+        case .playing:
+            plexState = "playing"
+        case .paused:
+            plexState = "paused"
+        case .ended:
+            plexState = "stopped"
+        default:
+            plexState = nil
+        }
+
+        guard let state = plexState else { return }
+
+        Task {
+            await PlexProgressReporter.shared.reportProgress(
+                ratingKey: self.metadata.ratingKey ?? "",
+                time: self.currentTime,
+                duration: self.duration,
+                state: state,
+                forceReport: true
+            )
+        }
+    }
+
+    /// Final report when the player goes away: stopped, watched past 90%,
+    /// then a refresh so the surfaces repaint.
+    func reportFinalProgress() async {
+        await reportFinalProgress(time: currentTime, duration: duration)
+    }
+
+    func reportFinalProgress(time: TimeInterval, duration: TimeInterval) async {
+        if case .provider(let playback) = source {
+            await stopProviderReporter(at: time)
+            if duration > 0 && time / duration > 0.9 {
+                try? await playback.provider.markPlayed(playback.item.ref)
+            }
+            NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
+            return
+        }
+
+        // 1. Report stopped state to Plex
+        await PlexProgressReporter.shared.reportProgress(
+            ratingKey: metadata.ratingKey ?? "",
+            time: time,
+            duration: duration,
+            state: "stopped",
+            forceReport: true
+        )
+
+        // 2. Mark as watched if > 90% complete
+        if duration > 0 && time / duration > 0.9 {
+            await PlexProgressReporter.shared.markAsWatched(
+                ratingKey: metadata.ratingKey ?? ""
+            )
+        }
+
+        // 3. Wait for Plex server to process (2 seconds)
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+
+        // 4. Trigger refresh after progress is confirmed
+        NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
+    }
+
+    private func reportProviderState(_ newState: UniversalPlaybackState) {
+        guard let reporter = providerReporter else { return }
+        let position = currentTime
+        switch newState {
+        case .playing:
+            if providerReporterStarted {
+                enqueueProviderReport { await reporter.progress(position: position) }
+            } else {
+                providerReporterStarted = true
+                enqueueProviderReport { await reporter.start(position: position) }
+            }
+        case .paused:
+            guard providerReporterStarted else { return }
+            enqueueProviderReport { await reporter.paused(at: position) }
+        case .ended:
+            Task { await self.stopProviderReporter(at: position) }
+        default:
+            break
+        }
+    }
+
+    /// Send `stopped` once for the current play session, even if it never
+    /// started: the provider ends its encoding on it.
+    private func stopProviderReporter(at position: TimeInterval) async {
+        guard let reporter = providerReporter else {
+            await providerReportTail?.value
+            return
+        }
+        providerReporter = nil
+        providerReporterStarted = false
+        await enqueueProviderReport { await reporter.stopped(at: position) }.value
+    }
+
+    @discardableResult
+    private func enqueueProviderReport(_ report: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        let previous = providerReportTail
+        let task = Task {
+            await previous?.value
+            await report()
+        }
+        providerReportTail = task
+        return task
+    }
+
     /// Mark current content as watched (for use before transitioning to next episode)
-    private func markCurrentAsWatched() async {
+    func markCurrentAsWatched() async {
+        // A provider session stays open: this runs at the credits while the
+        // video keeps playing, and `stopped` would end the server session
+        // (and a transcode) under it. `.ended`, exit and the swap stop it.
+        if case .provider(let playback) = source {
+            try? await playback.provider.markPlayed(playback.item.ref)
+            NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
+            return
+        }
         guard let ratingKey = metadata.ratingKey, !ratingKey.isEmpty else { return }
 
         // Report stopped state

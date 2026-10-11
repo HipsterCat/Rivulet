@@ -108,13 +108,7 @@ actor PlexLiveTVProvider: LiveTVProvider {
                 authToken: authToken
             )
         } catch {
-            // Capture Plex Live TV capability check failure
-            let capturedServerURL = self.serverURL
-            SentryBridge.capture(error: error) { scope in
-                scope.setTag(value: "plex_livetv", key: "component")
-                scope.setTag(value: "capability_check", key: "operation")
-                scope.setExtra(value: capturedServerURL, key: "server_url")
-            }
+            logFailure(error, operation: "capability_check")
             throw error
         }
         capabilities = caps
@@ -142,13 +136,7 @@ actor PlexLiveTVProvider: LiveTVProvider {
                 authToken: authToken
             )
         } catch {
-            // Capture Plex Live TV channel fetch failure
-            let capturedServerURL = self.serverURL
-            SentryBridge.capture(error: error) { scope in
-                scope.setTag(value: "plex_livetv", key: "component")
-                scope.setTag(value: "channel_fetch", key: "operation")
-                scope.setExtra(value: capturedServerURL, key: "server_url")
-            }
+            logFailure(error, operation: "channel_fetch")
             throw error
         }
 
@@ -236,15 +224,7 @@ actor PlexLiveTVProvider: LiveTVProvider {
                 endTime: endDate
             )
         } catch {
-            // Capture Plex Live TV EPG fetch failure
-            let capturedServerURL = self.serverURL
-            let capturedChannelCount = channels.count
-            SentryBridge.capture(error: error) { scope in
-                scope.setTag(value: "plex_livetv", key: "component")
-                scope.setTag(value: "epg_fetch", key: "operation")
-                scope.setExtra(value: capturedServerURL, key: "server_url")
-                scope.setExtra(value: capturedChannelCount, key: "channel_count")
-            }
+            logFailure(error, operation: "epg_fetch", ["channel_count": channels.count])
             throw error
         }
 
@@ -428,7 +408,7 @@ actor PlexLiveTVProvider: LiveTVProvider {
     /// AetherEngine deinterlaces (bwdif) after demuxing client-side — along
     /// with the odd subtitle tracks (DVB/teletext). HDHomeRun direct URLs pass
     /// through untouched (raw TS → same engine path).
-    func resolveStreamURL(for channel: UnifiedChannel) async -> URL? {
+    func resolveStreamURL(for channel: UnifiedChannel) async throws -> URL? {
         guard let base = buildStreamURL(for: channel) else { return nil }
 
         guard let baseComponents = URLComponents(url: base, resolvingAgainstBaseURL: false),
@@ -461,13 +441,19 @@ actor PlexLiveTVProvider: LiveTVProvider {
                 )
             }.value
         } catch {
-            SentryBridge.capture(error: error) { scope in
-                scope.setTag(value: "plex_livetv", key: "component")
-                scope.setExtra(value: channel.name, key: "channel_name")
-                scope.setExtra(value: dvrKey, key: "dvr_key")
-                scope.setExtra(value: "tune_failed", key: "operation")
+            // A tune the server answered with its own message is a tuner or
+            // antenna fault (RIVULET-6N), not ours.
+            if error is PlexLiveTuneError {
+                logFailure(error, operation: "tune", ["channel_name": channel.name, "dvr_key": dvrKey])
+            } else if !isCancellationError(error) {
+                SentryBridge.capture(error: error) { scope in
+                    scope.setTag(value: "plex_livetv", key: "component")
+                    scope.setExtra(value: channel.name, key: "channel_name")
+                    scope.setExtra(value: dvrKey, key: "dvr_key")
+                    scope.setExtra(value: "tune_failed", key: "operation")
+                }
             }
-            return nil
+            throw error
         }
 
         let transcodeSessionId = UUID().uuidString
@@ -569,6 +555,17 @@ actor PlexLiveTVProvider: LiveTVProvider {
     }
 
     // MARK: - Private Methods
+
+    /// Lineup/guide fetch failures are the user's server, not Rivulet: a log, not an error.
+    private func logFailure(_ error: Error, operation: String, _ extra: [String: Any] = [:]) {
+        guard !isCancellationError(error) else { return }
+        var attributes = extra
+        attributes["component"] = "plex_livetv"
+        attributes["operation"] = operation
+        attributes["host"] = URL(string: serverURL)?.host ?? "unknown"
+        attributes["error"] = String(describing: error)
+        SentryBridge.log(.warn, "Plex Live TV \(operation) failed", attributes: attributes)
+    }
 
     private func filterEPG(
         _ epg: [String: [UnifiedProgram]],

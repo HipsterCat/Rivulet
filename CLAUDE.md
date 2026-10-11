@@ -35,7 +35,7 @@ The video player is **AetherPlayer** — an adapter around AetherEngine (FFmpeg 
 - **Language**: Swift 6
 - **UI Framework**: UIKit for the primary surfaces (see above); SwiftUI for the rest
 - **Video Player**: AetherPlayer for VOD and Live TV; AVPlayer only for the `hls` route (server transcode, primary-when-no-direct-URL or Aether fallback). See `Docs/RIVULET_PLAYER.md`.
-- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (7.7.0). **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
+- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (7.25.3). **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
 - **Design Guide**: See `Docs/DESIGN_GUIDE.md` for UI/UX patterns
 - **Repo is public**: keep commit messages short and plain; no internal detail.
 
@@ -79,8 +79,9 @@ Rivulet/                # The tvOS app — everything below.
 │   │   ├── Subtitles/  # SubtitleModel (cue store; publishes the active set)
 │   │   ├── UIKit/      # CaptionOverlayView (the only caption renderer),
 │   │   │               #   PlayerRailView, PlayerRailPanelView, PlayerProgressBarView,
-│   │   │               #   PlayerUpNextPanelView, UpNextRowState, pills (canonical player chrome),
-│   │   │               #   Insights* panels (in-player cast/trivia; backed by Services/Insights + TMDB)
+│   │   │               #   PlayerInfoPaneViews (AVKit info pane: Info card, card rows), UpNextRowState,
+│   │   │               #   pills (canonical player chrome, cloned from AVKit; DEBUG AVKitScrubProbe measures it),
+│   │   │               #   Insights* views (in-player cast/trivia pane; backed by Services/Insights + TMDB)
 │   │   └── PostVideo/  # Post-playback summary overlays
 │   ├── Media/          # PreviewContext, HeroBackdropSupport, SharedMediaComponents,
 │   │                   #   FocusScrollMotion
@@ -92,7 +93,7 @@ Rivulet/                # The tvOS app — everything below.
 │   │                   #   MusicPlaylistView, MusicLyricsView, MusicVisualizerView
 │   │   └── Components/ # MusicProgressBar, MusicPosterCard, MusicShelfRow
 │   ├── Discover/       # DiscoverViewModel (SwiftUI Discover* views removed; UIKit home renders Discover)
-│   ├── LiveTV/         # EPGGuideView + GuideLayoutView + LiveGuideInfoCardView (56-style guide),
+│   ├── LiveTV/         # EPGGuideView + GuideLayoutView (56-style guide), LiveChannelsPaneView,
 │   │                   #   LiveTVAetherPlayerViewController (UIKit live rail), LiveTVContainerView,
 │   │                   #   MultiStreamViewModel; UIKit/: LiveBrowseViewController ("What's On"),
 │   │                   #   LiveMultiviewViewController, LiveCardCell, LiveMiniPlayerView
@@ -264,9 +265,10 @@ focusless AND single-transport, or when a needed hand-off is press-only.
   is correct there (engine acts first, declined presses bubble); the gated
   swipes are its touch-remote twin. The gate must claim exactly the moves
   the engine cannot perform — reuse the press override's own predicates
-  (`canEscapeUpward`, `containsFocus`, would-a-step-move). Adopters:
-  `InsightsPanelContainerView`, `PlayerInfoTabsView`, `InfoScrollView`
-  (escape to pills), `InsightsActorView` (bio steps).
+  (`canEscapeUpward`, `containsFocus`, would-a-step-move). Adopters: the
+  Live TV guide (`EPGGuideView`) and the player's content anchor. The
+  player's info panes don't need it: a `UIFocusGuide` between the pills and
+  the pane carries Up and Down.
 - **Do not migrate an already dual-transport surface onto the binding.** It
   changes nothing at runtime and splits a tuned interaction across two
   mechanisms. Settings reorder (grab-gated press taps + swipes) stays
@@ -287,6 +289,12 @@ focusless AND single-transport, or when a needed hand-off is press-only.
   next press took the collapse branch and worked: **every other Menu press
   did nothing at all.** `PlexHomeViewController.handleMenuBack` had the check
   from the start, which is why only the shell absorbed the press.
+- **A press a presented VC declines reaches its PRESENTER's `pressesBegan`.**
+  The presented VC's next responder is the presenter, so a VC that overrides
+  `pressesBegan` and presents anything must open with
+  `guard presentedViewController == nil else { super.pressesBegan(...); return }`
+  and gate its swipe recognizers the same way. Without it, Down on the show
+  page's Watched alert also scrolled `PreviewCarouselViewController` behind it.
 - **The VOD player's content state has ONE press owner.**
   `PlayerContainerViewController`'s `pressesBegan`/`Ended` ("Content-state
   presses") handle Left/Right/Up/Down/Select whenever no control holds focus,
@@ -365,6 +373,28 @@ Key components:
   Do not add a third view, and do not mount it through a `UIHostingController`: that
   applies the tvOS title-safe inset to the content, so every caption margin is
   measured against the wrong box.
+- **ASS/SSA renders through libass**, inside `CaptionOverlayView` as `ASSOverlayView`
+  (one caption renderer, now with a libass layer). VOD loads with
+  `preserveASSMarkup: true`, so an ASS track's cues arrive as raw event lines
+  (`Body.assEvents`). `AetherPlayer` publishes `ASSTrackSource` (header plus the
+  file's `fontAttachments`) and `sourceTime(atHostTime:)`, the frame-accurate
+  clock the display link renders against. libass comes from our own
+  `l984-451/LibassBuild` (one static xcframework, pinned `exactVersion`); do not
+  swap in swift-ass-renderer, AssKit or mpvkit binaries.
+  - **Video Override decides the path.** All three `allowsContent*` true (the
+    default): libass. Any pinned: plain captions in the system style, keeping
+    `\an`/`\pos`, dropping drawings. libass's selective style override is NOT a
+    substitute: it never touches inline tags and skips positioned events.
+  - **libass's ReadOrder dedupe is off** (`ass_set_check_readorder(track, 0)`):
+    real files hardcode ReadOrder 0. `ASSOverlayView` dedupes on
+    start, duration and line instead.
+  - **Rail and Height stepper lift dialogue through `ass_set_line_position`**,
+    which libass applies to non-positioned events only.
+  - **Bumping libass**: run LibassBuild's `build.sh`, tag `<libass>-<rev>` (pinned
+    `0.17.5-2` today) and never move a published tag, because SwiftPM records each
+    tag's revision and refuses one that changes. The module map stays in
+    `Headers/Libass/`: at the `Headers` root it collides with LibDovi's in the
+    shared `include/` directory.
 - **The `hls` route has no app-side captions at all.** `SubtitleManager`,
   `SubtitleClockSyncController` and the SwiftUI `SubtitleOverlayView` were RPlayer's
   sidecar pipeline; `390ebec` removed RPlayer's VOD branches and took the last caller
@@ -638,6 +668,8 @@ Most tests live in `RivuletTests/Unit/` (mirrors `Rivulet/` roughly by feature �
 
 **Building requires full Xcode** (not just Command Line Tools) since it's tvOS. There is still no CI test run — run tests locally. CI is split across two systems: `codemagic.yaml` archives and publishes to TestFlight on tag push (`v*` → tvOS, `ios-v*` → iOS), and `.github/workflows/` holds five workflows — the SwiftLint gate, two Claude review/mention bots, and two build checks that exist to guard the platform boundary: `build-ios.yml` compiles the `Rivulet iOS` scheme on PRs/pushes touching `RivuletCore/**`, `RivuletiOS/**`, or the project file (otherwise nothing compiles iOS between release tags), and `build-tvos-core.yml` compiles the tvOS scheme when shared code changes from the iOS side. Both are build-only; signing and archives stay on Codemagic.
 
+**One Xcode everywhere: `codemagic.yaml`'s `xcode:` pin.** Both build checks read it, and it must equal the Xcode you build with locally (27.0 today). When you upgrade local Xcode, bump the pin in the same commit (and the checks' `runs-on` image on a major). The type checker is the reason: a newer compiler accepts expressions an older one gives up on ("unable to type-check this expression in reasonable time"), so a mismatch passes every local build and breaks CI after the push. It happened twice before the pin (`e602163`, the favorites sort in `LiveTVDataStore`).
+
 **The Simulator does not fully mimic Apple TV**, especially for focus-engine behavior. Treat Simulator-only verification of tvOS focus/remote-input changes as provisional; say so rather than declaring it fixed.
 
 **`Docs/` is gitignored** (untracked on purpose, `c89b52d`), though some files under it are force-added and do ship — the `superpowers/` plans and specs, and `AETHER_ENGINE_STARTUP_NOTES.md`. What is *not* in the repo is `Docs/RIVULET_PLAYER.md` and `Docs/DESIGN_GUIDE.md`, both referenced throughout this file; they live only on the maintainer's machine. The `aether-update` and `rivulet-tvos-uikit` skills referenced above are also absent — `.claude/` is gitignored with nothing force-added. If a referenced doc or skill is missing in your environment, say so and proceed carefully rather than guessing its contents.
@@ -651,13 +683,14 @@ Most tests live in `RivuletTests/Unit/` (mirrors `Rivulet/` roughly by feature �
 | Player container (UIKit chrome) | `Views/Player/PlayerContainerViewController.swift` |
 | Player rail UI (UIKit) | `Views/Player/UIKit/PlayerRailView.swift` |
 | Rail panel (UIKit) | `Views/Player/UIKit/PlayerRailPanelView.swift` |
-| Up Next panel (UIKit) | `Views/Player/UIKit/PlayerUpNextPanelView.swift` |
+| Info pane content (UIKit) | `Views/Player/UIKit/PlayerInfoPaneViews.swift` |
 | Player (AetherEngine adapter) | `Services/Plex/Playback/AetherPlayer.swift` |
 | Live TV multiview (tiles bind the engine surface) | `Views/LiveTV/UIKit/LiveMultiviewViewController.swift` |
 | Routing decisions | `Services/Plex/Playback/Pipeline/ContentRouter.swift` |
 | Aether render surface | `Views/Player/Aether/AetherVideoSurfaceView.swift` |
 
 | Caption renderer | `Views/Player/UIKit/CaptionOverlayView.swift` |
+| libass layer (ASS/SSA) | `Views/Player/UIKit/ASSOverlayView.swift` |
 | Focus memory | `Services/Focus/FocusMemory.swift` |
 | Watch progress rule | `Models/Media/WatchProgressPolicy.swift` |
 | Plex star rating / favorite | `Models/Plex/PlexUserRating.swift` |

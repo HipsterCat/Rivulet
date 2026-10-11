@@ -37,8 +37,16 @@ struct LiveCardItem: Hashable {
                      program: program, recording: nil)
     }
 
-    static func upcoming(_ program: UnifiedProgram, on channel: UnifiedChannel) -> LiveCardItem {
-        LiveCardItem(id: "soon|\(program.id)", kind: .upcoming, channel: channel,
+    /// An upcoming card's start: the time alone today, with the weekday after.
+    static func startLabel(_ program: UnifiedProgram, now: Date = Date(), calendar: Calendar = .current) -> String {
+        let start = program.eventStart
+        return calendar.isDate(start, inSameDayAs: now)
+            ? start.formatted(.dateTime.hour().minute())
+            : start.formatted(.dateTime.weekday().hour().minute())
+    }
+
+    static func upcoming(_ program: UnifiedProgram, on channel: UnifiedChannel, section: String = "soon") -> LiveCardItem {
+        LiveCardItem(id: "\(section)|\(program.id)", kind: .upcoming, channel: channel,
                      program: program, recording: nil)
     }
 
@@ -91,6 +99,7 @@ final class LiveCardCell: UICollectionViewCell {
     private var artTask: Task<Void, Never>?
     private var logoTask: Task<Void, Never>?
     private var fieldTask: Task<Void, Never>?
+    private var measureTask: Task<Void, Never>?
     private var artURL: URL?
     private var logoURL: URL?
     private var fieldURL: URL?
@@ -224,9 +233,11 @@ final class LiveCardCell: UICollectionViewCell {
         artTask?.cancel()
         logoTask?.cancel()
         fieldTask?.cancel()
+        measureTask?.cancel()
         artTask = nil
         logoTask = nil
         fieldTask = nil
+        measureTask = nil
         artURL = nil
         logoURL = nil
         fieldURL = nil
@@ -243,20 +254,21 @@ final class LiveCardCell: UICollectionViewCell {
         // Text
         switch item.kind {
         case .channel:
-            titleLabel.text = program?.title ?? channel?.name ?? "Live"
+            titleLabel.text = program?.displayTitle ?? channel?.name ?? "Live"
             detailLabel.text = [channel?.channelNumber.map(String.init), channel?.name]
                 .compactMap { $0 }
                 .joined(separator: " · ")
-            // On now and set to record means it is recording.
-            setPill(item.setToRecord ? "● REC" : "▶ LIVE", color: .systemRed)
+            // On now and set to record means it is recording. LIVE is for
+            // live airings only, never replays.
+            setPill(item.setToRecord ? "● REC" : program?.isLiveAiring == true ? "▶ LIVE" : nil, color: .systemRed)
         case .upcoming:
-            titleLabel.text = program?.title ?? "Upcoming"
+            titleLabel.text = program?.displayTitle ?? "Upcoming"
             detailLabel.text = channel?.name
-            setPill(program.map { $0.startTime.formatted(Self.timeFormat) }, color: UIColor.white.withAlphaComponent(0.25),
+            setPill(program.map { LiveCardItem.startLabel($0, now: now) }, color: UIColor.white.withAlphaComponent(0.25),
                     recordDot: item.setToRecord)
         case .recording:
             let recording = item.recording
-            titleLabel.text = recording?.title ?? "Recording"
+            titleLabel.text = recording.map { UnifiedProgram.displayTitle($0.title) } ?? "Recording"
             detailLabel.text = [recording?.subtitle, recording?.channelName]
                 .compactMap { $0 }
                 .joined(separator: " · ")
@@ -278,15 +290,29 @@ final class LiveCardCell: UICollectionViewCell {
         progressFraction = CGFloat(min(max(progress ?? 0, 0), 1))
         setNeedsLayout()
 
-        // Art: the programme's own 16:9 image (its icon counts once the
-        // classifier has seen it is wide), else the channel's logo over a
-        // blurred field of the programme's other art, or of the logo itself.
-        let wideIcon = program?.iconURL.flatMap { EPGImageClassifier.shared.isLandscape($0) ? $0 : nil }
-        let art = program?.landscapeURL ?? wideIcon ?? item.recording?.posterURL
+        // Art: the programme's own 16:9 image (its icon counts once measured
+        // wide), else the channel's logo over a blurred field of the
+        // programme's other art, or of the logo itself.
+        let art = EPGImageClassifier.shared.wideArt(for: program) ?? item.recording?.posterURL
         let logo = channel?.logoURL
         load(art: art)
         load(logo: logo, asFallback: art == nil)
         load(field: art == nil ? (program?.posterURL ?? program?.iconURL ?? logo) : nil)
+        measure(art == nil ? program?.iconURL : nil, then: item)
+    }
+
+    /// Measures an icon the EPG gave no size for, and redraws the card once it
+    /// proves wide (Dispatcharr's feed declares no icon sizes).
+    private func measure(_ icon: URL?, then item: LiveCardItem) {
+        measureTask?.cancel()
+        guard let icon, EPGImageClassifier.shared.kind(for: icon) == nil else { return }
+        measureTask = Task { [weak self] in
+            let kind = await EPGImageClassifier.shared.classify(icon) {
+                await ImageCacheManager.shared.image(for: icon, quality: .thumb)?.size
+            }
+            guard let self, !Task.isCancelled, kind == .landscape else { return }
+            self.configure(item)
+        }
     }
 
     /// `recordDot` puts the guide's red record dot before `text`: scheduled

@@ -37,7 +37,8 @@ final class LiveBrowseViewController: UIViewController {
     private var miniSession: LiveTVSessionHandoff?
 
     // Shelves
-    private struct Shelf {
+    /// Also multiview's Add More rows (`LiveMultiviewViewController`).
+    struct Shelf {
         let id: String
         let title: String
         let items: [LiveCardItem]
@@ -59,6 +60,7 @@ final class LiveBrowseViewController: UIViewController {
     private var cancellables = Set<AnyCancellable>()
     private var minuteTimer: Timer?
     private var backdropTask: Task<Void, Never>?
+    private var measureTask: Task<Void, Never>?
     private var backdropURL: URL?
     /// Something full screen is over the page (the player, multiview, the
     /// recordings list). Leaving for one of those is not leaving Live TV, so
@@ -255,23 +257,24 @@ final class LiveBrowseViewController: UIViewController {
         var detail: [String] = []
         switch item.kind {
         case .channel:
-            eyebrowLabel.text = "LIVE"
-            eyebrowLabel.textColor = .systemRed
-            titleLabel.text = program?.title ?? channel?.name
+            let isLive = program?.isLiveAiring == true
+            eyebrowLabel.text = isLive ? "LIVE" : "ON NOW"
+            eyebrowLabel.textColor = isLive ? .systemRed : UIColor.white.withAlphaComponent(0.8)
+            titleLabel.text = program?.displayTitle ?? channel?.name
             if let program, !program.id.contains(":placeholder:") {
                 detail.append("\(program.startTime.formatted(Self.timeFormat)) – \(program.endTime.formatted(Self.timeFormat))")
             }
             if !channelLine.isEmpty { detail.append(channelLine) }
         case .upcoming:
-            eyebrowLabel.text = program.map { "STARTS \($0.startTime.formatted(Self.timeFormat))" }
+            eyebrowLabel.text = program.map { "STARTS \(LiveCardItem.startLabel($0).uppercased())" }
             eyebrowLabel.textColor = UIColor.white.withAlphaComponent(0.8)
-            titleLabel.text = program?.title
+            titleLabel.text = program?.displayTitle
             if !channelLine.isEmpty { detail.append(channelLine) }
         case .recording:
             let recording = item.recording
             eyebrowLabel.text = recording?.status == .recording ? "RECORDING" : "SCHEDULED"
             eyebrowLabel.textColor = recording?.status == .recording ? .systemRed : UIColor.white.withAlphaComponent(0.8)
-            titleLabel.text = recording?.title
+            titleLabel.text = recording.map { UnifiedProgram.displayTitle($0.title) }
             if let recording {
                 detail.append("\(recording.startTime.formatted(.dateTime.weekday().hour().minute())) – \(recording.endTime.formatted(Self.timeFormat))")
             }
@@ -286,8 +289,19 @@ final class LiveBrowseViewController: UIViewController {
         }
         summaryLabel.text = summary
 
-        let wideIcon = program?.iconURL.flatMap { EPGImageClassifier.shared.isLandscape($0) ? $0 : nil }
-        setBackdrop(program?.landscapeURL ?? wideIcon ?? item.recording?.posterURL)
+        let art = EPGImageClassifier.shared.wideArt(for: program) ?? item.recording?.posterURL
+        setBackdrop(art)
+        measureTask?.cancel()
+        // An icon with no declared size shows once it measures wide.
+        guard art == nil, let icon = program?.iconURL,
+              EPGImageClassifier.shared.kind(for: icon) == nil else { return }
+        measureTask = Task { [weak self] in
+            let kind = await EPGImageClassifier.shared.classify(icon) {
+                await ImageCacheManager.shared.image(for: icon)?.size
+            }
+            guard let self, !Task.isCancelled, kind == .landscape else { return }
+            self.setBackdrop(icon)
+        }
     }
 
     /// Crossfade to `url`, after focus has settled so a fast sweep along a
@@ -414,21 +428,29 @@ final class LiveBrowseViewController: UIViewController {
         }
     }
 
-    private func channelsInScope() -> [UnifiedChannel] {
-        let channels = LiveTVDataStore.shared.channels
-        guard let sourceIdFilter else { return channels }
-        return channels.filter { $0.sourceId == sourceIdFilter }
-    }
-
-    private func buildShelves(now: Date = Date()) -> [Shelf] {
+    /// The What's On rows for a source (nil: every source). Static so
+    /// multiview's Add More offers the same rows.
+    static func buildShelves(sourceIdFilter: String?, now: Date = Date()) -> [Shelf] {
         let store = LiveTVDataStore.shared
-        let channels = channelsInScope()
-        let channelsById = Dictionary(channels.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let all = sourceIdFilter.map { id in store.channels.filter { $0.sourceId == id } } ?? store.channels
+        // An empty event slot has nothing to show; Favorites and Recently
+        // Watched still list it, since the viewer chose it.
+        let channels = all.filter { store.getCurrentProgram(for: $0)?.isEmptySlot != true }
+        let channelsById = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var shelves: [Shelf] = []
 
         func onNow(_ list: [UnifiedChannel], section: String) -> [LiveCardItem] {
-            list.map { .channel($0, program: store.getCurrentProgram(for: $0), section: section) }
+            list.map { channel in
+                let program = store.getCurrentProgram(for: channel)
+                // A pregame block stands in for the game after it: the card is the game.
+                guard let block = program, block.isPregameBlock else {
+                    return .channel(channel, program: program, section: section)
+                }
+                return .upcoming(store.getNextProgram(for: channel) ?? block, on: channel, section: section)
+            }
         }
+        // Channels showing something now, not holding a slot for a later game.
+        let airing = channels.filter { store.getCurrentProgram(for: $0)?.isPregameBlock != true }
 
         // Channels played lately, newest first, to go straight back to one.
         let recent = store.recentChannelIds.compactMap { channelsById[$0] }
@@ -440,7 +462,7 @@ final class LiveBrowseViewController: UIViewController {
         // Recently Watched already covers going back, so its channels are left out.
         if store.suggestionsEnabled {
             let recentIds = Set(store.recentChannelIds)
-            let candidates = channels.filter { !recentIds.contains($0.id) }.map { channel in
+            let candidates = airing.filter { !recentIds.contains($0.id) }.map { channel in
                 let program = store.getCurrentProgram(for: channel)
                 return (channel: channel, program: program,
                         genre: LiveGenre.of(channel, airing: program, guide: store.epg[channel.id] ?? []))
@@ -464,37 +486,44 @@ final class LiveBrowseViewController: UIViewController {
             shelves.append(Shelf(id: "recordings", title: "Recordings", items: recordings))
         }
 
-        let favourites = store.favorites(in: channels)
+        let favourites = store.favorites(in: all)
         if !favourites.isEmpty {
             shelves.append(Shelf(id: "favorites", title: "Favorites", items: onNow(favourites, section: "favorites")))
         }
 
-        if !channels.isEmpty {
-            shelves.append(Shelf(id: "now", title: "On Now", items: onNow(Array(channels.prefix(150)), section: "now")))
+        if !airing.isEmpty {
+            shelves.append(Shelf(id: "now", title: "On Now", items: onNow(Array(airing.prefix(150)), section: "now")))
         }
 
         // The next programme on each channel that starts within the next
-        // ninety minutes.
+        // ninety minutes: what this viewer watches when each one starts
+        // first, then soonest first.
         let horizon = now.addingTimeInterval(90 * 60)
-        let soon = channels
-            .compactMap { channel -> LiveCardItem? in
-                guard let next = store.getNextProgram(for: channel),
-                      !next.id.contains(":placeholder:"),
-                      next.startTime > now, next.startTime <= horizon else { return nil }
-                return .upcoming(next, on: channel)
-            }
-            .sorted { ($0.program?.startTime ?? now) < ($1.program?.startTime ?? now) }
+        let upcoming = channels.compactMap { channel -> LiveSuggestions.Candidate? in
+            guard let next = store.getNextProgram(for: channel),
+                  !next.id.contains(":placeholder:"), !next.isEmptySlot,
+                  next.startTime > now, next.startTime <= horizon else { return nil }
+            return (channel, next, LiveGenre.of(channel, airing: next, guide: store.epg[channel.id] ?? []))
+        }
+        let likeness = store.suggestionsEnabled
+            ? LiveSuggestions.scores(upcoming.map { ($0, $0.program?.startTime ?? now) },
+                                     history: store.viewings, now: now)
+            : upcoming.map { _ in 0 }
+        let soon = zip(upcoming, likeness.map { $0 >= LiveSuggestions.threshold ? $0 : 0 })
+            .sorted { $0.1 != $1.1 ? $0.1 > $1.1
+                : ($0.0.program?.startTime ?? now) < ($1.0.program?.startTime ?? now) }
             .prefix(40)
+            .compactMap { candidate, _ in candidate.program.map { LiveCardItem.upcoming($0, on: candidate.channel) } }
         if !soon.isEmpty {
-            shelves.append(Shelf(id: "soon", title: "Starting Soon", items: Array(soon)))
+            shelves.append(Shelf(id: "soon", title: "Starting Soon", items: soon))
         }
 
-        // A shelf per genre, when the lineup spans more than one. A channel's
-        // usual genre, not what is on this minute: rows that regrouped at
-        // every programme boundary moved under focus. A genre with only a
-        // channel or two gets no row of its own.
-        let byGenre = Dictionary(grouping: channels) { channel in
-            LiveGenre.of(channel, airing: nil, guide: store.epg[channel.id] ?? [])
+        // A shelf per genre, when the lineup spans more than one, by what each
+        // channel is showing now. Cards move rows at programme boundaries; a
+        // local station that usually airs sports is not sports during church.
+        // A genre with only a channel or two gets no row of its own.
+        let byGenre = Dictionary(grouping: airing) { channel in
+            LiveGenre.of(channel, airing: store.getCurrentProgram(for: channel), guide: store.epg[channel.id] ?? [])
         }
         let genres = LiveGenre.allCases.filter { (byGenre[$0] ?? []).count >= 3 }
         if genres.count > 1 {
@@ -523,7 +552,7 @@ final class LiveBrowseViewController: UIViewController {
 
     private func rebuildShelves() {
         guard dataSource != nil else { return }
-        let built = buildShelves().filter { !$0.items.isEmpty }
+        let built = Self.buildShelves(sourceIdFilter: sourceIdFilter).filter { !$0.items.isEmpty }
         shelves = Dictionary(built.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let existing = Set(dataSource.snapshot().itemIdentifiers)
         var snapshot = NSDiffableDataSourceSnapshot<String, String>()
@@ -612,23 +641,24 @@ final class LiveBrowseViewController: UIViewController {
         presentPlayer(LiveTVAetherPlayerViewController(channel: channel, adopting: adopting))
     }
 
-    private func play(adopting session: LiveTVSessionHandoff) {
+    /// `animated: false` when multiview has just grown the tile full screen.
+    private func play(adopting session: LiveTVSessionHandoff, animated: Bool = true) {
         stopMini()
         presentPlayer(LiveTVAetherPlayerViewController(channel: session.channel,
-                                                       adopting: session))
+                                                       adopting: session), animated: animated)
     }
 
-    private func presentPlayer(_ player: LiveTVAetherPlayerViewController) {
+    private func presentPlayer(_ player: LiveTVAetherPlayerViewController, animated: Bool = true) {
         player.modalPresentationStyle = .fullScreen
         let keepPlaying = UserDefaults.standard.object(forKey: "liveTVKeepPlayingInGuide") as? Bool ?? true
         if keepPlaying {
             player.onMinimize = { [weak self] session in self?.showMini(session) }
         }
         player.onOpenMultiview = { [weak self] session in
-            self?.presentMultiview(adopting: session, adding: nil)
+            self?.presentMultiview(adopting: session, adding: nil, fromPlayer: true)
         }
         isCoveredByModal = true
-        present(player, animated: true)
+        present(player, animated: animated)
     }
 
     /// Multiview with the corner channel (when there is one) and `channel`.
@@ -636,14 +666,18 @@ final class LiveBrowseViewController: UIViewController {
         presentMultiview(adopting: takeMini(), adding: channel)
     }
 
-    private func presentMultiview(adopting session: LiveTVSessionHandoff?, adding channel: UnifiedChannel?) {
+    /// `fromPlayer`: the full-screen player just closed without animation, and
+    /// multiview takes over its picture (see `entersFromFullScreen`).
+    private func presentMultiview(adopting session: LiveTVSessionHandoff?, adding channel: UnifiedChannel?,
+                                  fromPlayer: Bool = false) {
         let multiview = LiveMultiviewViewController(adopting: session, adding: channel,
                                                     sourceIdFilter: sourceIdFilter)
+        multiview.entersFromFullScreen = fromPlayer
         multiview.onWatchFullScreen = { [weak self] session in
-            self?.play(adopting: session)
+            self?.play(adopting: session, animated: false)
         }
         isCoveredByModal = true
-        present(multiview, animated: true)
+        present(multiview, animated: !fromPlayer)
     }
 
     private func presentRecordings() {

@@ -52,6 +52,20 @@ final class AetherPlayer: PlayerProtocol {
     /// nameable AetherSubtitleCue (carries text AND bitmap bodies). Converted
     /// on the main queue in wireUpPublishers so the host overlay binds directly.
     @Published private(set) var subtitleCues: [AetherSubtitleCue] = []
+    /// The active subtitle track's ASS script, or nil when that track is not
+    /// ASS/SSA or its sidecar header has not decoded yet. The caption overlay
+    /// renders the track's raw event lines through libass against it.
+    @Published private(set) var assTrack: ASSTrackSource?
+
+    /// The loaded file's embedded fonts (MKV attachments). The engine fills
+    /// these once per load and does not publish them, so they are read after
+    /// `engine.load` returns.
+    private var assFonts: [LibassRenderer.Font] = []
+
+    /// Scrub stills for the loaded item, made on the first scrub. It opens its
+    /// own demuxer, so it is shut down on every load and on stop and never
+    /// outlives its item.
+    private var frameExtractor: FrameExtractor?
 
     /// Mirrors engine.$isSubtitleActive. True when any subtitle track
     /// (embedded or sidecar) is selected and the engine has cue data.
@@ -140,13 +154,6 @@ final class AetherPlayer: PlayerProtocol {
     /// background timestamp so the teardown-drain wait still applies.
     private var pendingReloadSince: Date?
 
-    /// AetherEngine's own version string. SwiftPM resolves a package to a
-    /// revision rather than a tag, so nothing else in the app can name the
-    /// engine release at runtime: `Package.resolved` is a build artifact and
-    /// the licenses screen carries a hand-maintained copy. Settings → About
-    /// prints this one, which the engine states about itself.
-    static var engineVersion: String { AetherEngine.version }
-
     /// Warm the opening bytes of a source the engine is not playing yet, so a
     /// later `load()` of that URL skips the cold open's two-to-three sequential
     /// round trips (AetherEngine 7.7.0).
@@ -224,6 +231,11 @@ final class AetherPlayer: PlayerProtocol {
         engine.$subtitleCues
             .receive(on: DispatchQueue.main)
             .sink { [weak self] cues in
+                // Under preserveASSMarkup an ASS/SSA track's cues are raw
+                // event lines (the flag touches no other codec). Read the
+                // active track now, after the main-queue hop, so a track
+                // switch that landed first is already visible.
+                let rawASS = self?.activeASSTrackInfo() != nil
                 // Convert here: each cue's type is inferred as
                 // AetherEngine.SubtitleCue (it cannot be named explicitly),
                 // and the body cases are pattern-matched without naming them.
@@ -231,7 +243,7 @@ final class AetherPlayer: PlayerProtocol {
                     let body: AetherSubtitleCue.Body
                     switch cue.body {
                     case .text(let string):
-                        body = .text(string)
+                        body = rawASS ? .assEvents(string) : .text(string)
                     case .richText(let runs):
                         // Styled runs. Since engine 5.26.0 this is not just
                         // colour: bold / italic / underline / strikethrough,
@@ -298,7 +310,15 @@ final class AetherPlayer: PlayerProtocol {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] id in
                 self?.activeSubtitleTrackId = id
+                self?.refreshASSTrack()
             }
+            .store(in: &cancellables)
+
+        // A sidecar's header arrives when its decode finishes, after the
+        // track is already active.
+        engine.$sidecarASSHeader
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshASSTrack() }
             .store(in: &cancellables)
 
         engine.$activeAudioTrackIndex
@@ -325,7 +345,13 @@ final class AetherPlayer: PlayerProtocol {
         engine.$audioTracks
             .receive(on: DispatchQueue.main)
             .sink { [weak self] tracks in
-                self?.audioTracks = tracks.map(Self.translateTrack)
+                guard let self else { return }
+                // Since 7.22.0 the remote-HLS bypass lists AVPlayer's audio
+                // tracks for information only, and the engine ignores
+                // selectAudioTrack there. Publish none, so the Live TV audio
+                // menu keeps switching through AVPlayer's media selection.
+                self.audioTracks = self.engine.videoRoute == .remoteBypass
+                    ? [] : tracks.map(Self.translateTrack)
             }
             .store(in: &cancellables)
 
@@ -744,8 +770,51 @@ final class AetherPlayer: PlayerProtocol {
     /// a session moves between surfaces.
     private(set) var isOnNativeLiveRoute = false
 
+    /// The engine's decode path and source codec for the current load, as
+    /// plain strings for telemetry.
+    var videoRouteName: String { engine.videoRoute.rawValue }
+    var sourceVideoCodecName: String? { engine.sourceVideoCodecName }
+
+    /// The start of a fullscreen live join, measured for issue #319. See
+    /// LiveAVTelemetry.
+    private var avCapture: LiveAVCapture?
+    private var avCaptureTask: Task<Void, Never>?
+    /// Which capture holds the engine's global log handler.
+    private static var engineLogCapture: LiveAVCapture?
+
+    private func startAVCapture(url: URL) {
+        let capture = LiveAVCapture(url: url)
+        avCapture = capture
+        Self.engineLogCapture = capture
+        // @Sendable, so neither closure is inferred main-actor: the engine
+        // calls both on its own threads.
+        EngineLog.handler = { @Sendable line in capture.ingest(line: line) }
+        engine.setSoftwareVideoFrameTimeObserver { @Sendable time in
+            capture.frame(pts: time.presentation.seconds)
+        }
+    }
+
+    /// Report what the capture has, if the join got as far as sound and a
+    /// picture, and stop listening.
+    func finishAVCapture() {
+        avCaptureTask?.cancel()
+        avCaptureTask = nil
+        guard let capture = avCapture else { return }
+        avCapture = nil
+        engine.setSoftwareVideoFrameTimeObserver(nil)
+        if Self.engineLogCapture === capture {
+            // ponytail: one global handler; a second fullscreen join replaces it.
+            EngineLog.handler = nil
+            Self.engineLogCapture = nil
+        }
+        if let sample = capture.sample() { LiveAVTelemetry.report(sample) }
+    }
+
     func loadLive(url: URL, headers: [String: String]?, forceEngineDemux: Bool = false,
                   role: LiveLoadRole = .fullscreen) async throws {
+        finishAVCapture()
+        dropFrameExtractor()
+        if role == .fullscreen { startAVCapture(url: url) }
         let isHLS = Self.liveRoute(for: url, forceEngineDemux: forceEngineDemux) == .nativeHLS
         isOnNativeLiveRoute = isHLS
         // Forced onto the engine demuxer AND the source is a playlist: the Plex
@@ -864,6 +933,15 @@ final class AetherPlayer: PlayerProtocol {
                 }
             } else {
                 try await engine.load(url: url, startPosition: nil, options: options)
+            }
+            if let capture = avCapture {
+                capture.setCodec(engine.sourceVideoCodecName)
+                // Long enough for the prime, the start, and the 5 s from the
+                // start that vlead_min skips, with ten seconds of it measured.
+                avCaptureTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(18))
+                    if !Task.isCancelled { self?.finishAVCapture() }
+                }
             }
             if joinsWirelessAudio && isOnSoftwareRoute {
                 // The software backend renders on a sample-buffer synchronizer
@@ -1009,6 +1087,10 @@ final class AetherPlayer: PlayerProtocol {
             panelIsInHDRMode: Self.panelIsInHDRMode(),
             audioBridgeMode: .lossless,
             isLive: isLive,
+            // ASS/SSA cues arrive as raw event lines for libass, with the header
+            // on TrackInfo.assHeader / sidecarASSHeader and fonts on
+            // fontAttachments. The flag touches no other codec.
+            preserveASSMarkup: true,
             preferredAudioLanguages: preferredAudioLanguages,
             preferredSubtitleLanguages: preferredSubtitleLanguages,
             externalSubtitles: externalSubtitles.map { sub in
@@ -1036,6 +1118,11 @@ final class AetherPlayer: PlayerProtocol {
         // against the old episode's picture rect until `presentationSize`
         // arrives.
         videoSize = .zero
+        // New file: the previous track's script and fonts describe nothing,
+        // even when the next episode repeats the same header and track id.
+        assFonts = []
+        assTrack = nil
+        dropFrameExtractor()
         userIntendsToPlay = true
         pendingReloadSince = nil
         do {
@@ -1050,6 +1137,55 @@ final class AetherPlayer: PlayerProtocol {
             errorSubject.send(pe)
             throw pe
         }
+        assFonts = engine.fontAttachments.map { LibassRenderer.Font(name: $0.filename, data: $0.data) }
+        // The track may have been published during the load with no fonts;
+        // republish so the renderer is built with them.
+        assTrack = nil
+        refreshASSTrack()
+    }
+
+    /// The engine's active subtitle track when it is ASS/SSA.
+    private func activeASSTrackInfo() -> TrackInfo? {
+        guard let index = engine.activeSubtitleTrackIndex,
+              let track = engine.subtitleTracks.first(where: { $0.id == index }),
+              ["ass", "ssa"].contains(track.codec.lowercased()) else { return nil }
+        return track
+    }
+
+    /// Publishes `assTrack` for the active track. A new instance whenever the
+    /// track id or header changes: two tracks from one release can share a
+    /// header, and each needs its own libass track.
+    ///
+    /// Relies on AetherEngine (re-checked at 7.25.3) clearing `subtitleCues` BEFORE it publishes
+    /// a new `activeSubtitleTrackIndex` (embedded select, sidecar select and
+    /// stop all do), so the overlay's new libass track never receives the old
+    /// track's lines. Re-check that ordering on every engine bump.
+    private func refreshASSTrack() {
+        guard let track = activeASSTrackInfo(),
+              let header = track.isExternal ? engine.sidecarASSHeader : track.assHeader else {
+            if assTrack != nil { assTrack = nil }
+            return
+        }
+        if let current = assTrack, current.trackId == track.id, current.header == header { return }
+        assTrack = ASSTrackSource(trackId: track.id, header: header, fonts: assFonts)
+    }
+
+    /// The cue-axis (source) time the video shows at `hostTime`, a
+    /// `CACurrentMediaTime()` / `CADisplayLink.targetTimestamp` reading, or
+    /// nil when no presentation timebase exists. `sourceTime` ticks at 10 Hz
+    /// (native) or 4 Hz (software); libass animation needs one reading per
+    /// display frame.
+    func sourceTime(atHostTime hostTime: CFTimeInterval) -> Double? {
+        let host = CMTime(seconds: hostTime, preferredTimescale: 1_000_000_000)
+        if let timebase = engine.softwarePresentationTimebase {
+            // The software path presents on the source axis already.
+            let t = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: timebase)
+            return t.isNumeric ? t.seconds : nil
+        }
+        guard let timebase = engine.currentAVPlayerItem?.timebase else { return nil }
+        let item = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: timebase)
+        guard item.isNumeric else { return nil }
+        return engine.presentationAxisMap.sourceSeconds(forItemSeconds: item.seconds)
     }
 
     /// Hand external metadata (title, artwork, description, genre) to the
@@ -1085,7 +1221,29 @@ final class AetherPlayer: PlayerProtocol {
         foregroundReloadTask?.cancel()
         pendingReloadSince = nil
         userIntendsToPlay = false
+        finishAVCapture()
+        dropFrameExtractor()
         engine.stop()
+    }
+
+    deinit {
+        if let extractor = frameExtractor { Task { await extractor.shutdown() } }
+    }
+
+    /// A low-res still of the loaded item at `seconds`, for the scrub bar.
+    /// Keyframe-snapped and cached by the engine, and it yields while playback
+    /// is starved. nil with no engine session (the hls route) or when the
+    /// source cannot open a second reader.
+    func scrubFrame(atSeconds seconds: TimeInterval, maxWidth: Int = 320) async -> CGImage? {
+        if frameExtractor == nil { frameExtractor = engine.makeFrameExtractor() }
+        guard let extractor = frameExtractor else { return nil }
+        return await extractor.thumbnail(at: seconds, maxWidth: maxWidth)
+    }
+
+    private func dropFrameExtractor() {
+        guard let extractor = frameExtractor else { return }
+        frameExtractor = nil
+        Task { await extractor.shutdown() }
     }
 
     // MARK: - Render surface
@@ -1199,6 +1357,13 @@ final class AetherPlayer: PlayerProtocol {
     /// remote-HLS bypass, or across a channel change.
     func liveThumbnail(atSessionSeconds sessionSeconds: Double, maxWidth: Int = 320) async -> CGImage? {
         await engine.liveScrubThumbnail(atSessionSeconds: sessionSeconds, maxWidth: maxWidth)
+    }
+
+    /// True once the current load has its first frame on screen (an audio-only
+    /// load: once ready). `.playing` is not that: the software path reports it
+    /// before a single frame is decoded (#323).
+    var hasPresented: AnyPublisher<Bool, Never> {
+        engine.$startupProgress.map { $0?.isComplete == true }.removeDuplicates().eraseToAnyPublisher()
     }
 
     /// Fires when the engine has given up on a live source (a transcode that

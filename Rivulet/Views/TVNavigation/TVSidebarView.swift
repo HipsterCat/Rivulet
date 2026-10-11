@@ -26,6 +26,8 @@ struct TVSidebarView: View {
     // @StateObject here, SwiftUI doesn't see hiddenLibraryKeys updates.
     @StateObject private var librarySettings = LibrarySettingsManager.shared
     @StateObject private var liveTVDataStore = LiveTVDataStore.shared
+    // Jellyfin libraries (sidebar section) and its account (welcome gate).
+    @StateObject private var jellyfinStore = JellyfinDataStore.shared
     @StateObject private var profileManager = PlexUserProfileManager.shared
     @StateObject private var nestedNavState = NestedNavigationState()
     @StateObject private var deepLinkHandler = DeepLinkHandler.shared
@@ -50,6 +52,11 @@ struct TVSidebarView: View {
 
     private var uiScale: CGFloat {
         (DisplaySize(rawValue: displaySizeRaw) ?? .normal).scale
+    }
+
+    /// Home's welcome overlay stands down for any signed-in server.
+    private var isSignedInToAnyServer: Bool {
+        authManager.hasCredentials || jellyfinStore.account != nil
     }
 
     private var profileName: String {
@@ -93,7 +100,9 @@ struct TVSidebarView: View {
             showWatchlist: showWatchlistTab,
             liveTVAbove: liveTVAboveLibraries,
             serverName: authManager.savedServerName,
-            profileName: profileName)
+            profileName: profileName,
+            jellyfinServerName: jellyfinStore.account?.serverName,
+            jellyfinLibraries: jellyfinStore.visibleLibraries)
     }
 
     private var tabSelection: Binding<SidebarTab> {
@@ -117,11 +126,11 @@ struct TVSidebarView: View {
         )
     }
 
-    var body: some View {
-        // The UIKit shell replaces the TabView(.sidebarAdaptable). Menu-to-Home
-        // (issue #192), the sidebar focus guard, and the focus watchdog were
-        // all workarounds for the system sidebar and live on inside the shell
-        // (or died with the TabView).
+    /// The UIKit shell replaces the TabView(.sidebarAdaptable). Menu-to-Home
+    /// (issue #192), the sidebar focus guard, and the focus watchdog were
+    /// all workarounds for the system sidebar and live on inside the shell
+    /// (or died with the TabView). Its modifiers keep the selected tab valid.
+    private var shell: some View {
         RootShellHost(
             selection: tabSelection,
             interactionBlocked: nestedNavState.isNested || nestedNavState.isSettingsSubPage,
@@ -154,11 +163,23 @@ struct TVSidebarView: View {
                 selectedTab = .home
             }
         }
+        .onChange(of: jellyfinStore.visibleLibraries) { _, libraries in
+            if case .providerLibrary(_, let libraryID) = selectedTab,
+               !libraries.contains(where: { $0.id == libraryID }) {
+                selectedTab = .home
+            }
+        }
         .onChange(of: showWatchlistTab) { _, shown in
             if !shown && selectedTab == .watchlist {
                 selectedTab = .home
             }
         }
+    }
+
+    var body: some View {
+        // Split from `shell`: the whole chain as one expression outran the
+        // type checker on CI ("unable to type-check this expression").
+        shell
         .task(id: authManager.hasCredentials) {
             StartupTimer.mark("TVSidebar .task entry")
             guard authManager.selectedServerToken != nil else { return }
@@ -447,6 +468,12 @@ struct TVSidebarView: View {
             if let lib = dataStore.libraries.first(where: { $0.key == key }), !lib.isMusicLibrary {
                 return PlexHomeViewController(mode: .library(key: lib.key, title: lib.title))
             }
+        case .providerLibrary(_, let libraryID):
+            // The same page as a Plex library, through the provider.
+            if let library = jellyfinStore.libraries.first(where: { $0.id == libraryID }) {
+                return PlexHomeViewController(mode: .library(key: library.settingsKey, title: library.title),
+                                              providerLibrary: library)
+            }
         default:
             break
         }
@@ -493,14 +520,18 @@ struct TVSidebarView: View {
                 // overlay; the home behind is `.disabled` so focus lands on the
                 // welcome button, not a hidden home element.
                 PlexHomeRoot()
-                    .disabled(!authManager.hasCredentials)
+                    .disabled(!isSignedInToAnyServer)
                     .overlay {
-                        if !authManager.hasCredentials {
+                        if !isSignedInToAnyServer {
                             welcomeView
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                                 .background(.black)
                         }
                     }
+            case .providerLibrary:
+                // Unreachable: mounted directly as a UIKit VC above. Kept so
+                // this switch stays exhaustive over SidebarTab.
+                Color.clear
             case .watchlist:
                 // Unreachable: mounted directly as a UIKit VC above. Kept so
                 // this switch stays exhaustive over SidebarTab.
@@ -620,18 +651,18 @@ struct TVSidebarView: View {
         guard let serverURL = authManager.selectedServerURL,
               let token = authManager.selectedServerToken,
               let top = Self.topPresentedViewController() else { return }
-        let providerID = MediaProviderRegistry.shared.primaryProvider?.id ?? "plex:\(serverURL)"
+        let providerID = MediaProviderRegistry.shared.plexProvider?.id ?? "plex:\(serverURL)"
         let item = PlexMediaMapper.item(metadata, providerID: providerID, serverURL: serverURL, authToken: token)
 
         if item.kind == .episode || item.kind == .season {
             let page = MediaItemDetailPageViewController(
                 item: item,
                 seriesTitle: nil,
-                onPlay: { episode in
+                onPlay: { episode, sourceID in
                     // Close the page first so the player isn't presented
                     // underneath it, then resolve full metadata to play.
                     top.dismiss(animated: true) {
-                        playDeepLinkItem(episode)
+                        playDeepLinkItem(episode, sourceID: sourceID)
                     }
                 })
             top.present(page, animated: true)
@@ -649,7 +680,12 @@ struct TVSidebarView: View {
 
     /// Play a MediaItem surfaced by the detail page: resolve full metadata by
     /// ratingKey (MediaItem carries no PlexMetadata), then hand to the player.
-    private func playDeepLinkItem(_ item: MediaItem) {
+    private func playDeepLinkItem(_ item: MediaItem, sourceID: String? = nil) {
+        if !item.ref.isPlex {
+            guard let top = Self.topPresentedViewController() else { return }
+            ProviderPlayer.play(item, fromBeginning: false, sourceID: sourceID, from: top, onDismiss: nil)
+            return
+        }
         let ratingKey = item.ref.itemID
         guard !ratingKey.isEmpty,
               let serverURL = authManager.selectedServerURL,
@@ -658,14 +694,14 @@ struct TVSidebarView: View {
             guard let meta = try? await PlexNetworkManager.shared.getFullMetadata(
                 serverURL: serverURL, authToken: token, ratingKey: ratingKey
             ) else { return }
-            presentPlayerForDeepLink(meta)
+            presentPlayerForDeepLink(meta, mediaID: sourceID)
         }
     }
 
     // MARK: - Deep Link Player
 
     /// Present player for a deep link from Top Shelf
-    private func presentPlayerForDeepLink(_ metadata: PlexMetadata) {
+    private func presentPlayerForDeepLink(_ metadata: PlexMetadata, mediaID: String? = nil) {
         Task {
             let (artImage, thumbImage) = await getPlayerImages(for: metadata)
 
@@ -676,7 +712,8 @@ struct TVSidebarView: View {
                     authToken: authManager.selectedServerToken ?? "",
                     startOffset: metadata.viewOffset.map { Double($0) / 1000.0 },
                     loadingArtImage: artImage,
-                    loadingThumbImage: thumbImage
+                    loadingThumbImage: thumbImage,
+                    preferredMediaID: mediaID
                 )
                 if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
                    let rootVC = scene.windows.first?.rootViewController {

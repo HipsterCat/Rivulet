@@ -28,8 +28,9 @@ enum EPGTheme {
     /// Channel column box: lighter than the background, darker than guide cells.
     static let columnFill = Color(red: 0.17, green: 0.17, blue: 0.19)
     /// Shared corner radius for every guide box (timeline, date, logo, cells)
-    /// and the rounded clip where cells tuck under the column / ruler.
-    static let columnCorner: CGFloat = 8
+    /// and the rounded clip where cells tuck under the column / ruler. Large
+    /// enough that the continuous curve reads as a squircle.
+    static let columnCorner: CGFloat = 14
     static let textPrimary = Color.white
     static let textSecondary = Color.white.opacity(0.55)
 
@@ -124,6 +125,9 @@ struct EPGGuide: UIViewRepresentable {
     /// rather than filtering (Recordings).
     var categoryActionTitle: String? = nil
     var onCategoryAction: (() -> Void)? = nil
+    /// The channel still playing in the corner, and what Select on it does.
+    var miniSession: LiveTVSessionHandoff? = nil
+    var onMiniPlayerSelect: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -200,6 +204,7 @@ struct EPGGuide: UIViewRepresentable {
             onSelect: onCategorySelect,
             actionTitle: categoryActionTitle,
             onAction: onCategoryAction)
+        uiView.setMiniSession(miniSession, onSelect: onMiniPlayerSelect)
         context.coordinator.updateRecordingMarks(recordingProgramIds)
         let timelineMoved = context.coordinator.lastTimelineStart.map { $0 != timelineStart } ?? false
         let dataChanged = context.coordinator.apply(self, to: layout)
@@ -449,13 +454,26 @@ struct EPGGuide: UIViewRepresentable {
         // Snap horizontal scrolling so a full 30-min cell sits next to the date.
         func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint,
                                        targetContentOffset: UnsafeMutablePointer<CGPoint>) {
-            targetContentOffset.pointee.x = Coordinator.snappedX(for: targetContentOffset.pointee.x)
+            targetContentOffset.pointee.x = Coordinator.focusScrollTargetX(
+                proposed: targetContentOffset.pointee.x, lockedX: lockedX,
+                isHorizontalMove: Date() < freeScrollUntil)
             if let layout = collectionView?.collectionViewLayout as? EPGLayout {
                 let inset = layout.rulerBottomInset
                 let rowH = EPGTheme.rowHeight
                 let y = targetContentOffset.pointee.y
                 targetContentOffset.pointee.y = (((y + inset) / rowH).rounded() * rowH) - inset
             }
+        }
+
+        /// Where a focus scroll ends horizontally. tvOS routes every focus
+        /// scroll through `scrollViewWillEndDragging`, Up/Down included, with
+        /// its own x to show more of a wide programme, and the scroll reports
+        /// decelerating, so `scrollViewDidScroll` would adopt it as the held
+        /// x and the guide would creep sideways row by row. Only a move along
+        /// the row may change x.
+        static func focusScrollTargetX(proposed: CGFloat, lockedX: CGFloat,
+                                       isHorizontalMove: Bool) -> CGFloat {
+            isHorizontalMove ? snappedX(for: proposed) : lockedX
         }
 
         /// Offset whose left grid edge lands on a 30-minute boundary.
@@ -557,11 +575,20 @@ struct EPGGuide: UIViewRepresentable {
 
         /// Veto the engine's geometric choice for Up/Down when it is not the
         /// programme airing at the anchor time, and move focus there instead.
+        ///
+        /// The redirect lands a runloop later, and the engine keeps offering
+        /// candidates meanwhile. Once every cell is vetoed its last offer is to
+        /// leave the grid, which on the Guide is the sidebar; with a row in that
+        /// direction, that offer is redirected like any other.
         private func shouldAllowVerticalMove(_ context: UICollectionViewFocusUpdateContext,
                                              in collectionView: UICollectionView) -> Bool {
-            guard let next = context.nextFocusedIndexPath,
-                  let prev = context.previouslyFocusedIndexPath,
-                  next.section != prev.section else { return true }
+            guard let prev = context.previouslyFocusedIndexPath,
+                  let section = Self.verticalTargetSection(
+                    from: prev.section, engineSection: context.nextFocusedIndexPath?.section,
+                    movingDown: context.focusHeading == .down, sectionCount: programs.count)
+            else { return true }
+            let leavingGrid = context.nextFocusedIndexPath == nil
+            let next = context.nextFocusedIndexPath ?? IndexPath(item: -1, section: section)
             let anchor = clampedAnchor(in: collectionView)
             guard let desired = programIndex(inSection: next.section, covering: anchor),
                   desired != next.item else { return true }
@@ -569,9 +596,22 @@ struct EPGGuide: UIViewRepresentable {
             // Only redirect to a cell that exists right now; otherwise the veto
             // would eat the swipe. The engine's own pick is in the same row, so
             // the row is realized, and the anchor is inside the visible window.
-            guard collectionView.cellForItem(at: target) != nil else { return true }
+            // Leaving the grid is never the better outcome, so that is vetoed
+            // even when the redirect cannot land.
+            guard collectionView.cellForItem(at: target) != nil else { return !leavingGrid }
             requestFocus(target)
             return false
+        }
+
+        /// The row an Up/Down move goes to, or nil when it is not one this
+        /// guide steers: a move along the row, or leaving the grid at the top
+        /// (to the category pills) or bottom edge. `engineSection` nil means the
+        /// engine is offering a view outside the grid.
+        nonisolated static func verticalTargetSection(from section: Int, engineSection: Int?,
+                                                      movingDown: Bool, sectionCount: Int) -> Int? {
+            if let engineSection { return engineSection == section ? nil : engineSection }
+            let next = section + (movingDown ? 1 : -1)
+            return (0..<sectionCount).contains(next) ? next : nil
         }
 
         /// The anchor, kept inside the visible time window and never in the past.
@@ -671,6 +711,9 @@ final class EPGContainerView: UIView {
     private weak var pendingGridFocusTarget: UIView?
     private weak var pendingCategoryFocusTarget: UIView?
     private var gridUpSwipeBinding: DirectionalInputBinding?
+    /// The channel still playing after Back, in the corner (issue #318).
+    private let miniPlayer = LiveMiniPlayerView()
+    private var onMiniPlayerSelect: (() -> Void)?
     private let timeFade = CAGradientLayer()
     private let bottomFade = CAGradientLayer()
     private let rightFade = CAGradientLayer()
@@ -715,6 +758,13 @@ final class EPGContainerView: UIView {
                 self?.moveFocusToCategories()
             })
 
+        miniPlayer.isFocusable = true
+        miniPlayer.isHidden = true
+        let select = UITapGestureRecognizer(target: self, action: #selector(selectMiniPlayer))
+        select.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
+        miniPlayer.addGestureRecognizer(select)
+        addSubview(miniPlayer)
+
         let bg = UIColor(EPGTheme.background)
 
         timeFade.colors = [bg.cgColor, bg.withAlphaComponent(0).cgColor]
@@ -749,8 +799,29 @@ final class EPGContainerView: UIView {
         if clockLabel.text != text { clockLabel.text = text }
     }
 
+    /// Shows `session` in the corner, or hides the corner player when nil.
+    func setMiniSession(_ session: LiveTVSessionHandoff?, onSelect: (() -> Void)?) {
+        onMiniPlayerSelect = onSelect
+        if let session {
+            miniPlayer.show(session)
+            miniPlayer.isHidden = false
+        } else if !miniPlayer.isHidden {
+            miniPlayer.release()
+            miniPlayer.isHidden = true
+        }
+    }
+
+    @objc private func selectMiniPlayer() {
+        onMiniPlayerSelect?()
+    }
+
     override func willMove(toWindow newWindow: UIWindow?) {
         super.willMove(toWindow: newWindow)
+        if newWindow == nil {
+            MenuPressInterceptor.resign(self)
+        } else {
+            MenuPressInterceptor.register(self)
+        }
         if newWindow == nil {
             clockTimer?.invalidate()
             clockTimer = nil
@@ -869,10 +940,40 @@ final class EPGContainerView: UIView {
         collectionView?.frame = CGRect(x: 0, y: contentTopInset,
                                        width: bounds.width,
                                        height: max(bounds.height - contentTopInset, 0))
+        // `bounds`/`center`, not `frame`: the focused corner player is scaled.
+        miniPlayer.bounds = CGRect(origin: .zero, size: EPGTheme.miniPlayerSize)
+        miniPlayer.center = CGPoint(x: bounds.width - EPGTheme.pageMargin - EPGTheme.miniPlayerSize.width / 2,
+                                    y: EPGTheme.pageMargin + EPGTheme.miniPlayerSize.height / 2)
         let top = EPGTheme.rulerTop + EPGTheme.timelineHeight
         timeFade.frame = CGRect(x: 0, y: top, width: bounds.width, height: 16)
         bottomFade.frame = CGRect(x: 0, y: bounds.height - 70, width: bounds.width, height: 70)
         rightFade.frame = CGRect(x: bounds.width - 48, y: top, width: 48, height: bounds.height - top)
+    }
+}
+
+extension EPGContainerView: MenuBackHandling {
+    /// With a channel in the corner, Menu from the grid or the pills returns the
+    /// grid to its top and focuses the corner player, as Menu below a library's
+    /// top row returns to its top. From the corner player it declines, so the
+    /// sidebar opens.
+    func handleMenuBack() -> Bool {
+        // Focus must be in this guide: a player or menu presented over it holds
+        // focus in its own views, and Menu keeps its meaning there.
+        guard !miniPlayer.isHidden,
+              let system = UIFocusSystem.focusSystem(for: self),
+              let focused = system.focusedItem as? UIView,
+              focused.isDescendant(of: self), !focused.isDescendant(of: miniPlayer)
+        else { return false }
+        // A jump, as in the library.
+        if let cv = collectionView {
+            cv.contentOffset.y = -cv.contentInset.top
+            cv.layoutIfNeeded()
+        }
+        system.requestFocusUpdate(to: miniPlayer)
+        system.updateFocusIfNeeded()
+        // Something drawn over the corner (the guide-error banner) can make it
+        // unfocusable; then Menu keeps its usual meaning.
+        return system.focusedItem === miniPlayer
     }
 }
 
@@ -910,6 +1011,8 @@ final class GuideCategoryBarView: UIView {
 
         let view = UICollectionView(frame: .zero, collectionViewLayout: layout)
         view.backgroundColor = .clear
+        // The focused pill grows past the bar.
+        view.clipsToBounds = false
         view.contentInsetAdjustmentBehavior = .never
         view.showsHorizontalScrollIndicator = false
         view.showsVerticalScrollIndicator = false
@@ -982,12 +1085,20 @@ final class GuideCategoryBarView: UIView {
         }
     }
 
+    /// Up from the grid lands on the current category, never on Recordings.
     func preferredFocusTarget() -> UIView? {
         collectionView.layoutIfNeeded()
         let selectedIndex = items.firstIndex { !$0.isAction && $0.group == selectedGroup }
             .map { IndexPath(item: $0, section: 0) }
-        let targetIndex = lastFocusedIndexPath ?? selectedIndex ?? IndexPath(item: 0, section: 0)
+        let targetIndex = selectedIndex ?? lastFocusedIndexPath ?? IndexPath(item: 0, section: 0)
         return collectionView.cellForItem(at: targetIndex)
+    }
+
+    /// Like the season pills, focusing a category switches to it, so the
+    /// focused pill and the selected one are the same pill. The Recordings
+    /// action opens on Select only.
+    nonisolated static func selectsOnFocus(isAction: Bool, group: String?, selected: String?) -> Bool {
+        !isAction && group != selected
     }
 }
 
@@ -1020,8 +1131,11 @@ extension GuideCategoryBarView: UICollectionViewDataSource,
         sizeForItemAt indexPath: IndexPath
     ) -> CGSize {
         guard let title = items[safe: indexPath.item]?.title else { return .zero }
-        let font = UIFont.systemFont(ofSize: 24, weight: .semibold)
-        let width = ceil((title as NSString).size(withAttributes: [.font: font]).width) + 44
+        let font = UIFont.systemFont(ofSize: GuideCategoryPillCell.fontSize, weight: .semibold)
+        // A few points of slack: a label sized to the exact measured width
+        // can still need a fraction more and truncate.
+        let width = ceil((title as NSString).size(withAttributes: [.font: font]).width) + 4
+            + GuideCategoryPillCell.horizontalPadding * 2
         return CGSize(width: width, height: 44)
     }
 
@@ -1031,8 +1145,8 @@ extension GuideCategoryBarView: UICollectionViewDataSource,
             onAction?()
             return
         }
-        guard item.group != selectedGroup else { return }
-        onSelect?(item.group)
+        // Focus already switched the category; Select goes to its channels.
+        onMoveDown?()
     }
 
     func collectionView(
@@ -1040,38 +1154,70 @@ extension GuideCategoryBarView: UICollectionViewDataSource,
         didUpdateFocusIn context: UICollectionViewFocusUpdateContext,
         with coordinator: UIFocusAnimationCoordinator
     ) {
-        if let next = context.nextFocusedIndexPath { lastFocusedIndexPath = next }
+        guard let next = context.nextFocusedIndexPath else { return }
+        lastFocusedIndexPath = next
+        if let item = items[safe: next.item],
+           Self.selectsOnFocus(isAction: item.isAction, group: item.group, selected: selectedGroup) {
+            onSelect?(item.group)
+        }
     }
 }
 
+/// A capsule like `SeasonPillView` (the show detail's season pills), at the
+/// guide's smaller type. Focus switches the category, so a focused pill is
+/// also the selected one; what shows that the bar HAS focus is the focused
+/// look: solid white, raised and shadowed. With focus in the grid the
+/// selected category is a frosted capsule.
 final class GuideCategoryPillCell: UICollectionViewCell {
     static let reuseIdentifier = "GuideCategoryPillCell"
+    static let fontSize: CGFloat = 24
+    static let horizontalPadding: CGFloat = 22
 
     private let titleLabel = UILabel()
+    /// The capsule. Focus scales THIS, never `contentView`: the cell lays
+    /// `contentView` out by setting its frame, and a frame set on a scaled
+    /// view shrinks its bounds, which squeezed the label and cut the title.
+    /// Auto Layout positions `pill` by bounds and center, so its scale holds.
+    private let pill = UIView()
     private var selectedCategory = false
     var onDeclinedDownPress: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
 
-        contentView.layer.cornerRadius = 22
-        contentView.layer.cornerCurve = .continuous
-        titleLabel.font = .systemFont(ofSize: 24, weight: .semibold)
+        pill.layer.cornerCurve = .continuous
+        pill.layer.shadowColor = UIColor.black.cgColor
+        pill.layer.shadowOffset = CGSize(width: 0, height: 8)
+        pill.layer.shadowRadius = 14
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(pill)
         titleLabel.textAlignment = .center
+        titleLabel.lineBreakMode = .byClipping
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(titleLabel)
+        pill.addSubview(titleLabel)
 
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 22),
-            titleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -22),
-            titleLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            pill.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            pill.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            pill.topAnchor.constraint(equalTo: contentView.topAnchor),
+            pill.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: Self.horizontalPadding),
+            titleLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -Self.horizontalPadding),
+            titleLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // The cell's height, not the pill's: Auto Layout has not sized the
+        // pill yet at this point, and it always fills the cell.
+        pill.layer.cornerRadius = bounds.height / 2
+    }
+
     override var isHighlighted: Bool {
-        didSet { contentView.alpha = isHighlighted ? 0.75 : 1 }
+        didSet { pill.alpha = isHighlighted ? 0.75 : 1 }
     }
 
     /// Discrete arrows reach the focused responder only when the focus engine
@@ -1101,16 +1247,20 @@ final class GuideCategoryPillCell: UICollectionViewCell {
     }
 
     private func applyAppearance(focused: Bool) {
-        if selectedCategory {
-            contentView.backgroundColor = .white
-            titleLabel.textColor = UIColor(EPGTheme.background)
-        } else if focused {
-            contentView.backgroundColor = UIColor.white.withAlphaComponent(0.22)
+        // One weight for every state: the width is measured at semibold.
+        titleLabel.font = .systemFont(ofSize: Self.fontSize, weight: .semibold)
+        if focused {
+            pill.backgroundColor = .white
+            titleLabel.textColor = .black
+        } else if selectedCategory {
+            pill.backgroundColor = UIColor.white.withAlphaComponent(0.22)
             titleLabel.textColor = .white
         } else {
-            contentView.backgroundColor = .clear
-            titleLabel.textColor = UIColor(EPGTheme.textSecondary)
+            pill.backgroundColor = .clear
+            titleLabel.textColor = UIColor.white.withAlphaComponent(0.72)
         }
+        pill.layer.shadowOpacity = focused ? 0.35 : 0
+        pill.transform = focused ? CGAffineTransform(scaleX: 1.1, y: 1.1) : .identity
     }
 }
 
@@ -1356,12 +1506,10 @@ final class ProgramCellView: UICollectionViewCell {
         let rect = CGRect(x: leftClip, y: topClip,
                           width: max(bounds.width - leftClip, 0),
                           height: max(bounds.height - topClip, 0))
-        var corners: UIRectCorner = []
-        if leftClip > 0 { corners.formUnion([.topLeft, .bottomLeft]) }
-        if topClip > 0 { corners.formUnion([.topLeft, .topRight]) }
-        let r = EPGTheme.columnCorner
-        clipMask.path = UIBezierPath(roundedRect: rect, byRoundingCorners: corners,
-                                     cornerRadii: CGSize(width: r, height: r)).cgPath
+        // All four corners: the unclipped ones coincide with the card's own,
+        // and this initializer (unlike `byRoundingCorners:`) draws the same
+        // continuous curve as `cornerCurve = .continuous`.
+        clipMask.path = UIBezierPath(roundedRect: rect, cornerRadius: EPGTheme.columnCorner).cgPath
         contentView.layer.mask = clipMask
     }
 
@@ -1443,7 +1591,12 @@ final class ProgramCellView: UICollectionViewCell {
     }
 
     private func applyFocus(_ focused: Bool) {
-        card.backgroundColor = focused ? UIColor(white: 0.96, alpha: 1) : UIColor(white: 0, alpha: 0.32)
+        // Unfocused: the app's glass row tint (faint white fill, hairline
+        // edge), not a live UIGlassEffect per cell, which would re-sample the
+        // backdrop under ~50 scrolling cells every frame.
+        card.backgroundColor = focused ? UIColor(white: 0.96, alpha: 1) : UIColor(white: 1, alpha: 0.08)
+        card.layer.borderWidth = focused ? 0 : 1
+        card.layer.borderColor = UIColor(white: 1, alpha: 0.1).cgColor
         titleLabel.textColor = focused ? UIColor(white: 0.08, alpha: 1) : .white
         subtitleLabel.textColor = focused ? UIColor(white: 0.08, alpha: 0.6) : UIColor(white: 1, alpha: 0.7)
     }
@@ -1735,9 +1888,12 @@ struct GuideInfoBar: View {
         return nil
     }
 
+    @State private var loadedPoster: (url: URL, image: UIImage)?
+
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .task(id: programImageURL) { await loadPoster(programImageURL) }
     }
 
     /// Fixed poster height; width follows the image's own aspect ratio so a
@@ -1783,51 +1939,32 @@ struct GuideInfoBar: View {
     /// 2:3 poster box width.
     private var posterWidth: CGFloat { posterHeight * 2.0 / 3.0 }
 
-    /// Fixed 2:3 poster slot. Everything (programme artwork, the logo fallback,
-    /// the placeholder) is aspect-fit into the same frame, so the layout never
-    /// jumps when an image finishes loading, and nothing is stretched or cropped
-    /// (wider images get transparent bars).
+    /// The 2:3 poster slot, only when the programme has portrait artwork. No
+    /// channel-logo stand-in: the logo is already in the channel column, and
+    /// squeezed into a poster frame it read as a broken poster. Most IPTV
+    /// guides carry no portrait art, so there the info text starts at the edge.
+    /// Nothing is drawn until the image is loaded AND measured portrait:
+    /// drawing during the load showed an empty frame, or the wide art, that
+    /// then vanished.
     @ViewBuilder private var poster: some View {
-        ZStack {
-            EPGTheme.surface            // blank grey 2:3 card behind the artwork
-            posterContent
-        }
-        .frame(width: posterWidth, height: posterHeight)
-        .clipShape(RoundedRectangle(cornerRadius: EPGTheme.columnCorner))
-        .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
-    }
-
-    @ViewBuilder private var posterContent: some View {
-        if let url = programImageURL {
-            GuidePosterImage(url: url) {
-                logoInset
+        if let loaded = loadedPoster, loaded.url == programImageURL {
+            ZStack {
+                EPGTheme.surface
+                Image(uiImage: loaded.image).resizable().aspectRatio(contentMode: .fit)
             }
-            .id(url)
-        } else {
-            logoInset
+            .frame(width: posterWidth, height: posterHeight)
+            .clipShape(RoundedRectangle(cornerRadius: EPGTheme.columnCorner))
+            .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
         }
     }
 
-    /// Channel logo (or a glyph) inset on the blank grey card with padding, fit
-    /// without stretching or cropping.
-    @ViewBuilder private var logoInset: some View {
-        if let logo = channel?.logoURL {
-            CachedAsyncImage(url: logo) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fit).padding(24)
-                default:
-                    placeholderGlyph
-                }
-            }
-        } else {
-            placeholderGlyph
-        }
-    }
-
-    /// Placeholder glyph, shown while loading or when no artwork/logo exists.
-    private var placeholderGlyph: some View {
-        Image(systemName: "tv").font(.system(size: 40)).foregroundStyle(EPGTheme.textSecondary)
+    /// Loads and measures the poster; keeps it only when it is portrait.
+    private func loadPoster(_ url: URL?) async {
+        guard let url, !EPGImageClassifier.shared.isLandscape(url),
+              let image = await ImageCacheManager.shared.image(for: url) else { return }
+        let kind = await EPGImageClassifier.shared.classify(url) { image.size }
+        guard !Task.isCancelled, kind == .portrait else { return }
+        loadedPoster = (url, image)
     }
 
     private func channelLine(_ channel: UnifiedChannel) -> String {
@@ -1843,36 +1980,3 @@ struct GuideInfoBar: View {
 
 /// Dynamically inspects artwork aspect ratio to guarantee landscape images
 /// are never placed in the 2:3 poster slot, falling back to the channel logo.
-private struct GuidePosterImage<Fallback: View>: View {
-    let url: URL
-    @ViewBuilder let logoFallback: () -> Fallback
-    @State private var isLandscape: Bool
-
-    init(url: URL, @ViewBuilder logoFallback: @escaping () -> Fallback) {
-        self.url = url
-        self.logoFallback = logoFallback
-        self._isLandscape = State(initialValue: EPGImageClassifier.shared.isLandscape(url))
-    }
-
-    var body: some View {
-        if isLandscape {
-            logoFallback()
-        } else {
-            CachedAsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().aspectRatio(contentMode: .fit)
-                default:
-                    logoFallback()
-                }
-            }
-            .task(id: url) {
-                let kind = await EPGImageClassifier.shared.classify(url) {
-                    await ImageCacheManager.shared.image(for: url)?.size
-                }
-                guard !Task.isCancelled else { return }
-                isLandscape = kind == .landscape
-            }
-        }
-    }
-}
