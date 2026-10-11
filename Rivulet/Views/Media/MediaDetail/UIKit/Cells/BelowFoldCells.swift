@@ -374,7 +374,7 @@ private func pinFilling(_ inner: UIView, to container: UIView) {
 import SwiftUI
 
 #Preview("Related poster") {
-    UIKitCellPreviewHost(width: RelatedPosterCell.posterWidth, height: RelatedPosterCell.posterHeight) { (cell: RelatedPosterCell) in
+    UIKitCellPreviewHost(width: MediaRowMetrics.posterWidth, height: MediaRowMetrics.posterHeight) { (cell: PosterCell) in
         cell.configure(item: ComponentSandboxMocks.movieUnwatched())
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -46,8 +46,11 @@ final class MockDetailProvider: MediaProvider, @unchecked Sendable {
         MockDetailFixtures.related()
     }
 
-    func relatedItems(for itemRef: MediaItemRef) async throws -> [MediaItem] {
-        MockDetailFixtures.related().filter { $0.ref != itemRef }
+    func related(for ref: MediaItemRef, kind: MediaKind) async throws -> RelatedContent {
+        RelatedContent(
+            items: MockDetailFixtures.related().filter { $0.ref != ref },
+            collection: nil
+        )
     }
 
     func allEpisodes(of showRef: MediaItemRef) async throws -> [MediaItem] {
@@ -77,7 +80,7 @@ final class MockDetailProvider: MediaProvider, @unchecked Sendable {
         throw MediaProviderError.notPlayable
     }
 
-    func progressReporter(for itemRef: MediaItemRef, playSessionID: String?) -> any ProgressReporter {
+    func progressReporter(for itemRef: MediaItemRef, sourceID: String?, playSessionID: String?) -> any ProgressReporter {
         MockDetailProgressReporter()
     }
 
@@ -105,7 +108,7 @@ final class MockDetailProvider: MediaProvider, @unchecked Sendable {
 }
 
 struct MockDetailProgressReporter: ProgressReporter {
-    func start() async {}
+    func start(position: TimeInterval) async {}
     func progress(position: TimeInterval) async {}
     func paused(at position: TimeInterval) async {}
     func stopped(at position: TimeInterval) async {}

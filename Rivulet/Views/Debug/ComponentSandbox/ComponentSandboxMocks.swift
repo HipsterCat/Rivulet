@@ -229,7 +229,7 @@ enum ComponentSandboxMocks {
             trailerURL: nil,
             contentRating: "TV-14",
             regionOfOrigin: "United States",
-            rating: 8.2,
+            rating: MediaRating(8.2, source: .imdb),
             nextEpisode: episode(inProgress: true),
             collections: ["Sandbox Samples"]
         )

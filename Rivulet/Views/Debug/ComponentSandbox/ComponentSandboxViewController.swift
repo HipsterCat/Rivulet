@@ -23,10 +23,8 @@ nonisolated private enum SandboxSection: Int, CaseIterable, Hashable, Sendable {
     case playPills
     case heroButtons
     case badges
-    case upNext
     case transport
     case insightsTabs
-    case actor
     case skeletons
     case popups
     case posters
@@ -51,10 +49,8 @@ nonisolated private enum SandboxSection: Int, CaseIterable, Hashable, Sendable {
         case .playPills: return "Play Pills"
         case .heroButtons: return "Hero Buttons"
         case .badges: return "Badges"
-        case .upNext: return "Up Next"
         case .transport: return "Transport Controls"
         case .insightsTabs: return "Insights Tabs"
-        case .actor: return "Actor Header"
         case .skeletons: return "Skeletons / Loading"
         case .popups: return "Popups"
         case .posters: return "Posters"
@@ -82,10 +78,8 @@ nonisolated private enum SandboxItem: Hashable, Sendable {
     case playPills
     case heroButtons
     case badges
-    case upNext
     case transport
     case insightsTabs
-    case actorHeader(Bool) // loading
     case skeleton(String)
     case heroLoading
     case popupTriggers
@@ -117,7 +111,6 @@ final class ComponentSandboxViewController: UIViewController {
     private let cast = ComponentSandboxMocks.castRow()
     private let related = ComponentSandboxMocks.relatedRow()
     private let detail = ComponentSandboxMocks.detail()
-    private let upNextEpisodes = ComponentSandboxMocks.upNextEpisodes()
 
     private lazy var postersByID = Dictionary(uniqueKeysWithValues: posters.map { ($0.ref.itemID, $0) })
     private lazy var cwByID = Dictionary(uniqueKeysWithValues: continueWatching.map { ($0.ref.itemID, $0) })
@@ -190,10 +183,8 @@ final class ComponentSandboxViewController: UIViewController {
         collectionView.register(SandboxPlayPillsCell.self, forCellWithReuseIdentifier: SandboxPlayPillsCell.reuseID)
         collectionView.register(SandboxHeroButtonsCell.self, forCellWithReuseIdentifier: SandboxHeroButtonsCell.reuseID)
         collectionView.register(SandboxBadgesCell.self, forCellWithReuseIdentifier: SandboxBadgesCell.reuseID)
-        collectionView.register(SandboxUpNextCell.self, forCellWithReuseIdentifier: SandboxUpNextCell.reuseID)
         collectionView.register(SandboxTransportCell.self, forCellWithReuseIdentifier: SandboxTransportCell.reuseID)
         collectionView.register(SandboxInsightsTabsCell.self, forCellWithReuseIdentifier: SandboxInsightsTabsCell.reuseID)
-        collectionView.register(SandboxActorHeaderCell.self, forCellWithReuseIdentifier: SandboxActorHeaderCell.reuseID)
         collectionView.register(PosterSkeletonCell.self, forCellWithReuseIdentifier: PosterSkeletonCell.reuseID)
         collectionView.register(HeroLoadingCell.self, forCellWithReuseIdentifier: HeroLoadingCell.reuseID)
         collectionView.register(PosterCell.self, forCellWithReuseIdentifier: PosterCell.reuseID)
@@ -202,7 +193,6 @@ final class ComponentSandboxViewController: UIViewController {
         collectionView.register(SeasonPillCollectionCell.self, forCellWithReuseIdentifier: SeasonPillCollectionCell.reuseID)
         collectionView.register(EpisodeCollectionCell.self, forCellWithReuseIdentifier: EpisodeCollectionCell.reuseID)
         collectionView.register(CastCollectionCell.self, forCellWithReuseIdentifier: CastCollectionCell.reuseID)
-        collectionView.register(RelatedPosterCell.self, forCellWithReuseIdentifier: RelatedPosterCell.reuseID)
         collectionView.register(AboutCollectionCell.self, forCellWithReuseIdentifier: AboutCollectionCell.reuseID)
         collectionView.register(InfoColumnsCollectionCell.self, forCellWithReuseIdentifier: InfoColumnsCollectionCell.reuseID)
         collectionView.register(SandboxChromeCell.self, forCellWithReuseIdentifier: SandboxChromeCell.reuseID)
@@ -235,14 +225,10 @@ final class ComponentSandboxViewController: UIViewController {
                 return self.fullWidth(height: 260)
             case .badges:
                 return self.fullWidth(height: 320)
-            case .upNext:
-                return self.shelf(itemW: 520, itemH: 560, gap: 28)
             case .transport:
                 return self.fullWidth(height: 90)
             case .insightsTabs:
                 return self.fullWidth(height: 72)
-            case .actor:
-                return self.shelf(itemW: 440, itemH: 420, gap: 28)
             case .skeletons:
                 return self.shelf(
                     itemW: MediaRowMetrics.posterWidth,
@@ -403,15 +389,6 @@ final class ComponentSandboxViewController: UIViewController {
                 return collectionView.dequeueReusableCell(
                     withReuseIdentifier: SandboxBadgesCell.reuseID, for: indexPath)
 
-            case .upNext:
-                let cell = collectionView.dequeueReusableCell(
-                    withReuseIdentifier: SandboxUpNextCell.reuseID, for: indexPath) as! SandboxUpNextCell
-                cell.configure(
-                    episodes: self.upNextEpisodes,
-                    currentRatingKey: ComponentSandboxMocks.upNextCurrentRatingKey
-                )
-                return cell
-
             case .transport:
                 return collectionView.dequeueReusableCell(
                     withReuseIdentifier: SandboxTransportCell.reuseID, for: indexPath)
@@ -419,12 +396,6 @@ final class ComponentSandboxViewController: UIViewController {
             case .insightsTabs:
                 return collectionView.dequeueReusableCell(
                     withReuseIdentifier: SandboxInsightsTabsCell.reuseID, for: indexPath)
-
-            case .actorHeader(let loading):
-                let cell = collectionView.dequeueReusableCell(
-                    withReuseIdentifier: SandboxActorHeaderCell.reuseID, for: indexPath) as! SandboxActorHeaderCell
-                cell.configure(loading: loading)
-                return cell
 
             case .skeleton(let key):
                 let cell = collectionView.dequeueReusableCell(
@@ -492,7 +463,7 @@ final class ComponentSandboxViewController: UIViewController {
                 return cell
             case .related(let id):
                 let cell = collectionView.dequeueReusableCell(
-                    withReuseIdentifier: RelatedPosterCell.reuseID, for: indexPath) as! RelatedPosterCell
+                    withReuseIdentifier: PosterCell.reuseID, for: indexPath) as! PosterCell
                 if let media = self.relatedByID[id] { cell.configure(item: media) }
                 return cell
             case .about:
@@ -546,10 +517,8 @@ final class ComponentSandboxViewController: UIViewController {
         snapshot.appendItems([.playPills], toSection: .playPills)
         snapshot.appendItems([.heroButtons], toSection: .heroButtons)
         snapshot.appendItems([.badges], toSection: .badges)
-        snapshot.appendItems([.upNext], toSection: .upNext)
         snapshot.appendItems([.transport], toSection: .transport)
         snapshot.appendItems([.insightsTabs], toSection: .insightsTabs)
-        snapshot.appendItems([.actorHeader(false), .actorHeader(true)], toSection: .actor)
         snapshot.appendItems(
             [.skeleton("poster"), .skeleton("cw"), .heroLoading],
             toSection: .skeletons
@@ -637,7 +606,7 @@ extension ComponentSandboxViewController: UICollectionViewDelegate {
         case .episode, .about, .chrome, .info,
              .toastTriggers, .popupTriggers, .skipPills, .playPills,
              .heroButtons, .transport, .insightsTabs, .countdown,
-             .connectionBanner, .upNext, .homeState:
+             .connectionBanner, .homeState:
             return false
         default:
             return true

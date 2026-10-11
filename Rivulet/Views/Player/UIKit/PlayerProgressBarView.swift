@@ -807,7 +807,6 @@ import SwiftUI
             duration: 120 * 60,
             isScrubbing: false,
             scrubTime: 0,
-            scrubStepLabelText: nil,
             scrubThumbnail: nil,
             markers: [],
             chapters: []

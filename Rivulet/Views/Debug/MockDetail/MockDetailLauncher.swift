@@ -50,7 +50,7 @@ enum MockDetailLauncher {
             let page = MediaItemDetailPageViewController(
                 item: item,
                 seriesTitle: MockDetailFixtures.show().title,
-                onPlay: { _ in top.dismiss(animated: true) }
+                onPlay: { _, _ in top.dismiss(animated: true) }
             )
             top.present(page, animated: true)
         } else {

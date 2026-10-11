@@ -101,7 +101,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "TV-14",
             regionOfOrigin: "United States",
-            rating: 8.2,
+            rating: MediaRating(8.2, source: .imdb),
             nextEpisode: episode(),
             collections: ["Sandbox Samples"],
             extras: [
@@ -150,7 +150,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "PG-13",
             regionOfOrigin: "Canada",
-            rating: 7.4,
+            rating: MediaRating(7.4, source: .imdb),
             nextEpisode: nil,
             collections: ["Sandbox Samples"],
             extras: [
@@ -182,7 +182,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "TV-14",
             regionOfOrigin: "United States",
-            rating: 8.0,
+            rating: MediaRating(8.0, source: .imdb),
             nextEpisode: episode(id: "ep-4", title: "Silt", number: 4, progress: 0),
             collections: [],
             extras: [],

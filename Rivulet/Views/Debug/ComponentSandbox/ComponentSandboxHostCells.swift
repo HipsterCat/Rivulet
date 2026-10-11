@@ -573,46 +573,6 @@ final class SandboxBadgesCell: UICollectionViewCell {
     }
 }
 
-// MARK: - Up Next
-
-final class SandboxUpNextCell: UICollectionViewCell {
-    static let reuseID = "SandboxUpNextCell"
-
-    private var listView: UpNextListView?
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        contentView.backgroundColor = UIColor.white.withAlphaComponent(0.06)
-        contentView.layer.cornerRadius = 20
-        contentView.layer.cornerCurve = .continuous
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError() }
-
-    func configure(episodes: [PlexMetadata], currentRatingKey: String) {
-        listView?.removeFromSuperview()
-        let list = UpNextListView(
-            episodes: episodes,
-            currentRatingKey: currentRatingKey,
-            seasonNumber: 1,
-            serverURL: "https://sandbox.invalid",
-            authToken: "sandbox",
-            onSelect: { _ in }
-        )
-        SandboxHostHelpers.pin(list, to: contentView, insets: .init(top: 20, left: 20, bottom: 20, right: 20))
-        listView = list
-        contentView.layoutIfNeeded()
-        list.prepareForPresentation()
-    }
-
-    override func prepareForReuse() {
-        super.prepareForReuse()
-        listView?.removeFromSuperview()
-        listView = nil
-    }
-}
-
 // MARK: - Transport controls
 
 final class SandboxTransportCell: UICollectionViewCell {
@@ -672,34 +632,6 @@ final class SandboxInsightsTabsCell: UICollectionViewCell {
 
     override var canBecomeFocused: Bool { false }
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [tabBar] }
-}
-
-// MARK: - Actor header
-
-final class SandboxActorHeaderCell: UICollectionViewCell {
-    static let reuseID = "SandboxActorHeaderCell"
-
-    private let header = InsightsActorHeaderView()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        contentView.backgroundColor = UIColor.white.withAlphaComponent(0.06)
-        contentView.layer.cornerRadius = 20
-        contentView.layer.cornerCurve = .continuous
-        SandboxHostHelpers.pin(header, to: contentView, insets: .init(top: 24, left: 32, bottom: 24, right: 32))
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError() }
-
-    func configure(loading: Bool) {
-        header.configure(
-            name: "Ava Meridian",
-            biography: loading ? nil : ComponentSandboxMocks.actorBiography(),
-            portraitURL: ComponentSandboxMocks.actorPortraitURL(),
-            isLoading: loading
-        )
-    }
 }
 
 // MARK: - Detail chrome (existing)

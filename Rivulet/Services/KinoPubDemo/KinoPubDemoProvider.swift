@@ -78,13 +78,16 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
         catalog.items.filter { $0.genres.contains(collectionName) }.map(mediaItem)
     }
 
-    func relatedItems(for itemRef: MediaItemRef) async throws -> [MediaItem] {
-        guard let raw = catalog.item(id: itemRef.itemID) else { return [] }
+    func related(for ref: MediaItemRef, kind: MediaKind) async throws -> RelatedContent {
+        guard let raw = catalog.item(id: ref.itemID) else {
+            return RelatedContent(items: [], collection: nil)
+        }
         let genres = Set(raw.genres)
-        return catalog.items
+        let items = catalog.items
             .filter { $0.id != raw.id && !genres.isDisjoint(with: $0.genres) }
             .prefix(20)
             .map(mediaItem)
+        return RelatedContent(items: Array(items), collection: nil)
     }
 
     // MARK: - Detail
@@ -110,7 +113,8 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
             mediaSources: [],
             trailerURL: nil,
             contentRating: raw.displayRating,
-            rating: raw.kinopoiskRating ?? raw.imdbRating,
+            rating: MediaRating(raw.kinopoiskRating, source: .unknown)
+                ?? MediaRating(raw.imdbRating, source: .imdb),
             nextEpisode: raw.isSeries ? episode(raw, season: 1, number: 1) : nil,
             collections: []
         )
@@ -160,7 +164,7 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
         throw MediaProviderError.notPlayable
     }
 
-    func progressReporter(for itemRef: MediaItemRef, playSessionID: String?) -> any ProgressReporter {
+    func progressReporter(for itemRef: MediaItemRef, sourceID: String?, playSessionID: String?) -> any ProgressReporter {
         KinoPubDemoProgressReporter()
     }
 
@@ -313,7 +317,7 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
 }
 
 struct KinoPubDemoProgressReporter: ProgressReporter {
-    func start() async {}
+    func start(position: TimeInterval) async {}
     func progress(position: TimeInterval) async {}
     func paused(at position: TimeInterval) async {}
     func stopped(at position: TimeInterval) async {}
