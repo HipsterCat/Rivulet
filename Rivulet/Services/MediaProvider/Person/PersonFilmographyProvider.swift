@@ -6,58 +6,38 @@
 //  Rivulet
 //
 //  Turns a MediaPerson into a PersonDetail:
-//    - Filmography: the person's titles on the user's Plex server, via the
-//      origin library `?actor=` filter (Plex is the filmography source).
-//    - Biography + portrait: TMDB (Plex exposes no actor-bio API). Resolved via
-//      the originating title's TMDB credits + a name match, then /tmdb/person.
-//  The two data sources are injected so the logic unit-tests with fakes.
+//    - Filmography: the person's titles on the user's Plex server, via a
+//      server-wide `?actor=` filter.
+//    - Known For: Plex Discover's list for the person, minus titles already on
+//      the server, as metadata-only items.
+//    - Biography: the Discover person's summary, else TMDB.
+//  The data sources are injected so the logic unit-tests with fakes.
 //
 
 import Foundation
 
-// MARK: - Filter-choice DTO (per-section actor tag list)
 
-/// One entry from a section's actor filter choices
-/// (`/library/sections/{key}/actor`): `key` is the section-LOCAL actor tag id,
-/// `title` the actor name. Decoded with a minimal DTO because these Directory
-/// entries carry far fewer fields than a library `PlexLibrary` Directory.
-///
-/// Some PMS versions surface the id only in `fastKey` (the full path form,
-/// `/library/sections/X/all?actor=49`) and put a non-numeric value in `key`, so
-/// we accept both and prefer the `actor=` value parsed out of `fastKey` when
-/// present. `actorId` is the value to feed back into `?actor=`.
-private nonisolated struct PlexFilterChoiceContainer: Codable, Sendable {
+// MARK: - Default server filmography (server-wide ?actor= lookup)
+
+/// Actor hub entries from `/hubs/search`: `id` is the actor tag id.
+private nonisolated struct PlexActorSearchContainer: Codable, Sendable {
     let MediaContainer: Inner
-    struct Inner: Codable, Sendable { let Directory: [Choice]? }
-    struct Choice: Codable, Sendable {
-        let key: String?
-        let fastKey: String?
-        let title: String
-
-        /// Section-local actor id: the `actor=` query value from `fastKey` if it
-        /// carries one, else the raw `key`.
-        var actorId: String? {
-            if let fastKey,
-               let comps = URLComponents(string: fastKey),
-               let v = comps.queryItems?.first(where: { $0.name == "actor" })?.value,
-               !v.isEmpty {
-                return v
-            }
-            return (key?.isEmpty == false) ? key : nil
-        }
+    struct Inner: Codable, Sendable { let Hub: [Hub]? }
+    struct Hub: Codable, Sendable {
+        let type: String
+        let Directory: [Actor]?
+    }
+    // Optional so a non-actor hub's Directory shape can't fail the decode.
+    struct Actor: Codable, Sendable {
+        let id: Int?
+        let tag: String?
     }
 }
 
-// MARK: - Default server filmography (cross-section ?actor= lookup)
-
-/// The actor's titles across the WHOLE server, not just the section we came
-/// from. Plex actor tag ids are PER-SECTION (the id parsed from one title's
-/// `filter` only matches that title's library), so querying only the origin
-/// section returns just that medium — e.g. opening an actor from a movie would
-/// never surface their shows. We instead enumerate every movie/show section,
-/// resolve the actor's section-local id by NAME via that section's actor filter
-/// choices, then `?actor=<localId>` per section. Returns ([],[]) on any failure.
-private let _defaultServerFilmography: @Sendable (_ person: MediaPerson) async -> [MediaItem] = { person in
+/// The actor's titles across the whole server. Actor tag ids are server-wide
+/// (the same id in every section), so `/library/all?type=&actor=` covers every
+/// library in one call per kind. Returns [] on any failure.
+private let _defaultServerFilmography: @Sendable (_ person: MediaPerson) async -> [FilmographyEntry] = { person in
     let (serverURL, token, providerID): (String?, String?, String) = await MainActor.run {
         let url = PlexAuthManager.shared.selectedServerURL
         let tok = PlexAuthManager.shared.selectedServerToken
@@ -66,67 +46,129 @@ private let _defaultServerFilmography: @Sendable (_ person: MediaPerson) async -
     }
     guard let serverURL, let token else { return [] }
     let headers = await PlexNetworkManager.shared.plexHeaders(authToken: token)
-    let targetName = normalizedActorName(person.name)
 
-    // 1. Enumerate movie + show library sections.
-    let libraries = (try? await PlexNetworkManager.shared.getLibraries(serverURL: serverURL, authToken: token)) ?? []
-    let sections = libraries.filter { $0.type == "movie" || $0.type == "show" }
-    guard !sections.isEmpty else { return [] }
-
-    // 2-4. Per section: resolve the actor's local id by name, then ?actor=<id>.
-    //      The origin section can skip the name resolve (we already have its id).
-    var all: [MediaItem] = []
-    var seenItemIDs = Set<String>()
-    for section in sections {
-        let localActorId: String?
-        if section.key == person.originSectionKey, let originId = person.originActorId {
-            localActorId = originId
-        } else {
-            localActorId = await resolveActorId(
-                serverURL: serverURL, sectionKey: section.key, name: targetName, headers: headers)
-        }
-        guard let actorId = localActorId else { continue }
-        let items = await sectionItems(
-            serverURL: serverURL, sectionKey: section.key, actorId: actorId,
-            providerID: providerID, token: token, headers: headers)
-        for item in items where seenItemIDs.insert(item.ref.itemID).inserted {
-            all.append(item)
-        }
+    var actorId = person.originActorId
+    if actorId == nil {
+        actorId = await searchActorId(serverURL: serverURL, name: person.name, headers: headers)
     }
-    return all
+    guard let actorId else { return [] }
+
+    // Plex type 1 = movie, 2 = show.
+    async let movies = libraryItems(serverURL: serverURL, type: 1, actorId: actorId,
+                                    providerID: providerID, token: token, headers: headers)
+    async let shows = libraryItems(serverURL: serverURL, type: 2, actorId: actorId,
+                                   providerID: providerID, token: token, headers: headers)
+    return await movies + shows
 }
 
-/// Case/diacritic-insensitive name key for matching across sections.
+/// Case/diacritic-insensitive name key.
 private func normalizedActorName(_ s: String) -> String {
     s.folding(options: .diacriticInsensitive, locale: .current)
         .lowercased()
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-/// Fetch a section's actor filter choices and return the tag `key` whose title
-/// matches `name` (already normalized). nil if the section has no such actor.
-private func resolveActorId(serverURL: String, sectionKey: String, name: String, headers: [String: String]) async -> String? {
-    guard let url = URL(string: "\(serverURL)/library/sections/\(sectionKey)/actor") else { return nil }
-    let container: PlexFilterChoiceContainer? = try? await PlexNetworkManager.shared.request(url, headers: headers)
-    let choices = container?.MediaContainer.Directory ?? []
-    return choices.first { normalizedActorName($0.title) == name }?.actorId
+/// Resolve an actor tag id by name through server search, for cast that
+/// arrives without a Plex `filter` id.
+private func searchActorId(serverURL: String, name: String, headers: [String: String]) async -> String? {
+    guard var components = URLComponents(string: "\(serverURL)/hubs/search") else { return nil }
+    components.queryItems = [URLQueryItem(name: "query", value: name), URLQueryItem(name: "limit", value: "10")]
+    guard let url = components.url else { return nil }
+    let container: PlexActorSearchContainer? = try? await PlexNetworkManager.shared.request(url, headers: headers)
+    let target = normalizedActorName(name)
+    return container?.MediaContainer.Hub?
+        .filter { $0.type == "actor" }
+        .flatMap { $0.Directory ?? [] }
+        .first { $0.tag.map(normalizedActorName) == target }?
+        .id.map(String.init)
 }
 
-/// Query one section by its local actor id and map to on-server MediaItems.
-private func sectionItems(serverURL: String, sectionKey: String, actorId: String, providerID: String, token: String, headers: [String: String]) async -> [MediaItem] {
-    guard var components = URLComponents(string: "\(serverURL)/library/sections/\(sectionKey)/all") else { return [] }
-    components.queryItems = [URLQueryItem(name: "actor", value: actorId)]
+/// Every title of one Plex type featuring the actor, across all libraries.
+private func libraryItems(serverURL: String, type: Int, actorId: String, providerID: String, token: String, headers: [String: String]) async -> [FilmographyEntry] {
+    guard var components = URLComponents(string: "\(serverURL)/library/all") else { return [] }
+    components.queryItems = [URLQueryItem(name: "type", value: String(type)),
+                             URLQueryItem(name: "actor", value: actorId),
+                             URLQueryItem(name: "includeGuids", value: "1")]
     guard let url = components.url else { return [] }
     let container: PlexMediaContainerWrapper? = try? await PlexNetworkManager.shared.request(url, headers: headers)
     let metadatas = container?.MediaContainer.Metadata ?? []
-    return metadatas.compactMap { PlexMediaMapper.item($0, providerID: providerID, serverURL: serverURL, authToken: token) }
+    return metadatas.map { meta in
+        FilmographyEntry(item: PlexMediaMapper.item(meta, providerID: providerID, serverURL: serverURL, authToken: token),
+                         isOnServer: true, guid: meta.guid, tmdbId: meta.tmdbId)
+    }
 }
 
-// MARK: - Default biography lookup (TMDB)
+// MARK: - Plex Discover (bio + Known For)
 
-/// TMDB biography only — the portrait stays the Plex role thumb (see
-/// TMDBClient.actorBiography). Returns nil if the actor can't be resolved.
+/// Minimal Discover metadata: serves the person, the Known For hub, and the
+/// batch metadata lookup.
+private nonisolated struct DiscoverContainer: Codable, Sendable {
+    let MediaContainer: Inner
+    struct Inner: Codable, Sendable { let Metadata: [Item]? }
+    struct Item: Codable, Sendable {
+        let ratingKey: String?
+        let guid: String?
+        let type: String?
+        let title: String?
+        let year: Int?
+        let thumb: String?
+        let summary: String?
+        let Guid: [Tag]?
+    }
+    struct Tag: Codable, Sendable { let id: String }
+}
+
+/// Discover needs the account token, not the server token.
+private func discoverItems(_ path: String) async -> [DiscoverContainer.Item] {
+    guard let token = await MainActor.run(body: { PlexAuthManager.shared.authToken }),
+          let url = URL(string: "https://discover.provider.plex.tv\(path)") else { return [] }
+    let headers = await PlexNetworkManager.shared.plexHeaders(authToken: token)
+    let container: DiscoverContainer? = try? await PlexNetworkManager.shared.request(url, headers: headers)
+    return container?.MediaContainer.Metadata ?? []
+}
+
+/// The person's Known For titles as metadata-only items keyed by TMDB id.
+/// The hub carries no TMDB ids, so they come from a batch metadata fetch
+/// (Discover caps a batch at 20 keys).
+private let _defaultKnownFor: @Sendable (MediaPerson) async -> [FilmographyEntry] = { person in
+    guard let tagKey = person.tagKey else { return [] }
+    let titles = await discoverItems("/library/people/\(tagKey)/person_known_for")
+        .filter { $0.type == "movie" || $0.type == "show" }
+    let keys = titles.compactMap(\.ratingKey)
+    let chunks = stride(from: 0, to: keys.count, by: 20).map { Array(keys[$0..<min($0 + 20, keys.count)]) }
+    let tmdbByKey = await withTaskGroup(of: [DiscoverContainer.Item].self) { group in
+        for chunk in chunks {
+            group.addTask { await discoverItems("/library/metadata/\(chunk.joined(separator: ","))?includeGuids=1") }
+        }
+        var map: [String: Int] = [:]
+        for await items in group {
+            for item in items {
+                guard let key = item.ratingKey,
+                      let id = item.Guid?.lazy.compactMap({ PlexMetadata.extractTmdbId(from: $0.id) }).first else { continue }
+                map[key] = id
+            }
+        }
+        return map
+    }
+    return titles.compactMap { t in
+        guard let key = t.ratingKey, let tmdbId = tmdbByKey[key], let title = t.title else { return nil }
+        let item = PersonItemMapper.metadataOnlyItem(
+            tmdbId: tmdbId, isMovie: t.type == "movie", title: title, year: t.year,
+            posterURL: t.thumb.flatMap(URL.init(string:)), overview: t.summary)
+        return FilmographyEntry(item: item, isOnServer: false, guid: t.guid, tmdbId: tmdbId)
+    }
+}
+
+// MARK: - Default biography lookup
+
+/// Discover person summary, else TMDB. The portrait stays the Plex role thumb
+/// (see TMDBClient.actorBiography). Returns nil if the actor can't be resolved.
 private let _defaultBiography: @Sendable (MediaPerson) async -> String? = { person in
+    if let tagKey = person.tagKey,
+       let summary = await discoverItems("/library/people/\(tagKey)").first?.summary,
+       !summary.isEmpty {
+        return summary
+    }
     guard let titleTmdbId = person.titleTmdbId else { return nil }
     let type: TMDBMediaType = person.titleIsMovie ? .movie : .tv
     return await TMDBClient.shared.actorBiography(titleTmdbId: titleTmdbId, type: type, actorName: person.name)
@@ -139,21 +181,24 @@ final class PersonFilmographyProvider: PersonFilmographyProviding {
 
     /// Cross-section server filmography for the person (all on-server titles,
     /// any library). Injected for tests.
-    private let serverFilmographyItems: @Sendable (_ person: MediaPerson) async -> [MediaItem]
+    private let serverFilmographyItems: @Sendable (_ person: MediaPerson) async -> [FilmographyEntry]
     private let biography: @Sendable (MediaPerson) async -> String?
+    private let knownForTitles: @Sendable (MediaPerson) async -> [FilmographyEntry]
 
     nonisolated init(
-        serverFilmographyItems: @escaping @Sendable (_ person: MediaPerson) async -> [MediaItem] = _defaultServerFilmography,
-        biography: @escaping @Sendable (MediaPerson) async -> String? = _defaultBiography
+        serverFilmographyItems: @escaping @Sendable (_ person: MediaPerson) async -> [FilmographyEntry] = _defaultServerFilmography,
+        biography: @escaping @Sendable (MediaPerson) async -> String? = _defaultBiography,
+        knownFor: @escaping @Sendable (MediaPerson) async -> [FilmographyEntry] = _defaultKnownFor
     ) {
         self.serverFilmographyItems = serverFilmographyItems
         self.biography = biography
+        self.knownForTitles = knownFor
     }
 
     nonisolated func load(person: MediaPerson) async throws -> PersonDetail {
-        async let filmTask = serverFilmography(person)
+        async let serverTask = serverFilmographyItems(person)
         async let bioTask = biography(person)
-        let (movies, shows) = await filmTask
+        let (movies, shows) = Self.bucket(await serverTask)
         let bio = await bioTask
         return PersonDetail(
             id: person.tagKey ?? person.id,
@@ -166,14 +211,16 @@ final class PersonFilmographyProvider: PersonFilmographyProviding {
             shows: shows)
     }
 
-    /// Cross-section server `?actor=` filmography, bucketed by kind. All on-server.
-    nonisolated private func serverFilmography(_ person: MediaPerson) async -> (movies: [FilmographyEntry], shows: [FilmographyEntry]) {
+    nonisolated func knownFor(person: MediaPerson) async -> [FilmographyEntry] {
+        await knownForTitles(person)
+    }
+
+    /// Server filmography bucketed by kind. All on-server.
+    nonisolated private static func bucket(_ titles: [FilmographyEntry]) -> (movies: [FilmographyEntry], shows: [FilmographyEntry]) {
         var movies: [FilmographyEntry] = []
         var shows: [FilmographyEntry] = []
-        let items = await serverFilmographyItems(person)
-        for item in items {
-            let entry = FilmographyEntry(item: item, isOnServer: true)
-            switch item.kind {
+        for entry in titles {
+            switch entry.item.kind {
             case .movie: movies.append(entry)
             case .show: shows.append(entry)
             default: break

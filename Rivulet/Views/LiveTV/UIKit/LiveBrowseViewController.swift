@@ -35,14 +35,13 @@ final class LiveBrowseViewController: UIViewController {
     private let clockLabel = UILabel()
     private let miniPlayer = LiveMiniPlayerView()
     private var miniSession: LiveTVSessionHandoff?
+    /// Menu's focus targets, read once by `preferredFocusEnvironments`.
+    private var pendingMiniPlayerFocus = false
+    private var pendingTopRowFocus = false
 
     // Shelves
     /// Also multiview's Add More rows (`LiveMultiviewViewController`).
-    struct Shelf {
-        let id: String
-        let title: String
-        let items: [LiveCardItem]
-    }
+    typealias Shelf = LiveShelf
 
     private var collectionView: UICollectionView!
     /// One section and one item per shelf, both keyed by the shelf id: each
@@ -117,7 +116,8 @@ final class LiveBrowseViewController: UIViewController {
         ])
 
         let store = LiveTVDataStore.shared
-        Publishers.CombineLatest4(store.$channels, store.$epg, store.$scheduledRecordings, store.$favoriteIds)
+        Publishers.CombineLatest4(store.$channels, store.$epg, store.$scheduledRecordings,
+                                 store.$favoriteIds.combineLatest(store.$unfavoritedIds))
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _, _, _, _ in self?.rebuildShelves() }
             .store(in: &cancellables)
@@ -150,8 +150,15 @@ final class LiveBrowseViewController: UIViewController {
         minuteTimer = timer
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // Again on each appear: handlers are asked newest first.
+        MenuPressInterceptor.register(self)
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        MenuPressInterceptor.resign(self)
         minuteTimer?.invalidate()
         minuteTimer = nil
         // Another tab or page: the corner channel ends here, as in the guide.
@@ -170,7 +177,20 @@ final class LiveBrowseViewController: UIViewController {
     }
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
-        [collectionView].compactMap { $0 }
+        if pendingMiniPlayerFocus { return [miniPlayer] }
+        if pendingTopRowFocus, let top = collectionView?.cellForItem(at: IndexPath(item: 0, section: 0)) {
+            return [top]
+        }
+        return [collectionView].compactMap { $0 }
+    }
+
+    /// The header follows focus onto the corner player.
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        if context.nextFocusedView === miniPlayer, let channel = miniSession?.channel {
+            showInfo(for: .channel(channel, program: LiveTVDataStore.shared.getCurrentProgram(for: channel),
+                                   section: "corner"))
+        }
     }
 
     // MARK: - Header
@@ -204,6 +224,11 @@ final class LiveBrowseViewController: UIViewController {
         clockLabel.font = .monospacedDigitSystemFont(ofSize: 30, weight: .semibold)
         clockLabel.textColor = UIColor.white.withAlphaComponent(0.85)
         miniPlayer.isHidden = true
+        // A focus stop, so Menu has somewhere to come back to, as in the guide.
+        miniPlayer.isFocusable = true
+        let select = UITapGestureRecognizer(target: self, action: #selector(selectMiniPlayer))
+        select.allowedPressTypes = [NSNumber(value: UIPress.PressType.select.rawValue)]
+        miniPlayer.addGestureRecognizer(select)
 
         [eyebrowLabel, titleLabel, detailLabel, summaryLabel, clockLabel, miniPlayer].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -431,123 +456,7 @@ final class LiveBrowseViewController: UIViewController {
     /// The What's On rows for a source (nil: every source). Static so
     /// multiview's Add More offers the same rows.
     static func buildShelves(sourceIdFilter: String?, now: Date = Date()) -> [Shelf] {
-        let store = LiveTVDataStore.shared
-        let all = sourceIdFilter.map { id in store.channels.filter { $0.sourceId == id } } ?? store.channels
-        // An empty event slot has nothing to show; Favorites and Recently
-        // Watched still list it, since the viewer chose it.
-        let channels = all.filter { store.getCurrentProgram(for: $0)?.isEmptySlot != true }
-        let channelsById = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var shelves: [Shelf] = []
-
-        func onNow(_ list: [UnifiedChannel], section: String) -> [LiveCardItem] {
-            list.map { channel in
-                let program = store.getCurrentProgram(for: channel)
-                // A pregame block stands in for the game after it: the card is the game.
-                guard let block = program, block.isPregameBlock else {
-                    return .channel(channel, program: program, section: section)
-                }
-                return .upcoming(store.getNextProgram(for: channel) ?? block, on: channel, section: section)
-            }
-        }
-        // Channels showing something now, not holding a slot for a later game.
-        let airing = channels.filter { store.getCurrentProgram(for: $0)?.isPregameBlock != true }
-
-        // Channels played lately, newest first, to go straight back to one.
-        let recent = store.recentChannelIds.compactMap { channelsById[$0] }
-        if !recent.isEmpty {
-            shelves.append(Shelf(id: "recent", title: "Recently Watched", items: onNow(recent, section: "recent")))
-        }
-
-        // Like what this viewer watches at this hour, from what is on now.
-        // Recently Watched already covers going back, so its channels are left out.
-        if store.suggestionsEnabled {
-            let recentIds = Set(store.recentChannelIds)
-            let candidates = airing.filter { !recentIds.contains($0.id) }.map { channel in
-                let program = store.getCurrentProgram(for: channel)
-                return (channel: channel, program: program,
-                        genre: LiveGenre.of(channel, airing: program, guide: store.epg[channel.id] ?? []))
-            }
-            let picks = LiveSuggestions.rank(candidates, history: store.viewings, now: now).prefix(20)
-            if picks.count >= 3 {
-                shelves.append(Shelf(id: "foryou", title: "For You", items: onNow(Array(picks), section: "foryou")))
-            }
-        }
-
-        // What is being recorded or about to be.
-        let recordings = store.scheduledRecordings
-            .filter { ($0.status == .scheduled || $0.status == .recording) && $0.endTime > now }
-            .filter { sourceIdFilter == nil || $0.sourceId == sourceIdFilter }
-            .sorted { $0.startTime < $1.startTime }
-            .prefix(30)
-            .map { recording in
-                LiveCardItem.recording(recording, channel: recording.channelId.flatMap { channelsById[$0] })
-            }
-        if !recordings.isEmpty {
-            shelves.append(Shelf(id: "recordings", title: "Recordings", items: recordings))
-        }
-
-        let favourites = store.favorites(in: all)
-        if !favourites.isEmpty {
-            shelves.append(Shelf(id: "favorites", title: "Favorites", items: onNow(favourites, section: "favorites")))
-        }
-
-        if !airing.isEmpty {
-            shelves.append(Shelf(id: "now", title: "On Now", items: onNow(Array(airing.prefix(150)), section: "now")))
-        }
-
-        // The next programme on each channel that starts within the next
-        // ninety minutes: what this viewer watches when each one starts
-        // first, then soonest first.
-        let horizon = now.addingTimeInterval(90 * 60)
-        let upcoming = channels.compactMap { channel -> LiveSuggestions.Candidate? in
-            guard let next = store.getNextProgram(for: channel),
-                  !next.id.contains(":placeholder:"), !next.isEmptySlot,
-                  next.startTime > now, next.startTime <= horizon else { return nil }
-            return (channel, next, LiveGenre.of(channel, airing: next, guide: store.epg[channel.id] ?? []))
-        }
-        let likeness = store.suggestionsEnabled
-            ? LiveSuggestions.scores(upcoming.map { ($0, $0.program?.startTime ?? now) },
-                                     history: store.viewings, now: now)
-            : upcoming.map { _ in 0 }
-        let soon = zip(upcoming, likeness.map { $0 >= LiveSuggestions.threshold ? $0 : 0 })
-            .sorted { $0.1 != $1.1 ? $0.1 > $1.1
-                : ($0.0.program?.startTime ?? now) < ($1.0.program?.startTime ?? now) }
-            .prefix(40)
-            .compactMap { candidate, _ in candidate.program.map { LiveCardItem.upcoming($0, on: candidate.channel) } }
-        if !soon.isEmpty {
-            shelves.append(Shelf(id: "soon", title: "Starting Soon", items: soon))
-        }
-
-        // A shelf per genre, when the lineup spans more than one, by what each
-        // channel is showing now. Cards move rows at programme boundaries; a
-        // local station that usually airs sports is not sports during church.
-        // A genre with only a channel or two gets no row of its own.
-        let byGenre = Dictionary(grouping: airing) { channel in
-            LiveGenre.of(channel, airing: store.getCurrentProgram(for: channel), guide: store.epg[channel.id] ?? [])
-        }
-        let genres = LiveGenre.allCases.filter { (byGenre[$0] ?? []).count >= 3 }
-        if genres.count > 1 {
-            for genre in genres {
-                let id = "genre|\(genre.rawValue)"
-                let list = Array((byGenre[genre] ?? []).prefix(60))
-                shelves.append(Shelf(id: id, title: genre.rawValue, items: onNow(list, section: id)))
-            }
-        }
-
-        // A shelf per channel group, when the source groups at all.
-        let groups = Dictionary(grouping: channels) {
-            $0.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        let groupTitles = groups.keys.filter { !$0.isEmpty }.sorted()
-        if groupTitles.count > 1 {
-            for title in groupTitles.prefix(16) {
-                let id = "group|\(title)"
-                let list = Array((groups[title] ?? []).prefix(60))
-                shelves.append(Shelf(id: id, title: title, items: onNow(list, section: id)))
-            }
-        }
-
-        return shelves.map { Shelf(id: $0.id, title: $0.title, items: $0.items.uniquedById().markingRecordings(store)) }
+        LiveTVDataStore.shared.whatsOnShelves(sourceIdFilter: sourceIdFilter, now: now)
     }
 
     private func rebuildShelves() {
@@ -713,5 +622,53 @@ final class LiveBrowseViewController: UIViewController {
 
     private func stopMini() {
         takeMini()?.stop()
+    }
+
+    /// Back full screen: `play` adopts the corner session for its channel.
+    @objc private func selectMiniPlayer() {
+        if let channel = miniSession?.channel { play(channel) }
+    }
+}
+
+extension LiveBrowseViewController: MenuBackHandling {
+    /// As in the guide: Menu focuses the corner player, or the top row when
+    /// there is none, and returns the page to its top. From the corner player
+    /// or the top row it declines, so the sidebar opens.
+    func handleMenuBack() -> Bool {
+        // Focus must be in this page: a player or menu presented over it holds
+        // focus in its own views, and Menu keeps its meaning there.
+        guard isViewLoaded, let system = UIFocusSystem.focusSystem(for: view),
+              let focused = system.focusedItem as? UIView,
+              focused.isDescendant(of: view), !focused.isDescendant(of: miniPlayer)
+        else { return false }
+        // Requested from this controller, which holds focus (one aimed at the
+        // corner player is ignored), and before the scroll, which can take the
+        // focused cell away.
+        if !miniPlayer.isHidden {
+            pendingMiniPlayerFocus = true
+            setNeedsFocusUpdate()
+            updateFocusIfNeeded()
+            pendingMiniPlayerFocus = false
+            if system.focusedItem === miniPlayer {
+                scrollShelvesToTop()
+                return true
+            }
+        }
+        let row = sequence(first: focused, next: \.superview).first { $0 is ShelfRowCell } as? UICollectionViewCell
+        guard let row, StagedMenuBack.shouldReturnToTop(
+            focusedSection: collectionView.indexPath(for: row)?.section, topSection: 0)
+        else { return false }
+        // Scroll first here: the top row's cell must exist to be preferred.
+        scrollShelvesToTop()
+        pendingTopRowFocus = true
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+        pendingTopRowFocus = false
+        return true
+    }
+
+    private func scrollShelvesToTop() {
+        collectionView.setContentOffset(CGPoint(x: 0, y: -collectionView.adjustedContentInset.top), animated: false)
+        collectionView.layoutIfNeeded()
     }
 }

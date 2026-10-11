@@ -1613,8 +1613,8 @@ final class PlexHomeViewController: UIViewController {
     /// this when a member's watch state may have changed. The generation bump
     /// discards any page still in flight, which is in `gridPagesRequested` and
     /// so is re-requested below.
-    // ponytail: re-requests every loaded page (7 at most for the largest
-    // measured collection, 416 members); fetch only visible pages if it shows up.
+    // ponytail: re-requests every loaded page (a library scrolled deep can hold
+    // dozens); fetch only visible pages if it shows up.
     private func reloadLoadedGridPages() {
         gridGeneration += 1
         let pages = gridPagesRequested
@@ -3349,12 +3349,11 @@ final class PlexHomeViewController: UIViewController {
                             await self.refreshRecommendations(force: true)
                         }
                     case .library:
-                        if self.providerLibrary != nil {
-                            // The reload bumps the generation, which discards
-                            // an in-flight letter count; ask again.
-                            self.reloadLoadedGridPages()
-                            self.loadAlphabetIndex()
-                        }
+                        // Repaint badges (show unwatched counts, #333). The
+                        // reload bumps the generation, which discards an
+                        // in-flight letter count; ask again.
+                        self.reloadLoadedGridPages()
+                        self.loadAlphabetIndex()
                         await self.refreshThisLibraryHubs()
                     case .collection:
                         // Playback and detail-page watch changes: re-request
@@ -3740,6 +3739,9 @@ final class PlexHomeViewController: UIViewController {
                 // never updates its progress bars.
                 hasher.combine(item.userState.viewOffset)
                 hasher.combine(item.userState.lastViewedAt)
+                // A show's unwatched count and watched glyph (#333).
+                hasher.combine(item.childProgress)
+                hasher.combine(item.userState.isPlayed)
             }
         }
         return hasher.finalize()
@@ -6397,8 +6399,8 @@ extension PlexHomeViewController: UICollectionViewDelegate {
 
             let cwMiddle = [
                 TileMenuAction(title: "Mark as Watched",
-                               systemImage: "eye.fill") { [weak self] in
-                    self?.performMenuAction {
+                               systemImage: "eye.fill") {
+                    Self.changeOnServer {
                         try await network.markWatched(serverURL: serverURL, authToken: token, ratingKey: ratingKey)
                     }
                 },
@@ -6453,16 +6455,16 @@ extension PlexHomeViewController: UICollectionViewDelegate {
         let isWatched = item.isWatched
         if !isWatched || item.watchProgress != nil {
             middle.append(TileMenuAction(title: "Mark as Watched",
-                                         systemImage: "eye.fill") { [weak self] in
-                self?.performMenuAction {
+                                         systemImage: "eye.fill") {
+                Self.changeOnServer {
                     try await network.markWatched(serverURL: serverURL, authToken: token, ratingKey: ratingKey)
                 }
             })
         }
         if isWatched {
             middle.append(TileMenuAction(title: "Mark as Unwatched",
-                                         systemImage: "eye.slash.fill") { [weak self] in
-                self?.performMenuAction {
+                                         systemImage: "eye.slash.fill") {
+                Self.changeOnServer {
                     try await network.markUnwatched(serverURL: serverURL, authToken: token, ratingKey: ratingKey)
                 }
             })
@@ -6555,20 +6557,6 @@ extension PlexHomeViewController: UICollectionViewDelegate {
         Task { @MainActor in
             try? await change()
             NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
-        }
-    }
-
-    /// Performs a context-menu action, then refreshes hubs from the server.
-    private func performMenuAction(_ action: @escaping () async throws -> Void) {
-        Task { @MainActor in
-            do {
-                try await action()
-            } catch {}
-            // Collection page: a member's watch state changed from its tile
-            // menu, which posts no .plexDataNeedsRefresh.
-            if case .collection = mode { reloadLoadedGridPages() }
-            await dataStore.refreshHubs()
-            await dataStore.refreshLibraryHubs()
         }
     }
 
@@ -7012,15 +7000,46 @@ extension PlexHomeViewController: MenuBackHandling {
     /// engine re-resolves mid-flight, lands on whatever row is passing, and
     /// scrolls that back into view (the page ends up one row higher instead of
     /// at the top). Setting the offset and laying out first creates the cell,
-    /// so the focus request has somewhere to land.
+    /// so the focus request has somewhere to land. The scroll the viewer sees
+    /// is drawn over the jump afterwards (`playReturnToTopSlide`).
     private func returnToTopRow() {
+        let travel = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
+        let before = collectionView.snapshotView(afterScreenUpdates: false)
         aimFocusAtTopRow()
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
+        playReturnToTopSlide(from: before, travel: travel)
         // The hero's buttons live in a SwiftUI subview that may not be
         // focusable until the next runloop turn; re-assert once it is.
         DispatchQueue.main.async { [weak self] in
             self?.nudgeInitialHeroFocusIfNeeded()
         }
+    }
+
+    /// Draws the trip back up as a quick scroll. The page has already jumped
+    /// and focus has landed; this only slides the old picture down and the top
+    /// in after it, on presentation layers, so neither layout nor focus moves.
+    private func playReturnToTopSlide(from snapshot: UIView?, travel: CGFloat) {
+        let distance = min(travel, collectionView.bounds.height)
+        guard let snapshot, distance > 1, !UIAccessibility.isReduceMotionEnabled else { return }
+        snapshot.frame = collectionView.frame
+        view.insertSubview(snapshot, aboveSubview: collectionView)
+        CATransaction.begin()
+        // The snapshot can sit over the hero's buttons, which blocks focus
+        // geometrically, so the hero nudge runs again once it is gone.
+        CATransaction.setCompletionBlock { [weak self] in
+            snapshot.removeFromSuperview()
+            self?.nudgeInitialHeroFocusIfNeeded()
+        }
+        for (layer, from, to) in [(collectionView.layer, -distance, 0), (snapshot.layer, 0, distance)] {
+            let slide = CABasicAnimation(keyPath: "transform.translation.y")
+            slide.fromValue = from
+            slide.toValue = to
+            slide.duration = 0.35
+            slide.timingFunction = CAMediaTimingFunction(controlPoints: 0.33, 1, 0.68, 1)  // ease-out cubic
+            layer.add(slide, forKey: "returnToTop")
+        }
+        snapshot.layer.transform = CATransform3DMakeTranslation(0, distance, 0)
+        CATransaction.commit()
     }
 }

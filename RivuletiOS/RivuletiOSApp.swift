@@ -6,17 +6,33 @@ import UIKit
 
 @main
 struct RivuletiOSApp: App {
-    @StateObject private var plex = IOSPlexSession()
-    @StateObject private var navigation = IOSNavigationSettings()
+    @UIApplicationDelegateAdaptor(IOSAppDelegate.self) private var appDelegate
+    @StateObject private var plex: IOSPlexSession
 
     init() {
         // Order matters: identity and migration must land before anything
-        // touches PlexAuthManager.shared or builds a request — the manager
-        // reads Keychain and UserDefaults in its init, and PlexAPI values are
-        // baked into every header.
+        // touches PlexAuthManager.shared (the session does) or builds a request.
+        // The manager reads Keychain and UserDefaults in its init, and PlexAPI
+        // values are baked into every header.
         Self.migrateLegacyIOSSession()
+        #if DEBUG
+        IOSScreenshotMode.seedSession()
+        #endif
         PlexAPI.platform = "iOS"
         PlexAPI.deviceName = UIDevice.current.model   // "iPhone" / "iPad"
+        let session = IOSPlexSession()
+        session.installProfileHooks()
+        _plex = StateObject(wrappedValue: session)
+        // Start the path monitor now; its first reading arrives after a delay.
+        _ = NetworkPathMonitor.shared
+        // Recreates the background session and resumes unfinished downloads.
+        IOSDownloadCenter.shared.start()
+        // Folds the old single-source settings into the shared store, then
+        // warms the guide so the Live TV tab opens with data.
+        Task {
+            await LiveTVDataStore.shared.migrateLegacyIOSSource(defaults: .standard)
+            LiveTVDataStore.shared.startBackgroundPreload()
+        }
 
         #if !DEBUG
         // Deferred and gated exactly like tvOS: the SDK is never started in
@@ -35,7 +51,7 @@ struct RivuletiOSApp: App {
         WindowGroup {
             IOSRootView()
                 .environmentObject(plex)
-                .environmentObject(navigation)
+                .environmentObject(IOSDownloadCenter.shared)
         }
     }
 
