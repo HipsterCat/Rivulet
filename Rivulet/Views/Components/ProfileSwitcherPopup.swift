@@ -22,22 +22,25 @@ struct ProfileSwitcherPopup: View {
     @State private var isLoading = false
     @FocusState private var focusedUserId: Int?
 
+    // The Apple TV app's profile panel: 384 wide, insets 14 / 14 / 34,
+    // two columns that overlap 4pt, rows 10 apart, 160pt avatars growing to 180.
     private let columns = [
-        GridItem(.adaptive(minimum: 150, maximum: 170), spacing: 8)
+        GridItem(.fixed(180), spacing: -4),
+        GridItem(.fixed(180))
     ]
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             // Popup card — positioned top-left directly below sidebar pill
-            LazyVGrid(columns: columns, spacing: 8) {
+            LazyVGrid(columns: columns, spacing: 10) {
                 ForEach(profileManager.homeUsers) { user in
                     profileButton(for: user)
                         .focused($focusedUserId, equals: user.id)
                 }
             }
-            .padding(28)
-            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 58))
-            .frame(maxWidth: 420)
+            .padding(EdgeInsets(top: 14, leading: 14, bottom: 34, trailing: 14))
+            .frame(width: 384)
+            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 50))
             .padding(.top, 70)
             .padding(.leading, 0)
         }
@@ -48,7 +51,14 @@ struct ProfileSwitcherPopup: View {
         .onExitCommand {
             isPresented = false
         }
-        .sheet(isPresented: $showPinEntry) {
+        // Close as soon as the profile is entered: by the time this runs its token
+        // is installed and the old content dropped, so Home loads in view.
+        // A PIN sheet closes first and its onDismiss closes the panel.
+        .onChange(of: profileManager.selectedUser?.id) { _, _ in
+            guard didEnterRequestedProfile else { return }
+            if showPinEntry { showPinEntry = false } else { isPresented = false }
+        }
+        .sheet(isPresented: $showPinEntry, onDismiss: { if didEnterRequestedProfile { isPresented = false } }) {
             if let user = selectedUserForPin {
                 PinEntrySheet(
                     user: user,
@@ -68,13 +78,17 @@ struct ProfileSwitcherPopup: View {
         }
     }
 
+    private var didEnterRequestedProfile: Bool {
+        selectedUserForPin != nil && selectedUserForPin?.id == profileManager.selectedUser?.id
+    }
+
     private func profileButton(for user: PlexHomeUser) -> some View {
         let isCurrent = profileManager.selectedUser?.id == user.id
         let isFocused = focusedUserId == user.id
         let isLoadingThis = isLoading && selectedUserForPin?.id == user.id
 
-        let firstName = user.displayName.split(separator: " ").first.map(String.init) ?? user.displayName
-        let avatarSize: CGFloat = 140
+        let firstName = ShellSidebarModel.firstName(of: user.displayName)
+        let avatarSize: CGFloat = 160
 
         return Button {
             selectProfile(user)
@@ -101,16 +115,12 @@ struct ProfileSwitcherPopup: View {
                 }
                 .overlay(alignment: .topTrailing) {
                     if isCurrent && !isLoadingThis {
-                        Circle()
-                            .fill(.white)
-                            .frame(width: 34, height: 34)
-                            .overlay {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.system(size: 38))
-                                    .symbolRenderingMode(.palette)
-                                    .foregroundStyle(.white, .green)
-                            }
-                            .offset(x: 8, y: -8)
+                        // 36pt badge, the TV app's size.
+                        Image(systemName: "checkmark.circle.fill")
+                            .resizable()
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, .green)
+                            .frame(width: 36, height: 36)
                     } else if user.protected && !isCurrent && !isLoadingThis {
                         Image(systemName: profileManager.usersWithRememberedPins.contains(user.uuid)
                               ? "lock.open.fill" : "lock.fill")
@@ -122,15 +132,17 @@ struct ProfileSwitcherPopup: View {
                             .offset(x: 4, y: -4)
                     }
                 }
+                // Only the avatar grows on focus; the name stays put.
+                .scaleEffect(isFocused ? 180 / avatarSize : 1.0)
 
                 Text(firstName)
-                    .font(.system(size: 22, weight: isFocused ? .semibold : .regular))
+                    .font(Font(UIFont.preferredFont(forTextStyle: .caption2)).weight(isFocused ? .semibold : .regular))
+                    .padding(.horizontal, 5)
                     .foregroundStyle(.white.opacity(isFocused ? 1.0 : 0.7))
                     .lineLimit(1)
             }
         }
         .buttonStyle(ProfileSwitcherButtonStyle())
-        .scaleEffect(isFocused ? 1.08 : 1.0)
         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isFocused)
     }
 
@@ -199,12 +211,11 @@ struct ProfileSwitcherPopup: View {
             Task {
                 isLoading = true
                 selectedUserForPin = user
+                // Usually closed already by the selectedUser change above; this is the fallback.
                 let success = await profileManager.selectUser(user, pin: nil)
                 isLoading = false
                 selectedUserForPin = nil
-                if success {
-                    isPresented = false
-                }
+                if success { isPresented = false }
             }
         }
     }

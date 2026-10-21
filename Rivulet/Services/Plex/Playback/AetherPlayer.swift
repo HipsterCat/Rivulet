@@ -177,6 +177,9 @@ final class AetherPlayer: PlayerProtocol {
         } catch {
             fatalError("AetherEngine init failed: \(error)")
         }
+        // The engine otherwise uses system trust alone, so a server the API
+        // session accepts would browse and never play (#337).
+        EngineTLS.serverTrustEvaluator = { PlexCertificateDelegate.trustsServer($0) }
         wireUpPublishers()
         observeAppLifecycle()
     }
@@ -773,6 +776,14 @@ final class AetherPlayer: PlayerProtocol {
     /// The engine's decode path and source codec for the current load, as
     /// plain strings for telemetry.
     var videoRouteName: String { engine.videoRoute.rawValue }
+
+    /// How the current Dolby Vision source is reaching the screen; nil when not DV.
+    var dolbyVisionPlayback: DolbyVisionPlayback? {
+        DolbyVisionPlayback(sourceProfile: engine.sourceDVProfile,
+                            convertedTo81: engine.dolbyVisionConversion == .profile7ToProfile81,
+                            presentsDolbyVision: engine.videoFormat == .dolbyVision,
+                            presentsHDR: engine.videoFormat != .sdr)
+    }
     var sourceVideoCodecName: String? { engine.sourceVideoCodecName }
 
     /// The start of a fullscreen live join, measured for issue #319. See
@@ -1016,6 +1027,9 @@ final class AetherPlayer: PlayerProtocol {
         return text.contains(".m3u8") || text.contains("format=hls")
     }
 
+    /// Speaker layout ("7.1.4"…) object audio renders into; absent = off.
+    static let heightSpeakersKey = "heightSpeakers"
+
     /// DVB teletext caption page, applied to BOTH live and VOD loads. A
     /// `liveTeletextPage` UserDefaults key overrides everything (0 = force
     /// libzvbi auto-detect); otherwise Australian regions default to 801
@@ -1032,7 +1046,7 @@ final class AetherPlayer: PlayerProtocol {
     /// The user's saved audio-language intent (ISO code), if any.
     private static func livePreferredAudioLanguages() -> [String] {
         let lang = TrackIntentStore.effectiveAudioIntent.language
-        return lang.isEmpty ? [] : [lang]
+        return lang.isEmpty || lang == TrackLanguage.original ? [] : [lang]
     }
 
     /// The user's saved subtitle-language intent (ISO code) when subtitles
@@ -1080,7 +1094,7 @@ final class AetherPlayer: PlayerProtocol {
         // so the engine can also serve them as native WebVTT renditions if
         // that path is ever enabled; httpHeaders nil inherits the media's
         // own LoadOptions headers (same Plex auth).
-        let options = LoadOptions(
+        var options = LoadOptions(
             suppressDisplayCriteria: false,
             httpHeaders: headers ?? [:],
             matchContentEnabled: true,
@@ -1109,6 +1123,14 @@ final class AetherPlayer: PlayerProtocol {
             // way whichever surface plays it (VOD recordings/rips included).
             teletextPage: Self.regionTeletextPage()
         )
+        // Settings → Playback → Height Speakers: TrueHD Atmos and DTS:X keep their heights as
+        // lossy APAC (sent to the receiver as Atmos) instead of lossless 7.1 without them.
+        let heightLayout = SpatialSpeakerLayout(rawValue: UserDefaults.standard.string(forKey: Self.heightSpeakersKey) ?? "")
+        if let heightLayout { options.objectAudioRendering = .apac(heightLayout) }
+        // Profile 7 FEL composes both layers (#345). The engine doesn't check the panel,
+        // so keep the native route (HDR10 base) where the TV can't show Dolby Vision.
+        // Heights only render on the native route, so they win over FEL (which then plays as 8.1).
+        options.preferDualLayerDolbyVision = AetherEngine.displayCapabilities.supportsDolbyVision && heightLayout == nil
         // New content, so the previous item's aspect ratio describes nothing.
         // Reset HERE rather than when `currentItem` goes nil: the engine also
         // swaps its player for SAME-content reasons (audio track switch,

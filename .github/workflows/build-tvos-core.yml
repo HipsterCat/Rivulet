@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same Xcode as the TestFlight archive: codemagic.yaml's `xcode:` pin.
       # runs-on must name the image that carries it (xcode-27 for 27.x).
@@ -43,7 +43,7 @@ jobs:
           xcodebuild -version
 
       - name: Cache Swift packages
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: SourcePackages
           key: spm-${{ runner.os }}-${{ hashFiles('Rivulet.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
@@ -61,6 +61,7 @@ jobs:
             -configuration Debug \
             -destination 'generic/platform=tvOS Simulator' \
             -clonedSourcePackagesDirPath SourcePackages \
+            -onlyUsePackageVersionsFromResolvedFile \
             -quiet \
             CODE_SIGNING_ALLOWED=NO \
             ARCHS=arm64 \

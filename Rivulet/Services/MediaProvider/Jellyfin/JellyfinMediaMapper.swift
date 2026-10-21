@@ -12,13 +12,16 @@
 
 import Foundation
 
+/// What a "homevideos" view holds: photos only (photo browser) or any video (folders).
+enum HomeVideosContent { case photosOnly, videos }
+
 enum JellyfinMediaMapper {
 
     // MARK: - Library
 
     /// Library views Rivulet can render. Book, playlist, box set and trailer
     /// views have no surface, so they are dropped rather than shown empty.
-    static func library(_ view: JFItem, providerID: String) -> MediaLibrary? {
+    static func library(_ view: JFItem, providerID: String, homeVideos: HomeVideosContent = .videos) -> MediaLibrary? {
         guard let id = view.id else { return nil }
         let kind: MediaLibrary.LibraryKind
         switch view.collectionType {
@@ -26,11 +29,16 @@ enum JellyfinMediaMapper {
         case "tvshows": kind = .shows
         case "music": kind = .music
         case "photos": kind = .photos
+        // "Home Videos and Photos": the photo browser's only when it holds
+        // photos, so a video-only one keeps the video page and its Home row.
+        case "homevideos": kind = homeVideos == .photosOnly ? .photos : .mixed
         case "livetv": kind = .liveTV
-        case nil, "homevideos", "mixed", "folders", "unknown": kind = .mixed
+        case nil, "mixed", "folders", "unknown": kind = .mixed
         default: return nil
         }
-        return MediaLibrary(id: id, providerID: providerID, title: view.name ?? "", kind: kind)
+        var library = MediaLibrary(id: id, providerID: providerID, title: view.name ?? "", kind: kind)
+        library.browsesByFolder = kind == .mixed
+        return library
     }
 
     // MARK: - Kind
@@ -177,7 +185,7 @@ enum JellyfinMediaMapper {
             id: "\(index)",
             codec: s.codec ?? "unknown",
             profile: s.profile,
-            level: s.level.map { Int($0) },
+            level: s.level.flatMap { Int(exactly: $0.rounded()) },
             width: s.width,
             height: s.height,
             frameRate: s.realFrameRate ?? s.averageFrameRate,

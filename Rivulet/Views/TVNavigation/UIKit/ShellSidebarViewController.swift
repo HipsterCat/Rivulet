@@ -5,12 +5,8 @@
 //  ShellSidebarViewController.swift
 //  Rivulet
 //
-//  The custom shell sidebar: Rivulet's own recreation of the tvOS
-//  `.sidebarAdaptable` chrome, built so the shell owns expansion, collapse,
-//  and the pill (which the system version cannot hide; see the pill research
-//  notes). Currently reachable only through the `--sidebar-preview` launch
-//  argument for visual evaluation; the shell integration comes after the
-//  look is approved.
+//  The custom shell sidebar, embedded in RootShellViewController. Sizes and
+//  type come from the Apple TV app's own sidebar.
 //
 
 import UIKit
@@ -18,36 +14,40 @@ import UIKit
 // MARK: - Metrics
 
 private enum Metrics {
-    /// MEASURED from the live system sidebar (SidebarMeasure dump,
-    /// 2026-07-31): rows are 78pt pitch, zero spacing; content leading x 54
-    /// in window coords; every section break is a 70pt gap with the header
-    /// drawn inside it; list top inset 55, bottom 51. The focused capsule is
-    /// the 302pt-wide hosted content, ~54pt tall centered in the 78pt cell
-    /// (capsule height read from the screenshot against the cell frames).
-    ///
-    /// MEASURED from the presentation-layer trace of the system morph
-    /// (SidebarAnim bursts, 2026-07-31, simulator): the glass card animates
-    /// frame AND corner radius between panel (35,35 340x1010) r52 and pill
-    /// (50,50 ~160x60) r30 over ~450ms, settling ~97% by 240ms (high-damping
-    /// spring). Sim-captured; re-verify timing on device.
+    /// Values are the Apple TV app's own sidebar where one was read; the panel
+    /// frame, pill origin and morph timing are still the system sidebar's.
     static let panelWidth: CGFloat = 340
     static let panelInset: CGFloat = 35
-    static let panelCornerRadius: CGFloat = 52
-    /// 54 (window) - 36 (panel inset) = capsule leading inside the panel.
-    static let contentLeading: CGFloat = 18
-    static let contentTrailing: CGFloat = 18
+    /// The Apple TV app's panel radius, not the system tab sidebar's 52.
+    static let panelCornerRadius: CGFloat = 40
+    /// The TV app's section insets: rows sit 10pt inside the glass.
+    static let contentLeading: CGFloat = 10
+    static let contentTrailing: CGFloat = 10
     /// 55 (list top inset, window) - 36 (panel inset).
     static let contentTop: CGFloat = 19
     static let contentBottom: CGFloat = 15
     static let rowPitch: CGFloat = 78
-    /// Video-measured (default.mov, pitch-calibrated): the focused capsule
-    /// nearly fills the 78pt row.
-    static let capsuleHeight: CGFloat = 75
+    /// The TV app's focus platter: 72pt tall, 3pt inside the 78pt row.
+    static let capsuleHeight: CGFloat = 72
+    /// The TV app's row columns: icon centred in a 72pt leading column, title
+    /// 2pt after it, 16pt trailing margin.
+    static let iconCenterX: CGFloat = 36
+    static let titleLeading: CGFloat = 74
+    static let titleTrailing: CGFloat = 16
     static var capsuleRadius: CGFloat { capsuleHeight / 2 }
     static var capsuleVerticalInset: CGFloat { (rowPitch - capsuleHeight) / 2 }
     static let sectionGap: CGFloat = 70
     static let pillOrigin = CGPoint(x: 50, y: 50)
     static let pillHeight: CGFloat = 60
+    /// The TV app's 46pt icon box, centred in the 60pt pill.
+    static let pillDiscSize: CGFloat = 46
+    static var pillDiscInset: CGFloat { (pillHeight - pillDiscSize) / 2 }
+    static let pillTrailing: CGFloat = 24
+    /// The TV app's sidebar avatar, and how much it grows under focus.
+    static let avatarSize: CGFloat = 50
+    static let avatarFocusGrowth: CGFloat = 4
+    /// The TV app's profile header band: the first tab sits 125pt below the list top.
+    static let profileBandHeight: CGFloat = 125
     /// USER-VERIFIED on screen: the single spring crossfade reads nearly
     /// identical to the system morph; a literal three-phase re-timing from
     /// the 120fps frame analysis read distinctly WORSE and was reverted.
@@ -73,47 +73,47 @@ enum ShellPillMetrics {
 
 /// System row coloring: focused = solid white capsule, dark content; selected
 /// but unfocused = translucent capsule, full-white content; otherwise bare, dim.
+/// Resting 0.7 is the TV app's value; its focused 0.9 / 0.7 pair rides a
+/// PlusL / PlusD layer this sidebar does not have.
 private func sidebarRowColors(focused: Bool, selected: Bool) -> (background: UIColor, content: UIColor) {
     if focused { return (.white, .black) }
     if selected { return (UIColor.white.withAlphaComponent(0.1), .white) }
-    return (.clear, UIColor.white.withAlphaComponent(0.6))
+    return (.clear, UIColor.white.withAlphaComponent(0.7))
 }
 
-/// The collapsed pill's back-chevron. NOT SF `chevron.left`: measured from the
-/// system pill it is tall and narrow (7.5 x 25.7pt, aspect ~1:3.4), a 3.2pt
-/// stroke with rounded caps/join and a sharp ~60deg vertex, drawn so the
-/// proportion matches exactly.
-private final class PillChevronView: UIView {
-    private let shape = CAShapeLayer()
-    private let size = CGSize(width: 8, height: 26)
+/// The text style's font at the emphasized (bold) weight, as the TV app asks
+/// for it: from the style, never a hard-coded size.
+private func emphasizedFont(_ style: UIFont.TextStyle) -> UIFont {
+    let base = UIFont.preferredFont(forTextStyle: style)
+    return base.fontDescriptor.withSymbolicTraits(.traitBold).map { UIFont(descriptor: $0, size: 0) } ?? base
+}
 
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        shape.fillColor = nil
-        shape.strokeColor = UIColor.white.cgColor
-        shape.lineWidth = 3.2
-        shape.lineCap = .round
-        shape.lineJoin = .round
-        layer.addSublayer(shape)
+/// A round profile picture drawn over a glyph, which shows until it loads.
+private final class SidebarAvatarView: UIImageView {
+    var url: URL? {
+        didSet {
+            guard url != oldValue else { return }
+            image = url.flatMap { ImageCacheManager.shared.cachedImage(for: $0) }
+            guard let url, image == nil else { return }
+            Task { [weak self] in
+                let loaded = await ImageCacheManager.shared.image(for: url)
+                if self?.url == url { self?.image = loaded }
+            }
+        }
     }
+
+    init(diameter: CGFloat) {
+        super.init(frame: .zero)
+        contentMode = .scaleAspectFill
+        clipsToBounds = true
+        layer.cornerRadius = diameter / 2
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([widthAnchor.constraint(equalToConstant: diameter),
+                                     heightAnchor.constraint(equalToConstant: diameter)])
+    }
+
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override var intrinsicContentSize: CGSize { size }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let inset = shape.lineWidth / 2
-        let w = size.width, h = size.height
-        let path = UIBezierPath()
-        path.move(to: CGPoint(x: w - inset, y: inset))          // top-right
-        path.addLine(to: CGPoint(x: inset, y: h / 2))            // vertex (left, mid)
-        path.addLine(to: CGPoint(x: w - inset, y: h - inset))    // bottom-right
-        shape.path = path.cgPath
-        shape.frame = CGRect(origin: CGPoint(x: (bounds.width - w) / 2,
-                                             y: (bounds.height - h) / 2), size: size)
-    }
 }
-
 
 // MARK: - Collection view
 
@@ -125,7 +125,7 @@ final class SidebarCollectionView: UICollectionView {
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
         // The cell must exist right now, or the engine ignores this and falls
-        // back to its own pick (realized in aimInitialFocusAtSelectedTab).
+        // back to its own pick (realized in aimInitialFocus).
         if let indexPath = preferredFocusIndexPath, let cell = cellForItem(at: indexPath) {
             return [cell]
         }
@@ -140,7 +140,7 @@ final class SidebarCollectionView: UICollectionView {
         // resolved back through it to the selected row — so the expand
         // animator's completion, which requests focus ~0.3s after opening,
         // yanked the user back from whatever row they had already moved to.
-        // The next open re-aims via `aimInitialFocusAtSelectedTab`.
+        // The next open re-aims via `aimInitialFocus`.
         if let next = context.nextFocusedItem as? UIView, next.isDescendant(of: self) {
             preferredFocusIndexPath = nil
         }
@@ -165,14 +165,11 @@ final class ShellSidebarRowCell: UICollectionViewCell {
 
         iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 24, weight: .medium)
         iconView.setContentHuggingPriority(.required, for: .horizontal)
-        titleLabel.font = .systemFont(ofSize: 29, weight: .medium)
-
-        let stack = UIStackView(arrangedSubviews: [iconView, titleLabel])
-        stack.axis = .horizontal
-        stack.spacing = 14
-        stack.alignment = .center
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(stack)
+        titleLabel.font = .preferredFont(forTextStyle: .caption1)
+        for view in [iconView, titleLabel] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(view)
+        }
 
         NSLayoutConstraint.activate([
             backgroundPill.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -181,9 +178,14 @@ final class ShellSidebarRowCell: UICollectionViewCell {
                                                 constant: Metrics.capsuleVerticalInset),
             backgroundPill.bottomAnchor.constraint(equalTo: contentView.bottomAnchor,
                                                    constant: -Metrics.capsuleVerticalInset),
-            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 17),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -17),
-            stack.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            iconView.centerXAnchor.constraint(equalTo: contentView.leadingAnchor,
+                                              constant: Metrics.iconCenterX),
+            iconView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor,
+                                                constant: Metrics.titleLeading),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor,
+                                                 constant: -Metrics.titleTrailing),
+            titleLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
         ])
         applyAppearance(focused: false)
     }
@@ -218,6 +220,99 @@ final class ShellSidebarRowCell: UICollectionViewCell {
     }
 }
 
+// MARK: - Profile header cell
+
+/// The profile entry, above the tabs: avatar and first name, no focus capsule.
+/// Focus grows the avatar and, where there is a profile to switch to, fades a
+/// "Switch Profile" caption in under the name.
+final class ShellSidebarProfileCell: UICollectionViewCell {
+    static let reuseIdentifier = "ShellSidebarProfileCell"
+
+    private let iconView = UIImageView()
+    private let avatarView = SidebarAvatarView(diameter: Metrics.avatarSize)
+    private let nameLabel = UILabel()
+    private let captionLabel = UILabel()
+    private let separator = UIView()
+    private var nameCenterY: NSLayoutConstraint!
+    private var canSwitch = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 44, weight: .regular)
+        nameLabel.font = .preferredFont(forTextStyle: .caption1)
+        captionLabel.font = .preferredFont(forTextStyle: .caption2)
+        captionLabel.text = "Switch Profile"
+        captionLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+        separator.backgroundColor = UIColor.white.withAlphaComponent(0.1)
+        for view in [iconView, avatarView, nameLabel, captionLabel, separator] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(view)
+        }
+        // The entry occupies the band's top row; the separator halves the rest.
+        let rowCenter = Metrics.rowPitch / 2
+        nameCenterY = nameLabel.centerYAnchor.constraint(equalTo: contentView.topAnchor, constant: rowCenter)
+        NSLayoutConstraint.activate([
+            iconView.centerXAnchor.constraint(equalTo: contentView.leadingAnchor,
+                                              constant: Metrics.iconCenterX),
+            iconView.centerYAnchor.constraint(equalTo: contentView.topAnchor, constant: rowCenter),
+            avatarView.centerXAnchor.constraint(equalTo: iconView.centerXAnchor),
+            avatarView.centerYAnchor.constraint(equalTo: iconView.centerYAnchor),
+            nameLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor,
+                                               constant: Metrics.titleLeading),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor,
+                                                constant: -Metrics.titleTrailing),
+            nameCenterY,
+            captionLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
+            captionLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor,
+                                                   constant: -Metrics.titleTrailing),
+            captionLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor),
+            separator.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 15),
+            separator.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            separator.heightAnchor.constraint(equalToConstant: 1),
+            separator.centerYAnchor.constraint(
+                equalTo: contentView.topAnchor,
+                constant: (Metrics.rowPitch + Metrics.profileBandHeight) / 2),
+        ])
+        isAccessibilityElement = true
+        applyAppearance(focused: false)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(item: ShellSidebarItem) {
+        iconView.image = UIImage(systemName: item.icon)
+        avatarView.url = item.avatarURL
+        nameLabel.text = item.title
+        canSwitch = item.canSwitchProfile
+        accessibilityLabel = canSwitch ? "\(item.title), Switch Profile" : item.title
+        accessibilityTraits = canSwitch ? .button : .staticText
+        applyAppearance(focused: isFocused)
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        let focused = context.nextFocusedView === self
+        coordinator.addCoordinatedAnimations({
+            self.applyAppearance(focused: focused)
+            self.contentView.layoutIfNeeded()
+        })
+    }
+
+    private func applyAppearance(focused: Bool) {
+        let content = sidebarRowColors(focused: false, selected: focused).content
+        iconView.tintColor = content
+        nameLabel.textColor = content
+        let captioned = focused && canSwitch
+        captionLabel.alpha = captioned ? 1 : 0
+        // The name rises by half the caption so the pair stays centred on the avatar.
+        nameCenterY.constant = Metrics.rowPitch / 2 - (captioned ? captionLabel.font.lineHeight / 2 : 0)
+        let scale = focused ? (Metrics.avatarSize + Metrics.avatarFocusGrowth) / Metrics.avatarSize : 1
+        avatarView.transform = CGAffineTransform(scaleX: scale, y: scale)
+        iconView.transform = avatarView.transform
+    }
+}
+
 // MARK: - Section header
 
 final class ShellSidebarHeaderView: UICollectionReusableView {
@@ -227,13 +322,14 @@ final class ShellSidebarHeaderView: UICollectionReusableView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        label.font = .systemFont(ofSize: 21, weight: .semibold)
-        label.textColor = UIColor.white.withAlphaComponent(0.45)
+        label.font = emphasizedFont(.caption2)
+        label.textColor = .tertiaryLabel.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
         NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 17),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 15),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 28),
         ])
     }
 
@@ -261,8 +357,13 @@ final class ShellSidebarViewController: UIViewController {
         effect.tintColor = Metrics.glassTint
         return UIVisualEffectView(effect: effect)
     }()
-    private let pillChevron = PillChevronView()
+    /// `chevron.compact.left` at callout size, as the TV app's pill draws it.
+    private let pillChevron = UIImageView(image: UIImage(
+        systemName: "chevron.compact.left",
+        withConfiguration: UIImage.SymbolConfiguration(textStyle: .callout)))
     private let pillIcon = UIImageView()
+    private let pillIconDisc = UIView()
+    private let pillAvatar = SidebarAvatarView(diameter: Metrics.pillDiscSize)
     private let pillLabel = UILabel()
     private let pillStack = UIStackView()
     private var collectionView: SidebarCollectionView!
@@ -276,12 +377,20 @@ final class ShellSidebarViewController: UIViewController {
     var onTabSelected: ((SidebarTab) -> Void)?
     var onCollapseRequested: (() -> Void)?
     private var pillHidden = false
+    /// While the profile panel is up the pill names the user, not the tab.
+    private var pillShowsProfile = false
 
     var isExpanded: Bool { state == .expanded }
     var focusTarget: UIView { collectionView }
 
-    func setExpanded(_ expanded: Bool, animated: Bool) {
-        if expanded { aimInitialFocusAtSelectedTab() }
+    func setPillShowsProfile(_ shows: Bool) {
+        pillShowsProfile = shows
+        configurePill()
+    }
+
+    /// `aimAt` opens on that row instead of the selected tab's.
+    func setExpanded(_ expanded: Bool, animated: Bool, aimAt tab: SidebarTab? = nil) {
+        if expanded { aimInitialFocus(at: tab ?? selectedTab) }
         setState(expanded ? .expanded : .collapsed)
         if !animated {
             transitionAnimator?.stopAnimation(false)
@@ -293,8 +402,8 @@ final class ShellSidebarViewController: UIViewController {
     /// row (Home opens on Home, Settings on Settings). The cell must be
     /// realized before the focus engine reads `preferredFocusEnvironments`,
     /// so unhide + lay out + scroll it into view first.
-    private func aimInitialFocusAtSelectedTab() {
-        guard let indexPath = indexPath(for: selectedTab) else {
+    private func aimInitialFocus(at tab: SidebarTab) {
+        guard let indexPath = indexPath(for: tab) else {
             collectionView.preferredFocusIndexPath = nil
             return
         }
@@ -318,7 +427,7 @@ final class ShellSidebarViewController: UIViewController {
     func setSelectedTabExternal(_ tab: SidebarTab) {
         guard tab != selectedTab else { return }
         selectedTab = tab
-        configurePill(item(for: tab))
+        configurePill()
         collectionView.reloadData()
     }
 
@@ -330,7 +439,7 @@ final class ShellSidebarViewController: UIViewController {
         sections = new
         guard isViewLoaded else { return }
         collectionView.reloadData()
-        configurePill(item(for: selectedTab))
+        configurePill()
     }
 
     /// Collapsed-state pill visibility, driven by the below-top focus signal.
@@ -350,7 +459,7 @@ final class ShellSidebarViewController: UIViewController {
         view.backgroundColor = .clear
         sections = Self.liveSections()
         buildViews()
-        configurePill(item(for: selectedTab))
+        configurePill()
         applyState(expanded: true, animated: false)
     }
 
@@ -394,7 +503,8 @@ final class ShellSidebarViewController: UIViewController {
     private var pillFrame: CGRect {
         let content = pillStack.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize)
         return CGRect(x: Metrics.pillOrigin.x, y: Metrics.pillOrigin.y,
-                      width: content.width + 48, height: Metrics.pillHeight)
+                      width: content.width + Metrics.pillDiscInset + Metrics.pillTrailing,
+                      height: Metrics.pillHeight)
     }
 
     private func setState(_ newState: State) {
@@ -436,6 +546,8 @@ final class ShellSidebarViewController: UIViewController {
         }
         animator.addCompletion { _ in
             self.transitionAnimator = nil
+            // The pill's title can change mid-morph (Menu to Home): fit it now.
+            self.view.setNeedsLayout()
             if self.state == .collapsed {
                 // A hidden list is invisible to the focus engine; alpha 0 is not.
                 self.collectionView.isHidden = true
@@ -478,27 +590,35 @@ final class ShellSidebarViewController: UIViewController {
         collectionView.dataSource = self
         collectionView.delegate = self
         // Off: initial focus is directed at the selected tab, not the last
-        // one the user happened to touch (see aimInitialFocusAtSelectedTab).
+        // one the user happened to touch (see aimInitialFocus).
         collectionView.remembersLastFocusedIndexPath = false
         collectionView.register(ShellSidebarRowCell.self,
                                 forCellWithReuseIdentifier: ShellSidebarRowCell.reuseIdentifier)
+        collectionView.register(ShellSidebarProfileCell.self,
+                                forCellWithReuseIdentifier: ShellSidebarProfileCell.reuseIdentifier)
         collectionView.register(ShellSidebarHeaderView.self,
                                 forSupplementaryViewOfKind: ShellSidebarHeaderView.elementKind,
                                 withReuseIdentifier: ShellSidebarHeaderView.reuseIdentifier)
         cardView.addSubview(collectionView)
 
         // Back-chevron, as the system pill shows: OUTSIDE the capsule, to its
-        // left, white. Custom-drawn (see PillChevronView) to match the system
-        // pill's tall-narrow proportion. Lives on the main view (not the glass
-        // card) so it sits outside the glass, and fades with the pill.
+        // left, white. Lives on the main view (not the glass card) so it sits
+        // outside the glass, and fades with the pill.
+        pillChevron.tintColor = .white
         pillChevron.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(pillChevron)
 
         pillIcon.tintColor = .white
-        pillIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
-        pillLabel.font = .systemFont(ofSize: 25, weight: .semibold)
+        pillIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(textStyle: .caption1)
+        pillIcon.translatesAutoresizingMaskIntoConstraints = false
+        // Disc tone is a photo estimate; the TV app's colour was not read.
+        pillIconDisc.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        pillIconDisc.layer.cornerRadius = Metrics.pillDiscSize / 2
+        pillIconDisc.addSubview(pillIcon)
+        pillIconDisc.addSubview(pillAvatar)
+        pillLabel.font = emphasizedFont(.body)
         pillLabel.textColor = .white
-        pillStack.addArrangedSubview(pillIcon)
+        pillStack.addArrangedSubview(pillIconDisc)
         pillStack.addArrangedSubview(pillLabel)
         pillStack.axis = .horizontal
         pillStack.spacing = 12
@@ -507,7 +627,14 @@ final class ShellSidebarViewController: UIViewController {
         cardView.addSubview(pillStack)
 
         NSLayoutConstraint.activate([
-            pillStack.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 24),
+            pillIconDisc.widthAnchor.constraint(equalToConstant: Metrics.pillDiscSize),
+            pillIconDisc.heightAnchor.constraint(equalToConstant: Metrics.pillDiscSize),
+            pillIcon.centerXAnchor.constraint(equalTo: pillIconDisc.centerXAnchor),
+            pillIcon.centerYAnchor.constraint(equalTo: pillIconDisc.centerYAnchor),
+            pillAvatar.centerXAnchor.constraint(equalTo: pillIconDisc.centerXAnchor),
+            pillAvatar.centerYAnchor.constraint(equalTo: pillIconDisc.centerYAnchor),
+            pillStack.leadingAnchor.constraint(equalTo: cardView.leadingAnchor,
+                                               constant: Metrics.pillDiscInset),
             pillStack.centerYAnchor.constraint(equalTo: cardView.topAnchor,
                                                constant: Metrics.pillHeight / 2),
             // Chevron sits just left of the collapsed pill, vertically centered
@@ -530,15 +657,23 @@ final class ShellSidebarViewController: UIViewController {
             height: panelFrame.height - Metrics.contentTop - Metrics.contentBottom)
     }
 
-    private func configurePill(_ item: ShellSidebarItem) {
+    private func configurePill() {
+        let item = item(for: pillShowsProfile ? .account : selectedTab)
         pillIcon.image = UIImage(systemName: item.icon)
+        pillAvatar.url = item.avatarURL
         pillLabel.text = item.title
+        // The pill is as wide as its title: resize it when it is at rest.
+        view.setNeedsLayout()
     }
 
     private func makeLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, _ in
-            let itemSize = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1),
-                                                  heightDimension: .absolute(Metrics.rowPitch))
+            // The profile header is section 0 and brings its own gap beneath.
+            let isProfile = self?.sections[sectionIndex].items.first?.tab == .account
+            let followsProfile = sectionIndex == 1 && self?.sections[0].items.first?.tab == .account
+            let itemSize = NSCollectionLayoutSize(
+                widthDimension: .fractionalWidth(1),
+                heightDimension: .absolute(isProfile ? Metrics.profileBandHeight : Metrics.rowPitch))
             let item = NSCollectionLayoutItem(layoutSize: itemSize)
             let group = NSCollectionLayoutGroup.vertical(layoutSize: itemSize, subitems: [item])
             let section = NSCollectionLayoutSection(group: group)
@@ -557,7 +692,7 @@ final class ShellSidebarViewController: UIViewController {
                         elementKind: ShellSidebarHeaderView.elementKind,
                         alignment: .top)
                 ]
-            } else if sectionIndex > 0 {
+            } else if sectionIndex > 0, !followsProfile {
                 section.contentInsets = NSDirectionalEdgeInsets(top: Metrics.sectionGap,
                                                                 leading: 0, bottom: 0, trailing: 0)
             }
@@ -576,7 +711,7 @@ final class ShellSidebarViewController: UIViewController {
             ?? PlexAuthManager.shared.username
             ?? "Account"
         return ShellSidebarModel.sections(
-            libraries: PlexDataStore.shared.visibleMediaLibraries,
+            libraries: PlexDataStore.shared.visibleSidebarLibraries,
             liveTVSources: LiveTVDataStore.shared.sources,
             combineLiveTV: flag("combineLiveTVSources", default: true),
             showDiscover: flag("showDiscoverTab", default: true),
@@ -607,10 +742,17 @@ extension ShellSidebarViewController: UICollectionViewDataSource, UICollectionVi
 
     func collectionView(_ collectionView: UICollectionView,
                         cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let item = sections[indexPath.section].items[indexPath.item]
+        if item.tab == .account {
+            let cell = collectionView.dequeueReusableCell(
+                withReuseIdentifier: ShellSidebarProfileCell.reuseIdentifier,
+                for: indexPath) as! ShellSidebarProfileCell
+            cell.configure(item: item)
+            return cell
+        }
         let cell = collectionView.dequeueReusableCell(
             withReuseIdentifier: ShellSidebarRowCell.reuseIdentifier,
             for: indexPath) as! ShellSidebarRowCell
-        let item = sections[indexPath.section].items[indexPath.item]
         cell.configure(item: item, isSelectedTab: item.tab == selectedTab)
         return cell
     }
@@ -628,7 +770,7 @@ extension ShellSidebarViewController: UICollectionViewDataSource, UICollectionVi
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         let tab = sections[indexPath.section].items[indexPath.item].tab
-        select(tab: tab)
+        if tab != .account { select(tab: tab) }
         if embedded { onTabSelected?(tab) }
     }
 
@@ -646,7 +788,7 @@ extension ShellSidebarViewController: UICollectionViewDataSource, UICollectionVi
 
     private func select(tab: SidebarTab) {
         selectedTab = tab
-        configurePill(item(for: tab))
+        configurePill()
         collectionView.reloadData()
     }
 }

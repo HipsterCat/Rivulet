@@ -28,6 +28,16 @@ func makePaneGlass(cornerRadius: CGFloat) -> UIView {
     return glass
 }
 
+/// AVKit's label shadow (black 0.2, radius 30): lifts white text off bright video behind glass.
+func applyChromeTextShadow(_ labels: [UILabel]) {
+    for label in labels {
+        label.layer.shadowColor = UIColor.black.cgColor
+        label.layer.shadowOpacity = 0.2
+        label.layer.shadowRadius = 30
+        label.layer.shadowOffset = .zero
+    }
+}
+
 // MARK: - PlayerInfoCardView
 
 /// AVKit's Info tab: a 250pt glass card with the poster, title, a two-line
@@ -606,6 +616,28 @@ private final class CardBandGradientView: UIView {
 /// Per-category delivery mode (Direct Play / Direct Stream / Transcode)
 /// shown at the top of each section, so users can confirm playback status
 /// without opening the Plex server dashboard.
+/// How a Dolby Vision source reaches the screen, for the Details tab.
+enum DolbyVisionPlayback: String, Equatable {
+    case dualLayer = "Dual Layer (FEL)"
+    case convertedTo81 = "Profile 8.1 (converted)"
+    case dolbyVision = "Dolby Vision"
+    case hdr10BaseLayer = "HDR10 Base Layer"
+    case sdr = "SDR"
+
+    /// A Profile 7 source shown as Dolby Vision without the 8.1 rewrite is on
+    /// the engine's dual-layer route, which only FEL takes.
+    init?(sourceProfile: Int?, convertedTo81: Bool, presentsDolbyVision: Bool, presentsHDR: Bool) {
+        guard let sourceProfile else { return nil }
+        if convertedTo81 {
+            self = .convertedTo81
+        } else if presentsDolbyVision {
+            self = sourceProfile == 7 ? .dualLayer : .dolbyVision
+        } else {
+            self = presentsHDR ? .hdr10BaseLayer : .sdr
+        }
+    }
+}
+
 struct StreamingModeInfo {
     enum Mode: String {
         case directPlay = "Direct Play"
@@ -830,7 +862,8 @@ final class PlayerDetailsPaneView: UIView {
 
     // MARK: Section builders
 
-    static func mediaSections(metadata: PlexMetadata, modes: StreamingModeInfo) -> [Section] {
+    static func mediaSections(metadata: PlexMetadata, modes: StreamingModeInfo,
+                              dolbyVision: DolbyVisionPlayback? = nil) -> [Section] {
         let media = metadata.Media?.first
         let streams = media?.Part?.first?.Stream ?? []
         var sections: [Section] = []
@@ -844,6 +877,7 @@ final class PlayerDetailsPaneView: UIView {
                 var profile = "Profile \(stream.DOVIProfile ?? 0)"
                 if let compat = stream.DOVIBLCompatID { profile += " (CompatID \(compat))" }
                 video.append(Row(label: "Dolby Vision", value: profile))
+                if let dolbyVision { video.append(Row(label: "Playing As", value: dolbyVision.rawValue)) }
             } else if stream.isHDR {
                 video.append(Row(label: "HDR", value: "HDR10"))
             }

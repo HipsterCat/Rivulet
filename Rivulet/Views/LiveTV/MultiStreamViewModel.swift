@@ -18,6 +18,8 @@ final class MultiStreamViewModel: ObservableObject {
     enum LayoutMode: Equatable {
         case grid
         case focus(mainId: UUID)
+        /// One stream beside a scores list; only while that stream shows a game.
+        case scores(mainId: UUID)
     }
 
     // MARK: - Stream Slot Model
@@ -99,6 +101,8 @@ final class MultiStreamViewModel: ObservableObject {
         didSet {
             guard streams.count != oldValue.count else { return }
             let count = streams.count
+            let settled = Self.settled(layoutMode, streamCount: count)
+            if settled != layoutMode { layoutMode = settled }
             // Crashes and hangs carry how many tiles were running, so four
             // streams (open to everyone, no longer an opt-in) can be watched.
             SentryBridge.configureScope { scope in
@@ -165,6 +169,27 @@ final class MultiStreamViewModel: ObservableObject {
         return false
     }
 
+    /// The game the one open stream shows, which is what offers the scores layout.
+    var scoresMatch: (league: League, game: ScoreGame)? {
+        let store = LiveTVDataStore.shared
+        return Self.scoresMatch(channels: streams.map(\.channel), boards: ScoreboardPoller.shared.boards,
+                                program: { store.getCurrentProgram(for: $0) })
+    }
+
+    var canUseScoresLayout: Bool { scoresMatch != nil }
+
+    static func scoresMatch(channels: [UnifiedChannel], boards: [League: Scoreboard],
+                            program: (UnifiedChannel) -> UnifiedProgram?) -> (league: League, game: ScoreGame)? {
+        guard channels.count == 1, let current = program(channels[0]) else { return nil }
+        return GameMatcher.game(for: current, channel: channels[0], in: boards)
+    }
+
+    /// The scores layout holds exactly one stream; any other count drops to the grid.
+    static func settled(_ mode: LayoutMode, streamCount: Int) -> LayoutMode {
+        if case .scores = mode, streamCount != 1 { return .grid }
+        return mode
+    }
+
     // MARK: - Initialization
 
     /// Multiview that starts from a session already running elsewhere (the
@@ -172,6 +197,7 @@ final class MultiStreamViewModel: ObservableObject {
     /// no new tune, then optionally adds `channel` beside it.
     init(adopting session: LiveTVSessionHandoff?, adding channel: UnifiedChannel?) {
         Self.activeSessionCount += 1
+        MusicQueue.shared.liveTVSessionBegan(ObjectIdentifier(self))
         UIApplication.shared.isIdleTimerDisabled = true
 
         if let session { adoptStream(session) }
@@ -273,7 +299,6 @@ final class MultiStreamViewModel: ObservableObject {
                 "stream_type": streamType,
                 "stream_url_scheme": url.scheme ?? "unknown",
                 "stream_url_host": url.host ?? "unknown",
-                "stream_url_path": url.path,
                 "is_plex_transcode": url.path.contains("/transcode/"),
                 "is_hls": url.pathExtension == "m3u8" || url.path.contains(".m3u8"),
                 "slot_index": slotIndex,
@@ -328,7 +353,6 @@ final class MultiStreamViewModel: ObservableObject {
                     // client profile) and drop every value.
                     scope.setExtra(value: SensitiveDataRedactor.safeURLString(url), key: "stream_url")
                     scope.setExtra(value: url.host ?? "unknown", key: "stream_host")
-                    scope.setExtra(value: url.path, key: "stream_path")
                     scope.setExtra(value: SensitiveDataRedactor.redact(url.query ?? ""), key: "stream_query_params")
                 }
 
@@ -439,6 +463,7 @@ final class MultiStreamViewModel: ObservableObject {
         // Decrement session count and only re-enable screensaver when no sessions remain
         if !didDecrementSessionCount {
             didDecrementSessionCount = true
+            MusicQueue.shared.liveTVSessionEnded(ObjectIdentifier(self))
             Self.activeSessionCount = max(0, Self.activeSessionCount - 1)
             if Self.activeSessionCount == 0 {
                 UIApplication.shared.isIdleTimerDisabled = false
@@ -474,8 +499,13 @@ final class MultiStreamViewModel: ObservableObject {
     }
 
     func resetLayout() {
-        guard case .focus = layoutMode else { return }
+        guard layoutMode != .grid else { return }
         layoutMode = .grid
+    }
+
+    func useScoresLayout() {
+        guard canUseScoresLayout, let slot = streams.first else { return }
+        layoutMode = .scores(mainId: slot.id)
     }
 
     /// Replaces the stream at the given index with a new channel
@@ -538,8 +568,10 @@ final class MultiStreamViewModel: ObservableObject {
         recoveryAttempts[newSlot.id] = 0
 
         // Update focus layout if the replaced stream was the main one
-        if case .focus(let mainId) = layoutMode, mainId == oldSlot.id {
-            layoutMode = .focus(mainId: newSlot.id)
+        switch layoutMode {
+        case .focus(let mainId) where mainId == oldSlot.id: layoutMode = .focus(mainId: newSlot.id)
+        case .scores(let mainId) where mainId == oldSlot.id: layoutMode = .scores(mainId: newSlot.id)
+        default: break
         }
 
         // Start playback (resolve = Plex tune step for cloud-EPG/DVB channels)
@@ -870,7 +902,9 @@ final class MultiStreamViewModel: ObservableObject {
 
         // Only decrement if stopAllStreams wasn't called (safety net)
         let needsDecrement = !didDecrementSessionCount
+        let session = ObjectIdentifier(self)
         Task { @MainActor in
+            if needsDecrement { MusicQueue.shared.liveTVSessionEnded(session) }
             if needsDecrement && Self.activeSessionCount > 0 {
                 Self.activeSessionCount -= 1
                 if Self.activeSessionCount == 0 {

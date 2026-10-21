@@ -36,8 +36,9 @@ final class SettingsContainerViewController: UIViewController {
     private var pages: [SettingsPageViewController] = []
     private var topPage: SettingsPageViewController? { pages.last }
 
-    private let slideDistance: CGFloat = 80
-    private let transitionDuration: TimeInterval = 0.45
+    // Measured off tvOS Settings: pages move about 72 pt and settle in about 0.67 s.
+    private let slideDistance: CGFloat = 72
+    private let transitionDuration: TimeInterval = 0.67
     private var isAnimating = false
 
     var depth: Int { pages.count }
@@ -61,8 +62,8 @@ final class SettingsContainerViewController: UIViewController {
     }
 
     private func setupLayout() {
-        titleLabel.font = .systemFont(ofSize: 52, weight: .bold)
-        titleLabel.textColor = UIColor.white.withAlphaComponent(0.65)
+        titleLabel.font = .systemFont(ofSize: 57, weight: .bold)
+        titleLabel.textColor = .tertiaryLabel
         titleLabel.textAlignment = .center
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(titleLabel)
@@ -78,19 +79,21 @@ final class SettingsContainerViewController: UIViewController {
         rightPane.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(rightPane)
 
+        // Fixed points measured off tvOS Settings (1920x1080): title baseline
+        // 111, panel 90,180 870x654, rows from x 1060 (the page adds 24).
         NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            titleLabel.firstBaselineAnchor.constraint(equalTo: view.topAnchor, constant: 111),
             titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
-            leftPanel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-            leftPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            leftPanel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            leftPanel.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.55),
+            leftPanel.topAnchor.constraint(equalTo: view.topAnchor, constant: 180),
+            leftPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 90),
+            leftPanel.widthAnchor.constraint(equalToConstant: 870),
+            leftPanel.heightAnchor.constraint(equalToConstant: 654),
 
-            rightPane.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-            rightPane.leadingAnchor.constraint(equalTo: leftPanel.trailingAnchor),
-            rightPane.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            rightPane.topAnchor.constraint(equalTo: view.topAnchor, constant: 174),
+            rightPane.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 1036),
+            rightPane.widthAnchor.constraint(equalToConstant: 828),
             rightPane.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
@@ -118,6 +121,10 @@ final class SettingsContainerViewController: UIViewController {
         vc.onPop = { [weak self, weak vc] in
             guard let self, let vc, self.topPage === vc else { return }
             self.pop()
+        }
+        vc.onPopTwo = { [weak self, weak vc] in
+            guard let self, let vc, self.topPage === vc else { return }
+            self.pop(levels: 2)
         }
         vc.onFocusRow = { [weak self] id in self?.leftPanel.show(id: id) }
         return vc
@@ -151,8 +158,15 @@ final class SettingsContainerViewController: UIViewController {
         onDepthChange?(pages.count > 1)
     }
 
-    func pop() {
-        guard !isAnimating, pages.count > 1 else { return }
+    /// Pops `levels` pages in one transition: the pages between are dropped
+    /// unseen (they hold no view while covered).
+    func pop(levels: Int = 1) {
+        guard !isAnimating, pages.count > levels else { return }
+        for _ in 1..<max(levels, 1) {
+            let skipped = pages.remove(at: pages.count - 2)
+            skipped.willMove(toParent: nil)
+            skipped.removeFromParent()
+        }
         let oldVC = pages.removeLast()
         let newVC = topPage
         if let newVC {

@@ -27,26 +27,6 @@ enum PostVideoState: Equatable {
     case showingEpisodeSummary
 }
 
-/// Video frame state for shrink animation
-enum VideoFrameState: Equatable {
-    case fullscreen
-    case shrunk
-
-    var scale: CGFloat {
-        switch self {
-        case .fullscreen: return 1.0
-        case .shrunk: return 0.25  // 25% size - roughly 480x270 on 1920x1080
-        }
-    }
-
-    var offset: CGSize {
-        switch self {
-        case .fullscreen: return .zero
-        case .shrunk: return CGSize(width: 60, height: 60)  // Padding from top-left corner
-        }
-    }
-}
-
 /// Seek indicator shown briefly when user taps left/right to skip
 enum SeekIndicator: Equatable {
     case forward(Int)   // seconds skipped forward
@@ -235,7 +215,6 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     // MARK: - Post-Video State
     @Published var postVideoState: PostVideoState = .hidden
-    @Published var videoFrameState: VideoFrameState = .fullscreen
     @Published private(set) var nextEpisode: PlexMetadata?
     /// Set once the next episode has been RESOLVED EARLY for the current episode
     /// (driven by Aether's first non-nil currentAVPlayer). Guards the fetch so
@@ -282,6 +261,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     @Published private(set) var countdownTotalSeconds: Int = 0
     @Published var isCountdownPaused: Bool = false
     private var countdownTimer: Timer?
+    /// Episodes played since the remote last started one, counting that one.
+    private var episodesInARow = 1
     @Published var scrubThumbnail: UIImage?
     @Published private(set) var scrubSpeed: Int = 0  // -8...8 shuttle level (0 = not shuttling); see ShuttleGrammar
     private var scrubStartTime: Date?  // When scrubbing started (for YouTube-style acceleration)
@@ -293,6 +274,9 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// inside one. Cleared (without reverting) by any user-initiated
     /// absolute seek, manual subtitle-track change, or stopPlayback.
     private var replayWindow: ReplayWindowLogic?
+    /// Subtitles turned on by tvOS's Show When Muted (aether route only).
+    private var captionsOnMute = CaptionsOnMuteLogic()
+    private lazy var systemCaptionsOnMute = SystemCaptionsOnMute { [weak self] in self?.updateCaptionsOnMute() }
     private var compatibilityNoticeTimer: Timer?
     private nonisolated(unsafe) var userActivity: NSUserActivity?
 
@@ -304,6 +288,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// HLS manifest enricher — injects audio/subtitle track labels into the master playlist.
     /// Must be retained for the lifetime of the AVURLAsset.
     private var hlsManifestEnricher: HLSManifestEnricher?
+    /// Set while the HLS origin's certificate fails system trust; see `prepareHLSRelay`.
+    private var hlsRelay: HLSTrustRelay?
 
     /// KVO observers
     private var rateObservation: NSKeyValueObservation?
@@ -337,6 +323,14 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// MCF/EDL lists. VOD only. Fed time + active cue text from the observers
     /// below; its `isFilterMuting` output is mirrored onto the active player.
     let contentFilter = ContentFilterManager()
+    /// Why the filter can't mute language on this title right now; nil when it can.
+    @Published private(set) var contentFilterNotice: String?
+    /// The subtitle track the filter is reading without showing it; the user's subtitles are off.
+    @Published private(set) var silentSubtitleTrackId: Int?
+    /// Reads image subtitle cues (PGS, VobSub) for the content filter.
+    private let subtitleImageReader = SubtitleImageReader()
+    /// False until the engine's load returns: its default-subtitle pick runs last and must not be pre-empted.
+    private var aetherLoadReturned = false
 
     // MARK: - Subtitle delay (OSD stepper, sticky per item)
 
@@ -542,6 +536,11 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var streamPreparationTask: Task<Void, Never>?
     /// Plex transcode session ID, extracted from HLS stream URL for cleanup on stop
     private var plexSessionId: String?
+    /// The Plex stream whose transcode subtitle feeds the caption overlay (hls route).
+    private var transcodeSubtitleTrackId: Int?
+    private var transcodeSubtitleTask: Task<Void, Never>?
+    private var transcodeSubtitleTimeObserver: Any?
+    private var lastTranscodeSubtitleRestart = Date.distantPast
     /// Playback startup/fallback plan for Rivulet direct-play-first policy.
     private(set) var playbackPlan: PlaybackPlan?
     /// The route actually serving playback right now.
@@ -751,6 +750,19 @@ final class UniversalPlayerViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // An image cue's words arrive after the tick that asked for them.
+        subtitleImageReader.onRead = { [weak self] in
+            guard let self else { return }
+            self.contentFilter.activeSubtitlesDidChange(texts: self.activeSubtitleTextForFilter())
+        }
+
+        // Pausing, Settings, or a list or file arriving all change whether a track is read unseen.
+        contentFilter.$isEnabled
+            .combineLatest(contentFilter.$isPaused, contentFilter.$hasLanguageSource)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.syncSilentSubtitleRead() }
+            .store(in: &cancellables)
+
         // A fresh player instance (e.g. the HLS fallback mid-item) starts
         // unmuted; re-assert the filter's current decision when either player
         // slot changes so a mute window survives the swap.
@@ -777,10 +789,11 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// published `isFilterMuting`. Called from both time observers.
     private func applyContentFilter(at time: TimeInterval) {
         // Feed the currently on-screen dialogue so language cues mute in sync.
-        // Cues resolve on the sourceTime axis, honoring the subtitle delay. The
-        // HLS route has no app-side cue source, so it contributes nothing here;
-        // there, language muting comes from the subtitle file the filter reads
-        // itself (see `contentFilterItem()`).
+        // Cues resolve on the sourceTime axis, honoring the subtitle delay. On
+        // the HLS route only a shown text track feeds this; otherwise language
+        // muting comes from the subtitle file the filter reads itself (see
+        // `contentFilterItem()`).
+        readSubtitleImages(at: time)
         contentFilter.activeSubtitlesDidChange(texts: activeSubtitleTextForFilter())
         // The delay stepper only moves what's on screen on the aether route.
         contentFilter.displayedSubtitleDidChange(
@@ -788,6 +801,14 @@ final class UniversalPlayerViewModel: ObservableObject {
                 ? nil
                 : subtitleTracks.first(where: { $0.id == currentSubtitleTrackId })?.subtitleKey,
             delay: aetherSubtitleModel.delaySeconds)
+        syncSilentSubtitleRead()
+        // Only the aether route gives the filter cues to read.
+        let tracks = aetherPlayer == nil ? [] : subtitleTracks
+        let notice = !contentFilter.isEnabled ? nil : ContentFilterSources.languageNotice(
+            hasLanguageSource: contentFilter.hasLanguageSource,
+            shown: tracks.first(where: { $0.id == currentSubtitleTrackId }),
+            tracks: tracks)
+        if notice != contentFilterNotice { contentFilterNotice = notice }
 
         guard let skipTarget = contentFilter.timeDidUpdate(time, allowSkip: !isScrubbing) else { return }
         // A window that runs to (or past) the end of the item would otherwise
@@ -796,6 +817,37 @@ final class UniversalPlayerViewModel: ObservableObject {
         Task { [weak self] in
             await self?.seek(to: target, revealsControls: false)
         }
+    }
+
+    /// Start, move or end the filter's unseen read of an embedded subtitle track.
+    /// Never saves a preference: the user's subtitles stay Off.
+    private func syncSilentSubtitleRead() {
+        guard aetherLoadReturned || aetherPlayer == nil else { return }
+        let wanted = !contentFilter.isEnabled || contentFilter.isPaused || !contentFilter.readsSubtitleText
+            ? nil : ContentFilterSources.silentTrack(
+                in: aetherPlayer == nil ? [] : subtitleTracks,
+                shownTrackId: currentSubtitleTrackId,
+                hasLanguageSource: contentFilter.hasLanguageSource)?.id
+        guard wanted != silentSubtitleTrackId else { return }
+        silentSubtitleTrackId = wanted
+        // A track the user has on already holds the engine's one selection.
+        if currentSubtitleTrackId == nil { aetherPlayer?.selectSubtitleTrack(id: wanted) }
+    }
+
+    /// Have the image cues around the playhead read (PGS, VobSub), ahead of
+    /// time so a line's words are known before it is spoken.
+    private func readSubtitleImages(at time: TimeInterval) {
+        let trackId = currentSubtitleTrackId ?? silentSubtitleTrackId
+        guard contentFilter.isEnabled, !contentFilter.isPaused, !contentFilter.hasLanguageSource,
+              contentFilter.readsSubtitleText,
+              let track = subtitleTracks.first(where: { $0.id == trackId }),
+              ContentFilterSources.isReadable(track), !ContentFilterSources.isTextSubtitle(codec: track.codec)
+        else { return subtitleImageReader.read([]) }
+        let now = time - aetherSubtitleModel.delaySeconds
+        subtitleImageReader.read(aetherSubtitleModel.cues.compactMap { cue in
+            guard cue.endTime >= now, cue.startTime <= now + 30, case .image(let image, _) = cue.body else { return nil }
+            return image
+        })
     }
 
     /// What the content filter needs to know about the current item. The
@@ -843,7 +895,84 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Cue-axis time the video shows at `hostTime`, for the libass layer's
     /// display link. nil when there is no Aether presentation timebase.
     func subtitleSourceTime(atHostTime hostTime: CFTimeInterval) -> Double? {
-        aetherPlayer?.sourceTime(atHostTime: hostTime)
+        if let aetherPlayer { return aetherPlayer.sourceTime(atHostTime: hostTime) }
+        // hls route: the AVPlayer item's clock is media time, as the transcode's cues are.
+        guard transcodeSubtitleTrackId != nil, let timebase = player?.currentItem?.timebase else { return nil }
+        let host = CMTime(seconds: hostTime, preferredTimescale: 1_000_000_000)
+        let seconds = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: timebase).seconds
+        return seconds.isFinite ? seconds : nil
+    }
+
+    // MARK: - hls route text subtitles
+
+    /// Starts reading the transcode's text subtitle into the caption overlay, or
+    /// clears it when the session carries none. Cues of the same track survive a
+    /// reload: their times are media time.
+    private func startTranscodeSubtitles() {
+        stopTranscodeSubtitleReader()
+        let trackId = currentSubtitleTrackId
+        let track = trackId.flatMap { id in plexSubtitleTracksFromMetadata().first { $0.id == id } }
+        guard aetherPlayer == nil, case .plex = source, case .hls = activeRoute,
+              let track, ContentFilterSources.isTextSubtitle(codec: track.codec),
+              let hlsURL = streamURL, let url = PlexNetworkManager.transcodeSubtitlesURL(forHLS: hlsURL) else {
+            clearTranscodeSubtitles()
+            return
+        }
+        if transcodeSubtitleTrackId != track.id {
+            clearTranscodeSubtitles()
+            transcodeSubtitleTrackId = track.id
+        }
+        var request = URLRequest(url: url)
+        for (key, value) in streamHeaders { request.setValue(value, forHTTPHeaderField: key) }
+        if let player {
+            transcodeSubtitleTimeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main
+            ) { [weak self] time in
+                MainActor.assumeIsolated { self?.aetherSubtitleModel.sourceTime = time.seconds }
+            }
+        }
+        let sessionId = plexSessionId
+        transcodeSubtitleTask = Task { [weak self] in
+            let gotHeader = await TranscodeSubtitleStream.read(request, onHeader: { header in
+                guard let self else { return }
+                if self.assTrack?.trackId != track.id || self.assTrack?.header != header {
+                    self.assTrack = ASSTrackSource(trackId: track.id, header: header, fonts: [])
+                }
+            }, onEvent: { event in
+                // ponytail: one update per line re-walks the list in the libass feed; batch if long files show it.
+                self?.appendTranscodeCue(AetherSubtitleCue(id: 0, startTime: event.start, endTime: event.end,
+                                                           body: .assEvents(event.line)))
+            })
+            guard let self, !Task.isCancelled else { return }
+            // PMS closes the stream when a seek past the transcoded range restarts
+            // its transcoder, and asking again then starts a second session over the
+            // first. Restarting the transcode at the playhead brings a fresh stream.
+            guard gotHeader, self.plexSessionId == sessionId, self.duration - self.playheadForReload > 30,
+                  Date().timeIntervalSince(self.lastTranscodeSubtitleRestart) > 15 else { return }
+            self.lastTranscodeSubtitleRestart = Date()
+            self.reloadTranscodeForTrackChange()
+        }
+    }
+
+    private func appendTranscodeCue(_ cue: AetherSubtitleCue) {
+        var cues = aetherSubtitleModel.cues
+        // A reloaded transcode resends lines from its own start, so it can land mid-list.
+        cues.insert(cue, at: cues.lastIndex { $0.startTime <= cue.startTime }.map { $0 + 1 } ?? 0)
+        aetherSubtitleModel.update(cues: cues)
+    }
+
+    private func stopTranscodeSubtitleReader() {
+        transcodeSubtitleTask?.cancel()
+        transcodeSubtitleTask = nil
+        if let transcodeSubtitleTimeObserver, let player { player.removeTimeObserver(transcodeSubtitleTimeObserver) }
+        transcodeSubtitleTimeObserver = nil
+    }
+
+    private func clearTranscodeSubtitles() {
+        guard transcodeSubtitleTrackId != nil else { return }
+        transcodeSubtitleTrackId = nil
+        aetherSubtitleModel.update(cues: [])
+        assTrack = nil
     }
 
     private func activeSubtitleTextForFilter() -> [String] {
@@ -851,7 +980,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             switch cue.body {
             case .text(let string): return string
             case .styledText(let runs): return runs.map(\.text).joined()
-            case .image: return nil
+            case .image(let image, _): return subtitleImageReader.text(for: image)
             case .assEvents(let lines):
                 // Words only: the Style, Name and Effect fields and the tag
                 // names would otherwise reach the profanity matcher as words.
@@ -1299,6 +1428,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                         let dur = item.duration.seconds
                         if dur.isFinite { self.duration = dur }
                         self.updateTrackLists()
+                        self.startTranscodeSubtitles()
                     case .failed:
                         let message = item.error?.localizedDescription ?? "Playback failed"
                         print("[Player] AVPlayerItem status: FAILED — \(message)")
@@ -1399,6 +1529,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Tear down AVPlayer observers.
     private func teardownAVPlayerObservers() {
+        stopTranscodeSubtitleReader()
         rateObservation?.invalidate()
         rateObservation = nil
         timeControlObservation?.invalidate()
@@ -1534,6 +1665,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     func startPlayback() async {
+        Task { await resolveSubtitleSearchAccess() }
         // Fetch detailed metadata if markers or chapters are missing
         let hasMarkers = !(metadata.Marker ?? []).isEmpty
         let hasChapters = !(metadata.Chapter ?? []).isEmpty
@@ -1694,7 +1826,8 @@ final class UniversalPlayerViewModel: ObservableObject {
             useDolbyVision: metadata.hasDolbyVision,
             forceVideoTranscode: forceVideoTranscode,
             allowAudioDirectStream: allowAudioDirectStreamDecision(reason: "rivulet_hls_fallback_build"),
-            step: activeStreamPlan.step
+            step: activeStreamPlan.step,
+            clientRendersTextSubtitles: true
         ) else {
             return nil
         }
@@ -1893,6 +2026,10 @@ final class UniversalPlayerViewModel: ObservableObject {
             do {
                 let ap = aetherPlayer ?? AetherPlayer()
                 aetherPlayer = ap
+                // A load drops the engine's selection; the unseen read is chosen again from its tracks.
+                aetherSubtitleModel.update(cues: [])
+                silentSubtitleTrackId = nil
+                aetherLoadReturned = false
                 bindAetherPublishers(ap)
                 // Feed title/artwork/description to Aether's internal AVPlayerItem
                 // (it makes its own item, so our native-path externalMetadata never
@@ -1914,6 +2051,11 @@ final class UniversalPlayerViewModel: ObservableObject {
                     headers: aetherHeaders,
                     startTime: startTime
                 )
+                aetherLoadReturned = true
+                // An item with no subtitles publishes nothing to replace the last item's list.
+                if ap.subtitleTracks.isEmpty { subtitleTracks = [] }
+                // Adopts the engine's own selection, then starts the unseen read if there is none.
+                updateTrackLists()
             } catch {
                 // Ordinary cancellation (the user left the player or switched
                 // items while the load was in flight) is not a playback
@@ -2096,7 +2238,12 @@ final class UniversalPlayerViewModel: ObservableObject {
             languages.append(contentsOf: languageCandidates(for: track))
         }
 
-        languages.append(TrackIntentStore.effectiveAudioIntent.language)
+        let audioIntent = TrackIntentStore.effectiveAudioIntent
+        if audioIntent.language != TrackLanguage.original {
+            languages.append(audioIntent.language)
+        } else if let main = TrackIntentResolver.resolveAudio(intent: audioIntent, in: plexAudioTracksFromMetadata()) {
+            languages.append(contentsOf: languageCandidates(for: main))
+        }
 
         if let selected = plexAudioTracksFromMetadata().first(where: { $0.isDefault }) {
             languages.append(contentsOf: languageCandidates(for: selected))
@@ -2119,14 +2266,22 @@ final class UniversalPlayerViewModel: ObservableObject {
             break
         }
 
-        switch TrackIntentStore.subtitleIntent {
+        switch TrackIntentStore.effectiveSubtitleIntent {
         case let .track(language, _, _, _) where !language.isEmpty:
             languages.append(language)
         case .off:
             break
-        case .track, .none:
-            // No stored intent (or an intent with no usable language): fall
-            // back to the file's forced/default subtitle stream.
+        case .foreignAudio:
+            let audio = TrackIntentResolver.resolveAudio(intent: TrackIntentStore.effectiveAudioIntent,
+                                                         in: plexAudioTracksFromMetadata())
+            if let track = TrackIntentResolver.resolveSubtitle(
+                intent: TrackIntentStore.effectiveSubtitleIntent, in: plexSubtitleTracksFromMetadata(),
+                audioLanguage: audio?.languageCode ?? audio?.language) {
+                languages.append(contentsOf: languageCandidates(for: track))
+            }
+        case .track:
+            // An intent with no usable language: fall back to the file's
+            // forced/default subtitle stream.
             if let selected = plexSubtitleTracksFromMetadata()
                 .first(where: { $0.isForced || $0.isDefault }) {
                 languages.append(contentsOf: languageCandidates(for: selected))
@@ -2246,7 +2401,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         // bitmap) and publishes them; the host renders via
         // CaptionOverlayView driven by this model. sourceTime shares
         // the engine clock tick so cue lookup can't drift from playback.
+        // A reused player replays the last item's cues on subscribe.
         player.$subtitleCues
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] cues in
                 self?.aetherSubtitleModel.update(cues: cues)
@@ -2293,7 +2450,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         // merges them with Plex's streams into ONE list per type (engine index
         // as the id, Plex's forced/SDH/commentary labels folded on). Either
         // side can arrive first, so the merge re-runs on each.
+        // A reused player replays the outgoing item's value; the load publishes this item's.
         player.$audioTracks
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] tracks in
                 guard let self, !tracks.isEmpty else { return }
@@ -2302,6 +2461,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             .store(in: &aetherCancellables)
 
         player.$subtitleTracks
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] tracks in
                 guard let self, !tracks.isEmpty else { return }
@@ -2318,6 +2478,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             .store(in: &aetherCancellables)
 
         player.$activeSubtitleTrackId
+            .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] id in
                 // Ignore engine-originated nil, exactly as the audio sink above
@@ -2328,7 +2489,8 @@ final class UniversalPlayerViewModel: ObservableObject {
                 // rendering. A genuine user turn-off sets currentSubtitleTrackId
                 // directly via selectSubtitleTrackWithoutSaving, not through this
                 // mirror sink, so dropping nil here doesn't miss real off events.
-                guard let self, let id else { return }
+                // A track read unseen for the content filter is not the user's pick.
+                guard let self, let id, self.silentSubtitleTrackId == nil else { return }
                 // Track ids ARE engine indices on this route (see TrackMerge) —
                 // the engine's active index needs no translation.
                 self.currentSubtitleTrackId = id
@@ -2348,6 +2510,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Fetch and log the HLS master manifest to inspect track labels and I-frame playlists.
     private func logHLSManifest(url: URL, headers: [String: String]) async {
+        let url = avPlayerURL(url)
         var request = URLRequest(url: url)
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
@@ -2414,6 +2577,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     ///   gets nothing. `retryWithoutEnrichment` calls this to trade the labels
     ///   for a session that plays.
     private func loadAVPlayer(url: URL, headers: [String: String]?, allowEnrichment: Bool = true) throws {
+        let url = avPlayerURL(url)
         teardownAVPlayerObservers()
         player?.pause()
         hlsManifestEnricher = nil
@@ -2886,11 +3050,13 @@ final class UniversalPlayerViewModel: ObservableObject {
     private func releaseAVPlayer() {
         guard player != nil else { return }
         teardownAVPlayerObservers()
+        clearTranscodeSubtitles()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
         _playerForCleanup = nil
         hlsManifestEnricher = nil
+        hlsRelay = nil
     }
 
     /// Frees the server transcode this session was playing, if any.
@@ -3299,13 +3465,15 @@ final class UniversalPlayerViewModel: ObservableObject {
         default:
             break
         }
-        let intent = TrackIntentStore.subtitleIntent
+        let intent = TrackIntentStore.effectiveSubtitleIntent
         if let selected = streams.first(where: { $0.isSubtitle && $0.selected == true })?.id,
            let track = subs.first(where: { $0.id == selected }), !track.isDefault, !track.isForced,
            TrackIntentResolver.plexSelectedSubtitleMayOverride(track, intent: intent) {
             ids.subtitle = selected
-        } else if let intent {
-            ids.subtitle = TrackIntentResolver.resolveSubtitle(intent: intent, in: subs)?.id ?? 0
+        } else {
+            let playing = audio.first { $0.id == ids.audio }
+            ids.subtitle = TrackIntentResolver.resolveSubtitle(
+                intent: intent, in: subs, audioLanguage: playing?.languageCode ?? playing?.language)?.id ?? 0
         }
         return ids
     }
@@ -3468,6 +3636,22 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
+    // MARK: - HLS Trust Relay
+
+    /// AVPlayer and the preflight use system trust, so an origin the Plex API
+    /// session accepts on its own rule is reached through a loopback relay (#337).
+    private func prepareHLSRelay(for url: URL) async {
+        if hlsRelay?.localURL(for: url) != nil { return }
+        hlsRelay = nil
+        guard await HLSTrustRelay.systemTrustRefuses(url) else { return }
+        hlsRelay = await HLSTrustRelay.start(for: url)
+        diagnostics.step("hls_trust_relay", detail: hlsRelay == nil ? "failed to start" : "started")
+    }
+
+    private func avPlayerURL(_ url: URL) -> URL {
+        hlsRelay?.localURL(for: url) ?? url
+    }
+
     // MARK: - HLS Transcode Preflight
 
     /// Wait for the HLS transcode session to be ready before loading playback.
@@ -3478,6 +3662,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     ///   - headers: HTTP headers including auth token
     /// - Returns: true if the transcode is ready, false if it failed to start
     private func waitForHLSTranscodeReady(url: URL, headers: [String: String]) async -> Bool {
+        await prepareHLSRelay(for: url)
+        let url = avPlayerURL(url)
         await PlexNetworkManager.shared.startTranscodeDecision(hlsURL: url, headers: headers)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -3627,6 +3813,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         titleLogoResolveTask = nil
         clearReplayWindow()
         contentFilter.reset()
+        subtitleImageReader.read([])
         releaseThumbnailCache()
         cancelEngineThumbnail()
 
@@ -3649,6 +3836,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         player = nil
         _playerForCleanup = nil
         hlsManifestEnricher = nil
+        hlsRelay = nil
 
         // Stop the Plex transcode session so the server frees resources immediately.
         // Without this, switching between DV files can timeout waiting for the init segment
@@ -3887,6 +4075,26 @@ final class UniversalPlayerViewModel: ObservableObject {
         replayWindow = nil
         if window.priorSubtitleTrackId == nil {
             selectSubtitleTrackWithoutSaving(id: nil, reloadsTranscode: false)
+            updateCaptionsOnMute()
+        }
+    }
+
+    /// Shows subtitles while tvOS's Show When Muted applies and puts the prior
+    /// choice back after, unless the user picked meanwhile.
+    private func updateCaptionsOnMute() {
+        guard aetherPlayer != nil else { return }
+        if systemCaptionsOnMute.isActive {
+            let audio = audioTracks.first { $0.id == currentAudioTrackId }
+            if let id = captionsOnMute.activate(
+                current: subtitleTracks.first { $0.id == currentSubtitleTrackId },
+                tracks: subtitleTracks,
+                preferredLanguage: CaptionsOnMuteLogic.language(of: TrackIntentStore.subtitleIntent),
+                audioLanguage: audio?.languageCode ?? audio?.language
+            ) {
+                selectSubtitleTrackWithoutSaving(id: id, reloadsTranscode: false)
+            }
+        } else if let restore = captionsOnMute.deactivate(currentTrackId: currentSubtitleTrackId) {
+            selectSubtitleTrackWithoutSaving(id: restore, reloadsTranscode: false)
         }
     }
 
@@ -4242,9 +4450,13 @@ final class UniversalPlayerViewModel: ObservableObject {
         // future playback sessions restore it.
         selectAudioTrackWithoutSaving(id: id)
 
-        if let track = audioTracks.first(where: { $0.id == id }) {
+        // Picking what the intent already chooses (Original's main track) leaves it alone.
+        if let track = audioTracks.first(where: { $0.id == id }),
+           TrackIntentResolver.resolveAudio(intent: TrackIntentStore.effectiveAudioIntent, in: audioTracks)?.id != id {
             TrackIntentStore.audioIntent = AudioIntent(from: track)
         }
+        // Foreign Audio follows the new language.
+        if case .foreignAudio = TrackIntentStore.effectiveSubtitleIntent { applyGlobalSubtitleIntent() }
     }
 
     /// Select audio track without saving preference (for auto-selection)
@@ -4263,16 +4475,91 @@ final class UniversalPlayerViewModel: ObservableObject {
         // User picked a track manually: their choice wins over any active
         // replay window (no later revert-to-prior-track).
         clearReplayWindow()
+        if aetherPlayer != nil, systemCaptionsOnMute.isActive { captionsOnMute.userPicked() }
 
         // Delegate the actual pipeline switch to the auto-selection helper,
         // then persist the user's explicit choice as the saved preference so
         // future playback sessions restore it.
         selectSubtitleTrackWithoutSaving(id: id)
 
-        if let id = id, let track = subtitleTracks.first(where: { $0.id == id }) {
-            TrackIntentStore.subtitleIntent = SubtitleIntent(from: track)
-        } else {
-            TrackIntentStore.subtitleIntent = .off
+        TrackIntentStore.subtitleIntent = .afterPick(
+            id.flatMap { id in subtitleTracks.first { $0.id == id } },
+            replacing: TrackIntentStore.effectiveSubtitleIntent, audioLanguage: playingAudioLanguage)
+    }
+
+    // MARK: - Subtitle Search
+
+    /// Plex writes the file next to the media, which only the server's admin may
+    /// do. `selectedServer` (and its `owned`) is nil after a warm launch, so ask the server.
+    private(set) var canSearchSubtitles = false
+    /// Admin answers per server URL + token, for the session.
+    private static var serverAdminAnswers: [String: Bool] = [:]
+
+    private func resolveSubtitleSearchAccess() async {
+        guard case .plex = source, metadata.ratingKey != nil,
+              PlexUserProfileManager.shared.selectedUser?.restricted != true else { return }
+        let key = serverURL + authToken
+        if let known = Self.serverAdminAnswers[key] {
+            canSearchSubtitles = known
+            return
+        }
+        let isAdmin = await PlexNetworkManager.shared.canAdministerServer(serverURL: serverURL, authToken: authToken)
+        Self.serverAdminAnswers[key] = isAdmin
+        canSearchSubtitles = isAdmin
+    }
+
+    /// The subtitle preference's language, else the device's, as ISO 639-1.
+    private var subtitleSearchLanguage: String {
+        let device = Locale.current.language.languageCode?.identifier(.alpha2) ?? "en"
+        guard let preferred = TrackIntentStore.effectiveSubtitleIntent.language else { return device }
+        let code = TrackLanguage.normalize(preferred)
+        return code.isEmpty ? device : Locale.LanguageCode(code).identifier(.alpha2) ?? device
+    }
+
+    func searchSubtitles() async throws -> [PlexStream] {
+        guard let ratingKey = metadata.ratingKey else { return [] }
+        return try await PlexNetworkManager.shared.searchSubtitles(
+            serverURL: serverURL, authToken: authToken, ratingKey: ratingKey, language: subtitleSearchLanguage)
+    }
+
+    /// Downloads `result`, waits for the server to list it, then reloads at the
+    /// playhead with it on. A reload re-registers every sidecar in Plex's order,
+    /// which `TrackMerge` pairs on; adding one to the live engine would not.
+    func installSubtitle(_ result: PlexStream) async {
+        guard let ratingKey = metadata.ratingKey, let resultKey = result.key else { return }
+        let network = PlexNetworkManager.shared
+        let generation = itemGeneration
+        let known = Set(plexSubtitleTracksFromMetadata().map(\.id))
+        var tracks = currentPlexTrackIDs()
+        showCompatibilityNotice("Downloading Subtitles…")
+        do {
+            try await network.downloadSubtitle(
+                serverURL: serverURL, authToken: authToken, ratingKey: ratingKey, resultKey: resultKey)
+            for _ in 0..<10 {
+                try await Task.sleep(for: .seconds(1.5))
+                let fresh = try await network.getMetadata(serverURL: serverURL, authToken: authToken, ratingKey: ratingKey)
+                guard generation == itemGeneration else { return }
+                let media = VersionRanking.select(playingMediaID.map(VersionChoice.source) ?? .best,
+                                                  in: fresh.Media ?? []).media
+                guard let added = media.first?.Part?.first?.Stream?.first(where: {
+                    $0.isSubtitle && $0.key != nil && !known.contains($0.id)
+                }) else { continue }
+                metadata.Media = media
+                TrackIntentStore.subtitleIntent = .afterPick(
+                    MediaTrack(from: added), replacing: TrackIntentStore.effectiveSubtitleIntent,
+                    audioLanguage: playingAudioLanguage)
+                tracks.subtitle = added.id
+                hideCompatibilityNotice()
+                enqueueStreamWork { vm in
+                    await vm.reloadStream(toOriginal: vm.aetherPlayer != nil, reason: "subtitle_download",
+                                          tracks: tracks, restoring: vm.planSnapshot)
+                }
+                return
+            }
+            showCompatibilityNotice("Subtitles Didn't Arrive")
+        } catch {
+            if isCancellationError(error) || generation != itemGeneration { return }
+            showCompatibilityNotice("Couldn't Download Subtitles")
         }
     }
 
@@ -4313,6 +4600,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     private func updateTrackLists() {
         let previousSubtitleCount = subtitleTracks.count
         let previousAudioCount = audioTracks.count
+        // Fresh track ids: a mute session from the old list no longer applies.
+        if previousSubtitleCount == 0 { captionsOnMute = CaptionsOnMuteLogic() }
 
         let plexStreams = metadata.Media?.first?.Part?.first?.Stream ?? []
         let plexAudio = plexStreams.filter { $0.isAudio }.map { MediaTrack(from: $0) }
@@ -4338,7 +4627,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             // picker's checkmark and the rail's label would point at the wrong
             // row. The engine's active index is authoritative and always in the
             // current numbering.
-            if let active = ap.activeSubtitleTrackId {
+            if silentSubtitleTrackId == nil, let active = ap.activeSubtitleTrackId {
                 currentSubtitleTrackId = active
             }
             if let active = ap.activeAudioTrackId {
@@ -4376,6 +4665,8 @@ final class UniversalPlayerViewModel: ObservableObject {
             hasAppliedSubtitlePreference = true
             applySubtitlePreference()
         }
+        syncSilentSubtitleRead()
+        updateCaptionsOnMute()
     }
 
     /// Apply saved audio preference. Selection priority is:
@@ -4474,30 +4765,30 @@ final class UniversalPlayerViewModel: ObservableObject {
            let track = subtitleTrackMatchingPlexStreamId(selectedId),
            !track.isDefault, !track.isForced,
            TrackIntentResolver.plexSelectedSubtitleMayOverride(
-               track, intent: TrackIntentStore.subtitleIntent
+               track, intent: TrackIntentStore.effectiveSubtitleIntent
            ) {
             selectSubtitleTrackWithoutSaving(id: track.id)
             return
         }
 
-        // 3. No explicit user intent yet: honor selected/default stream behavior.
-        guard let intent = TrackIntentStore.subtitleIntent else {
-            if currentSubtitleTrackId == nil,
-               let forcedTrack = subtitleTracks.first(where: { $0.isForced }) {
-                selectSubtitleTrackWithoutSaving(id: forcedTrack.id)
-            } else if let activeSubtitleTrackId = currentSubtitleTrackId {
-                selectSubtitleTrackWithoutSaving(id: activeSubtitleTrackId)
-            }
-            return
-        }
+        applyGlobalSubtitleIntent()
+    }
 
-        // 4. Global subtitle intent. Resolution is a PURE READ: when no track
+    /// The playing audio track's language, for Foreign Audio.
+    private var playingAudioLanguage: String? {
+        let audio = audioTracks.first { $0.id == currentAudioTrackId }
+        return audio?.languageCode ?? audio?.language
+    }
+
+    private func applyGlobalSubtitleIntent() {
+        // 3. Global subtitle intent. Resolution is a PURE READ: when no track
         //    on this title matches the intent (e.g. stored "ENG forced" but
         //    this title only ships a regular English track), subtitles come up
         //    off for this title and the stored intent is left ALONE, so it
         //    re-engages on the next title that does have a forced English
         //    track. Only an explicit user pick writes intent.
-        if let match = TrackIntentResolver.resolveSubtitle(intent: intent, in: subtitleTracks) {
+        if let match = TrackIntentResolver.resolveSubtitle(intent: TrackIntentStore.effectiveSubtitleIntent,
+                                                           in: subtitleTracks, audioLanguage: playingAudioLanguage) {
             selectSubtitleTrackWithoutSaving(id: match.id)
         } else {
             selectSubtitleTrackWithoutSaving(id: nil)
@@ -4513,7 +4804,13 @@ final class UniversalPlayerViewModel: ObservableObject {
         aetherPlayer?.selectSubtitleTrack(id: id)
         let changed = id != currentSubtitleTrackId
         currentSubtitleTrackId = id
-        if changed, reloadsTranscode, aetherPlayer == nil { reloadTranscodeForTrackChange() }
+        syncSilentSubtitleRead()
+        if changed, reloadsTranscode, aetherPlayer == nil {
+            // The old track's captions go now, not when the reloaded transcode is ready.
+            stopTranscodeSubtitleReader()
+            clearTranscodeSubtitles()
+            reloadTranscodeForTrackChange()
+        }
     }
 
     private func plexAudioTracksFromMetadata() -> [MediaTrack] {
@@ -5352,14 +5649,6 @@ final class UniversalPlayerViewModel: ObservableObject {
             return
         }
 
-        // Animate video shrink
-        withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) {
-            videoFrameState = .shrunk
-        }
-
-        // Show episode summary after brief delay
-        try? await Task.sleep(nanoseconds: 200_000_000)  // 0.2s
-        guard generation == itemGeneration else { return }
         postVideoState = .showingEpisodeSummary
 
         // Start countdown and preload
@@ -5494,16 +5783,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     func loadInsightsCast() async {
         let generation = itemGeneration
         let isMovie = metadata.type == "movie"
-        // Episodes: use the SHOW's tmdb id, never the episode's own guid. Some
-        // Plex agents put a per-episode tmdb:// id in the episode's Guid array,
-        // which would resolve to the wrong id and silently drop TMDB cast.
-        var tmdbId = metadata.type == "episode"
-            ? (metadata.parentShowTmdbId ?? metadata.showTmdbId)
-            : metadata.tmdbId
-        if let providerEpisode {
-            tmdbId = await providerShowTmdbID(providerEpisode)
-            guard generation == itemGeneration else { return }
-        }
+        let tmdbId = await insightsTmdbID()
+        guard generation == itemGeneration else { return }
 
         var people: [MediaPerson] = []
 
@@ -5521,12 +5802,8 @@ final class UniversalPlayerViewModel: ObservableObject {
 
         // Plex Role fallback: item's own roles, then (episodes) the show's roles.
         if people.isEmpty, case .plex = source {
-            var roles = metadata.Role ?? []
-            if roles.isEmpty, let key = metadata.ratingKey,
-               let full = try? await PlexNetworkManager.shared.getFullMetadata(
-                   serverURL: serverURL, authToken: authToken, ratingKey: key) {
-                roles = full.Role ?? []
-            }
+            // Hub items carry a truncated Role list (3 on Continue Watching).
+            var roles = await insightsFullMetadata()?.Role ?? metadata.Role ?? []
             if roles.isEmpty, metadata.type == "episode", let showKey = metadata.grandparentRatingKey,
                let show = try? await PlexNetworkManager.shared.getFullMetadata(
                    serverURL: serverURL, authToken: authToken, ratingKey: showKey) {
@@ -5550,25 +5827,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// stays nil and the panel shows no Trivia section).
     func loadInsightsTrivia() async {
         let generation = itemGeneration
-        var tmdbId = metadata.type == "episode"
-            ? (metadata.parentShowTmdbId ?? metadata.showTmdbId)
-            : metadata.tmdbId
-
-        // For episodes, Plex often gives a plex:// or tvdb:// grandparent guid
-        // (not tmdb://), so the direct extraction above is nil. Resolve the
-        // show TMDB id from the show's external ids (tvdb/imdb -> tmdb via the
-        // proxy find route) so Insights can fetch/request generation instead of
-        // silently bailing. Cached per show, so this is one lookup, not per
-        // episode.
-        if let providerEpisode {
-            tmdbId = await providerShowTmdbID(providerEpisode)
-            guard generation == itemGeneration else { return }
-        } else if tmdbId == nil, metadata.type == "episode" {
-            let externalIDs = await resolveShowExternalIDs()
-            guard generation == itemGeneration else { return }
-            tmdbId = await InsightsShowIDResolver.shared.resolve(externalIDs)
-            guard generation == itemGeneration else { return }
-        }
+        let tmdbId = await insightsTmdbID()
+        guard generation == itemGeneration else { return }
 
         guard let tmdbId else {
             guard generation == itemGeneration else { return }
@@ -5625,6 +5885,35 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard generation == itemGeneration else { return }
         insightsTrivia = trivia
         suppressedTriviaIDs = suppressed
+    }
+
+    /// The TMDB id both Insights sections describe: an episode's SHOW (never the
+    /// episode's own guid, which some agents set wrongly), else the item. Hub
+    /// items (Continue Watching) arrive without Guid, so a miss reads full metadata.
+    private func insightsTmdbID() async -> Int? {
+        if let providerEpisode { return await providerShowTmdbID(providerEpisode) }
+        if metadata.type == "episode" {
+            if let id = metadata.parentShowTmdbId ?? metadata.showTmdbId { return id }
+            return await InsightsShowIDResolver.shared.resolve(await resolveShowExternalIDs())
+        }
+        if let id = metadata.tmdbId { return id }
+        return await insightsFullMetadata()?.tmdbId
+    }
+
+    /// One full-metadata fetch per item, shared by the cast and trivia loads.
+    private var insightsFullMetadataTask: (generation: Int, task: Task<PlexMetadata?, Never>)?
+
+    private func insightsFullMetadata() async -> PlexMetadata? {
+        guard case .plex = source, let key = metadata.ratingKey else { return nil }
+        if let cached = insightsFullMetadataTask, cached.generation == itemGeneration {
+            return await cached.task.value
+        }
+        let (url, token) = (serverURL, authToken)
+        let task = Task {
+            try? await PlexNetworkManager.shared.getFullMetadata(serverURL: url, authToken: token, ratingKey: key)
+        }
+        insightsFullMetadataTask = (itemGeneration, task)
+        return await task.value
     }
 
     /// `.provider` episodes only: the playback, since an episode's own ids are
@@ -5920,6 +6209,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard countdownSetting > 0 else {
             return
         }
+        // Autoplay Limit: past it, Up Next waits for the remote.
+        guard AutoplayLimit.current.allowsAutoplay(afterEpisodesInARow: episodesInARow) else { return }
 
         countdownSeconds = countdownSetting
         // The ring draws remaining/total, so it needs the RESOLVED setting.
@@ -5940,7 +6231,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
                 if self.countdownSeconds <= 0 {
                     self.countdownTimer?.invalidate()
-                    await self.playNextEpisode()
+                    await self.playNextEpisode(autoplayed: true)
                 }
             }
         }
@@ -6086,8 +6377,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         await playNextEpisode()
     }
 
-    /// Play the next episode
-    func playNextEpisode() async {
+    /// Play the next episode. `autoplayed` is the countdown running out; any
+    /// other start comes from the remote and begins a new run.
+    func playNextEpisode(autoplayed: Bool = false) async {
         guard let next = nextEpisode else { return }
         // A provider swap awaits its provider first, so a second call (the
         // countdown and a Play Now press) must not start another one.
@@ -6127,12 +6419,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         countdownTimer = nil
         countdownSeconds = 0
         isCountdownPaused = false
+        episodesInARow = autoplayed ? episodesInARow + 1 : 1
 
-        // Reset post-video state with animation to return video to fullscreen
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            postVideoState = .hidden
-            videoFrameState = .fullscreen
-        }
+        postVideoState = .hidden
 
         if let nextProviderPlayback {
             // Source, display shim and reporter move together; the outgoing
@@ -6268,7 +6557,6 @@ final class UniversalPlayerViewModel: ObservableObject {
         countdownTimer?.invalidate()
         countdownTimer = nil
         postVideoState = .hidden
-        videoFrameState = .fullscreen
         nextEpisode = nil
         countdownSeconds = 0
         isCountdownPaused = false

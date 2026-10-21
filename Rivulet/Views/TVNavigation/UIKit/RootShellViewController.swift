@@ -38,6 +38,45 @@ final class RootShellViewController: UIViewController {
         didSet { updateChromeVisibility() }
     }
 
+    /// A counter: each bump closes the sidebar (a profile switch lands on Home
+    /// with the sidebar closed, as the TV app's relaunch does).
+    var collapseRequest = 0 {
+        didSet {
+            guard collapseRequest != oldValue, isViewLoaded else { return }
+            evictCachedContent()
+            // The switch emptied the mounted page: once it reloads, focus has to
+            // be driven into it again, as on a fresh mount.
+            contentHasHadFocus = false
+            collapseSidebar()
+            updateChromeVisibility()
+        }
+    }
+
+    /// Drops every cached page but Home: they hold the previous profile's items.
+    private func evictCachedContent() {
+        for (tab, vc) in contentVCs where tab != .home {
+            vc.willMove(toParent: nil)
+            vc.view.removeFromSuperview()
+            vc.removeFromParent()
+            contentVCs[tab] = nil
+        }
+    }
+
+    /// The profile panel is up: the sidebar folds to its pill, which names the user.
+    var profilePanelOpen = false {
+        didSet {
+            guard profilePanelOpen != oldValue, isViewLoaded else { return }
+            sidebar.setPillShowsProfile(profilePanelOpen)
+            if profilePanelOpen { collapseSidebar() }
+            updateChromeVisibility()
+        }
+    }
+    /// A counter: each bump reopens the sidebar on the profile row (the panel
+    /// closed with no switch, back to where Select was pressed).
+    var profileRowRequest = 0 {
+        didSet { if profileRowRequest != oldValue, isViewLoaded { expandSidebar(aimAt: .account) } }
+    }
+
     private(set) var currentTab: SidebarTab = .home
     private var contentVCs: [SidebarTab: UIViewController] = [:]
     private let sidebar = ShellSidebarViewController()
@@ -86,6 +125,8 @@ final class RootShellViewController: UIViewController {
 
         sidebar.onTabSelected = { [weak self] tab in
             guard let self else { return }
+            // The profile row opens the switcher; it has no content to mount.
+            if tab == .account { self.onTabChange?(tab); return }
             // Mount BEFORE collapsing. `collapseSidebar` resolves focus
             // immediately, but the report back through SwiftUI is async, so
             // waiting for the binding to return parked focus in the OUTGOING
@@ -113,6 +154,9 @@ final class RootShellViewController: UIViewController {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleContentBecameFocusable),
             name: .contentBecameFocusable, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleTabContentReplaced(_:)),
+            name: .tabContentReplaced, object: nil)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -229,9 +273,9 @@ final class RootShellViewController: UIViewController {
 
     // MARK: Sidebar chrome
 
-    private func expandSidebar() {
+    private func expandSidebar(aimAt tab: SidebarTab? = nil) {
         guard !sidebar.isExpanded, !interactionBlocked else { return }
-        sidebar.setExpanded(true, animated: true)
+        sidebar.setExpanded(true, animated: true, aimAt: tab)
         updateChromeVisibility()
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
@@ -251,7 +295,8 @@ final class RootShellViewController: UIViewController {
     private func updateChromeVisibility() {
         guard isViewLoaded else { return }
         if interactionBlocked, sidebar.isExpanded { collapseSidebar() }
-        sidebar.setPillHidden(belowTop || pillSuppressed || interactionBlocked)
+        // The profile panel hangs under the pill, so the pill shows on every page.
+        sidebar.setPillHidden(!profilePanelOpen && (belowTop || pillSuppressed || interactionBlocked))
         // `sidebar.view` is full-screen, transparent and the LAST subview here,
         // so while collapsed it is an interactive layer painted over every
         // content view. `UIFocusDebugger` names it as the occluder for every
@@ -287,6 +332,16 @@ final class RootShellViewController: UIViewController {
         driveFocusIntoContent()
     }
 
+    /// The mounted tab swapped its page: hand focus in as `mountContent` does.
+    @objc private func handleTabContentReplaced(_ note: Notification) {
+        guard let content = contentVCs[currentTab], note.object as AnyObject? === content else { return }
+        contentHasHadFocus = false
+        contentFocusGaveUp = false
+        belowTop = false
+        updateChromeVisibility()
+        driveFocusIntoContent()
+    }
+
     // MARK: Focus
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
@@ -298,9 +353,9 @@ final class RootShellViewController: UIViewController {
     /// The nearest backing `UIView` at or above `item` in the focus chain.
     ///
     /// SwiftUI's focus items are NOT UIViews, so `as? UIView` on a focused item
-    /// (and `context.nextFocusedView`, which is the same cast) is nil for every
-    /// hosted SwiftUI tab — Music and Live TV. That silently turned off both
-    /// `contentHasHadFocus` and the Menu containment check there: Music could
+    /// (and `context.nextFocusedView`, which is the same cast) is nil for a
+    /// hosted SwiftUI tab (Live TV). That silently turned off both
+    /// `contentHasHadFocus` and the Menu containment check there: the tab could
     /// only ever leave via the give-up fallback, and Menu fell through to the
     /// system and quit the app.
     ///
@@ -343,6 +398,13 @@ final class RootShellViewController: UIViewController {
             }
             return
         }
+        // The profile panel hands focus back to the content it left it in, after
+        // the sidebar has reopened: pull it into the sidebar.
+        if sidebar.isExpanded, isInsideContent(next) {
+            setNeedsFocusUpdate()
+            updateFocusIfNeeded()
+            return
+        }
         if !contentHasHadFocus, isInsideContent(next) {
             contentHasHadFocus = true
             updateChromeVisibility()
@@ -376,7 +438,7 @@ extension RootShellViewController: MenuBackHandling {
         // shell absorbed the press.
         // Via `backingView`, not a bare `as? UIView`: a SwiftUI tab's focused
         // item is not a UIView, so the plain cast failed there and Menu bubbled
-        // to the system, quitting the app from Music and Live TV.
+        // to the system, quitting the app from Live TV.
         // Nothing focused with nothing presented is a page still loading (a
         // spinner, no focus target): Menu opens the sidebar rather than
         // reaching the system and quitting the app.

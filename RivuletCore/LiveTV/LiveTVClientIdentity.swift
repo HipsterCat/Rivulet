@@ -30,14 +30,14 @@ enum LiveTVClientIdentity {
     /// Read from the bundle rather than hardcoded so it tracks releases without
     /// anyone remembering to update it. Contains no user, device, or token data,
     /// so it is safe to send to any server and safe to log.
-    static let userAgent: String = {
+    nonisolated static let userAgent: String = {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         return "Rivulet/\(version)"
     }()
 
     /// Headers attached to every Live TV stream load. Kept as a single value so
     /// the player call sites cannot drift apart from one another.
-    static let streamHeaders: [String: String] = ["User-Agent": userAgent]
+    nonisolated static let streamHeaders: [String: String] = ["User-Agent": userAgent]
 
     /// Headers for one channel's stream: the base identity, overridden by any
     /// headers the playlist authored for that channel (`url|User-Agent=...`).
@@ -51,11 +51,15 @@ enum LiveTVClientIdentity {
     ///
     /// Only a literal `|` is a delimiter. An encoded `%7C` is ordinary URL data
     /// (a signed token, an Xtream password) and is left in the URL untouched.
+    private nonisolated static let streamSchemes: Set<String> = ["http", "https", "rtsp", "rtsps", "rtp", "udp", "rtmp", "rtmps", "srt"]
+
     nonisolated static func parseStreamURL(_ rawString: String) -> (url: URL, headers: [String: String])? {
         let trimmed = rawString.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
         guard let first = parts.first,
-              let url = URL(string: first.trimmingCharacters(in: .whitespaces)) else {
+              let url = URL(string: first.trimmingCharacters(in: .whitespaces)),
+              // A playlist names network streams only, never `file:` or FFmpeg's `concat:`/`subfile:`.
+              let scheme = url.scheme?.lowercased(), streamSchemes.contains(scheme) else {
             return nil
         }
 

@@ -67,6 +67,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     private var subtitleOverlay: CaptionOverlayView?
     private var captionStyle: CaptionStyle = CaptionAppearance.current()
     private var cancellables = Set<AnyCancellable>()
+    /// Subtitles turned on by tvOS's Show When Muted.
+    private var captionsOnMute = CaptionsOnMuteLogic()
+    private lazy var systemCaptionsOnMute = SystemCaptionsOnMute { [weak self] in self?.updateCaptionsOnMute() }
 
     /// Last-resort AVPlayer (fallback stage 2) rendered on its own layer.
     private var lastResortPlayer: AVPlayer?
@@ -298,6 +301,24 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     /// tile. The host presents multiview once this player has closed.
     var onOpenMultiview: ((LiveTVSessionHandoff) -> Void)?
 
+    /// The Scores pane's leading "Watch with Scores" card; hidden while nil.
+    var onWatchWithScores: (() -> Void)?
+
+    /// The scoreboard game the programme on screen shows, kept by `updateRailContent`.
+    private(set) var matchedGame: (league: League, game: ScoreGame)?
+    private var scoresObservation: AnyCancellable?
+    /// Built once and reused: a board is up to ~60 cards, too slow to rebuild on every visit.
+    private var scoresPane: LiveScoresPaneView?
+
+    /// The rail's panes, for Down reopening the last one used.
+    enum LivePane { case info, scores, channels }
+    private var lastPane = LivePane.info
+
+    /// Down's pane: the last one used while it is still offered, else Info.
+    static func paneForDown(last: LivePane, available: Set<LivePane>) -> LivePane {
+        available.contains(last) ? last : .info
+    }
+
     init(channel: UnifiedChannel, adopting session: LiveTVSessionHandoff? = nil) {
         self.channel = session?.channel ?? channel
         self.pendingAdoption = session
@@ -348,6 +369,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
         inputCoordinator.target = self
         NowPlayingService.shared.attachLive(inputCoordinator: inputCoordinator)
+        MusicQueue.shared.liveTVSessionBegan(ObjectIdentifier(self))
         // Live TV is watched lean-back for long stretches with no input; the
         // screensaver must not take over mid-programme.
         UIApplication.shared.isIdleTimerDisabled = true
@@ -385,6 +407,11 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         aetherPlayer = aether
         aether.bind(view: engineSurfaceView)
         bindAetherSubtitles(aether)
+        captionsOnMute = CaptionsOnMuteLogic()
+        aether.$subtitleTracks
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateCaptionsOnMute() }
+            .store(in: &cancellables)
         bindNativeLegibleAttachment(aether)
 
         aether.playbackStatePublisher
@@ -516,6 +543,12 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         LiveHandoffCover.hide(in: view.window)
     }
 
+    // Safety net: a dismissal the guard below misses must not leave Music stood down.
+    deinit {
+        let session = ObjectIdentifier(self)
+        Task { @MainActor in MusicQueue.shared.liveTVSessionEnded(session) }
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         guard isBeingDismissed || isMovingFromParent else { return }
@@ -540,6 +573,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         timelineHideTimer = nil
         stopTimelineTicker()
         NowPlayingService.shared.detachLive(inputCoordinator: inputCoordinator)
+        MusicQueue.shared.liveTVSessionEnded(ObjectIdentifier(self))
         inputCoordinator.invalidate()
         UIApplication.shared.isIdleTimerDisabled = false
         onDismiss?(channel)
@@ -557,9 +591,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         super.dismiss(animated: animated, completion: completion)
     }
 
-    /// Carry the running channel into multiview as its first tile.
-    private func openMultiview() {
-        guard let onOpenMultiview, let session = detachSession() else { return }
+    /// Carry the running channel into multiview as its first tile. `open`
+    /// replaces `onOpenMultiview` (the host's "Watch with Scores").
+    func openMultiview(with open: ((LiveTVSessionHandoff) -> Void)? = nil) {
+        guard let onOpenMultiview = open ?? onOpenMultiview, let session = detachSession() else { return }
         // No dismiss animation: multiview opens with this picture full screen
         // and shrinks it into its tile, so the screen behind never shows.
         LiveHandoffCover.show(under: self)
@@ -764,7 +799,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         ])
         railView.scrubberFocusProxy = scrubberProxy
         scrubberProxy.onSkip = { [weak self] forward in
-            self?.skip(by: forward ? InputConfig.tapSeekSeconds : -InputConfig.tapSeekSeconds)
+            self?.skip(by: InputConfig.tapSeekDelta(forward: forward))
         }
         scrubberProxy.onShuttle = scrubberProxy.onSkip
         scrubberProxy.onSelect = { [weak self] in self?.togglePlayPause() }
@@ -792,16 +827,22 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         railView.onAudio = { [weak self] in self?.presentAudioPanel() }
         railView.onInfo = { [weak self] in self?.presentInfoPanel() }
         railView.onUpNext = { [weak self] in self?.presentChannelListPanel() }
+        railView.onScores = { [weak self] in self?.presentScoresPanel() }
         // Moving across the pills while a pane is open switches its tab.
         railView.onPillFocused = { [weak self] pill in
             guard let self, self.activePanel?.isPane == true, pill !== self.openPanePill else { return }
             if pill === self.railView.infoButton { self.presentInfoPanel() }
+            if pill === self.railView.scoresButton { self.presentScoresPanel() }
             if pill === self.railView.upNextButton { self.presentChannelListPanel() }
         }
         railView.onGoLive = { [weak self] in self?.goLive() }
         railView.onRecord = { [weak self] in self?.presentRecordPanel() }
 
         updateRailContent()
+        // A scores fetch landing can bring the Scores pill up.
+        scoresObservation = ScoreboardPoller.shared.$boards
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateRailContent() }
 
         // The guide's "current programme" rolls over on its own clock.
         programInfoTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -871,6 +912,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             available: store.canRecord(channel) && current != nil,
             isRecording: current.map { store.activeRecording(for: $0) != nil } ?? false
         )
+        updateScoresMatch(current)
 
 
         NowPlayingService.shared.updateLive(
@@ -878,6 +920,19 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             channelName: channel.name,
             isPlaying: !isUserPaused
         )
+    }
+
+    /// Matches the programme on screen to a game, fetching scores when it might be one.
+    private func updateScoresMatch(_ program: UnifiedProgram?) {
+        let poller = ScoreboardPoller.shared
+        if let program, GameMatcher.mightBeGame(program) {
+            Task { await poller.refreshIfStale(maxAge: 300) }
+            matchedGame = GameMatcher.game(for: program, channel: channel, in: poller.boards)
+            LiveScoresPaneView.noteWatched(matchedGame?.game.id)
+        } else {
+            matchedGame = nil
+        }
+        railView.setScoresAvailable(matchedGame != nil)
     }
 
     private func showRail() {
@@ -1074,6 +1129,11 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             riders: [progressBar, timeshiftBadge], replacing: openPane)
         railView.setSelectedPill(pill)
         openPanePill = pill
+        switch pill {
+        case railView.scoresButton: lastPane = .scores
+        case railView.upNextButton: lastPane = .channels
+        default: lastPane = .info
+        }
         panel.onDismiss = { [weak self, weak panel] in
             guard let self, self.activePanel === panel else { return }
             self.activePanel = nil
@@ -1132,8 +1192,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                 showsOffRow: true,
                 steppers: steppers
             ) { [weak self] trackId in
-                self?.aetherPlayer?.selectSubtitleTrack(id: trackId)
-                self?.activePanel?.dismissPanel()
+                guard let self else { return }
+                if self.systemCaptionsOnMute.isActive { self.captionsOnMute.userPicked() }
+                self.aetherPlayer?.selectSubtitleTrack(id: trackId)
+                self.activePanel?.dismissPanel()
             }
             presentPanel(content: list, width: 520)
             return
@@ -1183,6 +1245,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                 tracks: aether.audioTracks,
                 selectedTrackId: aether.currentAudioTrackId,
                 showsOffRow: false,
+                choices: SystemAudioAdjustment.menuChoices,
                 toggles: SystemAudioAdjustment.menuToggles
             ) { [weak self] trackId in
                 if let trackId { self?.aetherPlayer?.selectAudioTrack(id: trackId) }
@@ -1215,6 +1278,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                 tracks: tracks,
                 selectedTrackId: selectedIndex,
                 showsOffRow: false,
+                choices: SystemAudioAdjustment.menuChoices,
                 toggles: SystemAudioAdjustment.menuToggles
             ) { [weak self] trackId in
                 if let trackId, trackId < group.options.count {
@@ -1776,6 +1840,39 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         presentPane(content: card, pill: railView.infoButton)
     }
 
+    /// Today's scores, opened on the league of the game on screen.
+    private func presentScoresPanel() {
+        guard let matchedGame else { return }
+        if let pane = scoresPane {
+            if pane.currentGameID != matchedGame.game.id {
+                pane.setCurrentGame(matchedGame.game.id, league: matchedGame.league)
+            }
+            presentPane(content: pane, pill: railView.scoresButton)
+            return
+        }
+        let store = LiveTVDataStore.shared
+        let watchWithScores = onWatchWithScores.map { action in
+            { [weak self] in
+                self?.activePanel?.dismissPanel()
+                action()
+            }
+        }
+        let pane = LiveScoresPaneView(
+            league: matchedGame.league,
+            currentGameID: matchedGame.game.id,
+            channelsAiring: { games in
+                GameMatcher.channels(airing: games, channels: store.channels,
+                                     current: { store.getCurrentProgram(for: $0) })
+            },
+            onSelect: { [weak self] selected in
+                self?.activePanel?.dismissPanel()
+                self?.switchChannel(to: selected)
+            },
+            onWatchWithScores: watchWithScores)
+        scoresPane = pane
+        presentPane(content: pane, pill: railView.scoresButton)
+    }
+
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
@@ -1911,7 +2008,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             return
         }
         if let activePanel {
-            activePanel.dismissPanel()
+            if !activePanel.contentHandlesMenuPress() { activePanel.dismissPanel() }
             armDismissEchoBlock()
             completion?()
             return
@@ -1954,7 +2051,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     private func handleHiddenChromeDirection(_ direction: DirectionalInputBinding.Direction) {
         switch direction {
         case .left:
-            skip(by: -InputConfig.tapSeekSeconds)
+            skip(by: -InputConfig.tapSeekBackSeconds)
         case .right:
             skip(by: InputConfig.tapSeekSeconds)
         case .up:
@@ -1962,10 +2059,20 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             if let tool = railView.firstToolButton { railView.setFocusLanding(tool) }
             showRail()
         case .down:
-            // And Down opens the Info pane.
-            railView.setFocusLanding(railView.infoButton)
+            // And Down reopens the last pane used, Info at first.
+            var available: Set<LivePane> = [.info]
+            if matchedGame != nil { available.insert(.scores) }
+            if !LiveTVDataStore.shared.channels.isEmpty { available.insert(.channels) }
+            let pane = Self.paneForDown(last: lastPane, available: available)
+            let pills: [LivePane: PlayerInfoPillButton] = [
+                .info: railView.infoButton, .scores: railView.scoresButton, .channels: railView.upNextButton]
+            if let pill = pills[pane] { railView.setFocusLanding(pill) }
             showRail()
-            presentInfoPanel()
+            switch pane {
+            case .info: presentInfoPanel()
+            case .scores: presentScoresPanel()
+            case .channels: presentChannelListPanel()
+            }
         }
     }
 
@@ -2294,6 +2401,25 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         overlay.setControlsVisible(railVisible || timelineVisible, animated: animated)
     }
 
+    /// Shows subtitles while tvOS's Show When Muted applies, then puts the prior
+    /// choice back. Engine demux only: bypass captions belong to AVPlayer.
+    private func updateCaptionsOnMute() {
+        guard let aether = aetherPlayer, !isPlayingRemoteHLSDirectly else { return }
+        if systemCaptionsOnMute.isActive {
+            let audio = aether.audioTracks.first { $0.id == aether.currentAudioTrackId }
+            if let id = captionsOnMute.activate(
+                current: aether.subtitleTracks.first { $0.id == aether.currentSubtitleTrackId },
+                tracks: aether.subtitleTracks,
+                preferredLanguage: CaptionsOnMuteLogic.language(of: TrackIntentStore.subtitleIntent),
+                audioLanguage: audio?.languageCode ?? audio?.language
+            ) {
+                aether.selectSubtitleTrack(id: id)
+            }
+        } else if let restore = captionsOnMute.deactivate(currentTrackId: aether.currentSubtitleTrackId) {
+            aether.selectSubtitleTrack(id: restore)
+        }
+    }
+
     private func bindAetherSubtitles(_ aether: AetherPlayer) {
         aether.$subtitleCues
             .receive(on: DispatchQueue.main)
@@ -2358,7 +2484,7 @@ extension LiveTVAetherPlayerViewController: PlaybackInputTarget {
         case .seekRelative(let seconds):
             skip(by: seconds)
         case .stepSeek(let forward), .scrubNudge(let forward):
-            skip(by: forward ? InputConfig.tapSeekSeconds : -InputConfig.tapSeekSeconds)
+            skip(by: InputConfig.tapSeekDelta(forward: forward))
         case .jumpSeek(let forward):
             skip(by: forward ? InputConfig.jumpSeekSeconds : -InputConfig.jumpSeekSeconds)
         case .showInfo:

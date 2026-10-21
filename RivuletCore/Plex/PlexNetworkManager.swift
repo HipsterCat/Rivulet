@@ -77,6 +77,10 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
     /// finishes it anyway and holds the grab with nobody to release it.
     static let liveTuneTimeout: TimeInterval = 300
 
+    /// A slow PMS takes 23 to 30s to answer one six-hour grid, and twice that
+    /// for twelve hours, so the default 30s failed about half the time (#338).
+    static let guideTimeout: TimeInterval = 120
+
     // Not private: callers inject a manager (see PlexProvider.init), so tests
     // subclass this to stub responses. App code still uses `.shared`.
     override init() {
@@ -116,12 +120,13 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         _ url: URL,
         method: String = "GET",
         headers: [String: String] = [:],
-        body: Data? = nil
+        body: Data? = nil,
+        timeout: TimeInterval? = nil
     ) async throws -> T {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.httpBody = body
-        request.timeoutInterval = defaultTimeout
+        request.timeoutInterval = timeout ?? defaultTimeout
 
         // Default headers
         request.addValue("application/json", forHTTPHeaderField: "Accept")
@@ -140,7 +145,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await (timeout == nil ? session : longHoldSession).data(for: request)
         } catch {
             // Transport-level failures (timeout -1001, connection lost -1005,
             // cannot-connect -1004) previously escaped this function completely
@@ -357,6 +362,15 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return json["authToken"] as? String
     }
 
+    /// Revokes an account token at plex.tv, as Plex's own clients do on sign-out. Best effort.
+    func revokeToken(_ authToken: String) async {
+        guard let url = URL(string: "\(PlexAPI.baseUrl)/api/v2/users/signout") else { return }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.httpMethod = "DELETE"
+        plexHeaders(authToken: authToken).forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        _ = try? await session.data(for: request)
+    }
+
     // MARK: - Server Discovery
 
     /// Get list of available Plex servers for the authenticated user
@@ -376,7 +390,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         // Only Plex Media Servers. Each device's `machineIdentifier` is populated
         // at decode time from its `clientIdentifier` (the same value the old
         // pms/servers.xml fetch returned), so no separate round-trip is needed.
-        return devices.filter { $0.provides == "server" }
+        let servers = devices.filter { $0.provides == "server" }
+        PlexCertificateDelegate.registerCertificateHashes(from: servers)
+        return servers
     }
 
     // MARK: - Library Browsing
@@ -427,6 +443,31 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return container.MediaContainer.Metadata ?? []
     }
 
+    /// One level of a section's on-disk tree: the root, or a folder by `parent`.
+    /// Start must ride with Size or PMS ignores both.
+    func getFolder(
+        serverURL: String,
+        authToken: String,
+        sectionId: String,
+        parent: String?,
+        start: Int,
+        size: Int
+    ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
+        guard var components = URLComponents(string: "\(serverURL)/library/sections/\(sectionId)/folder") else {
+            throw PlexAPIError.invalidURL
+        }
+        components.queryItems = (parent.map { [URLQueryItem(name: "parent", value: $0)] } ?? []) + [
+            URLQueryItem(name: "X-Plex-Container-Start", value: "\(start)"),
+            URLQueryItem(name: "X-Plex-Container-Size", value: "\(size)")
+        ]
+        guard let url = components.url else { throw PlexAPIError.invalidURL }
+        let container: PlexMediaContainerWrapper = try await request(
+            url,
+            headers: plexHeaders(authToken: authToken)
+        )
+        return (container.MediaContainer.Metadata ?? [], container.MediaContainer.totalSize)
+    }
+
     /// Get library items with total count for pagination
     /// - Parameters:
     ///   - serverURL: The Plex server URL
@@ -444,7 +485,8 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         size: Int = 100,
         sort: String? = nil,
         type: Int? = nil,
-        includeGuids: Bool = false
+        includeGuids: Bool = false,
+        filters: [URLQueryItem] = []
     ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
         #if DEBUG
         if KinoPubDemo.isActive {
@@ -477,7 +519,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             queryItems.append(URLQueryItem(name: "includeGuids", value: "1"))
         }
 
-        components.queryItems = queryItems
+        components.queryItems = queryItems + filters
 
         guard let url = components.url else {
             throw PlexAPIError.invalidURL
@@ -1244,8 +1286,96 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             request.addValue(value, forHTTPHeaderField: key)
         }
 
+        let before = try? await getMetadata(serverURL: serverURL, authToken: authToken, ratingKey: ratingKey).updatedAt
         let (_, response) = try await session.data(for: request)
 
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            throw PlexAPIError.invalidResponse
+        }
+        // The server refreshes after answering (about 3 s measured): wait for
+        // the item's updatedAt to move, so a repaint shows the new metadata.
+        for _ in 0..<15 {
+            try await Task.sleep(for: .seconds(2))
+            let now = try? await getMetadata(serverURL: serverURL, authToken: authToken, ratingKey: ratingKey).updatedAt
+            if now != before { return }
+        }
+    }
+
+    /// Subtitles the server's agents (OpenSubtitles) offer for an item, best first.
+    /// `language` must be ISO 639-1: PMS 1.43.4 answers 500 for "eng".
+    func searchSubtitles(
+        serverURL: String,
+        authToken: String,
+        ratingKey: String,
+        language: String
+    ) async throws -> [PlexStream] {
+        guard var components = URLComponents(string: "\(serverURL)/library/metadata/\(ratingKey)/subtitles") else {
+            throw PlexAPIError.invalidURL
+        }
+        components.queryItems = [URLQueryItem(name: "language", value: language)]
+        guard let url = components.url else { throw PlexAPIError.invalidURL }
+        let container: PlexStreamListWrapper = try await request(url, headers: plexHeaders(authToken: authToken))
+        return container.MediaContainer.Stream ?? []
+    }
+
+    /// Whether `authToken` administers the server: `/accounts` answers 200 for the
+    /// owner and 401 otherwise.
+    func canAdministerServer(serverURL: String, authToken: String) async -> Bool {
+        guard let url = URL(string: "\(serverURL)/accounts?X-Plex-Container-Start=0&X-Plex-Container-Size=1") else {
+            return false
+        }
+        var request = URLRequest(url: url)
+        for (key, value) in plexHeaders(authToken: authToken) {
+            request.addValue(value, forHTTPHeaderField: key)
+        }
+        guard let (_, response) = try? await session.data(for: request) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    /// Whether the server's "Allow media deletion" setting is on (`allowMediaDeletion` on `/`).
+    func allowsMediaDeletion(serverURL: String, authToken: String) async -> Bool {
+        guard let url = URL(string: serverURL) else { return false }
+        let root: PlexServerRootWrapper? = try? await request(url, headers: plexHeaders(authToken: authToken))
+        return root?.MediaContainer.allowMediaDeletion == true
+    }
+
+    /// Deletes an item and its files from the server.
+    func deleteMetadata(serverURL: String, authToken: String, ratingKey: String) async throws {
+        guard let url = URL(string: "\(serverURL)/library/metadata/\(ratingKey)") else {
+            throw PlexAPIError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        for (key, value) in plexHeaders(authToken: authToken) {
+            request.addValue(value, forHTTPHeaderField: key)
+        }
+        let (_, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else { throw PlexAPIError.invalidResponse }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw PlexAPIError.httpError(statusCode: httpResponse.statusCode, data: nil)
+        }
+    }
+
+    /// Saves a search result next to the media. PMS answers at once and lists
+    /// the new stream (under a new id) about two seconds later.
+    func downloadSubtitle(
+        serverURL: String,
+        authToken: String,
+        ratingKey: String,
+        resultKey: String
+    ) async throws {
+        guard var components = URLComponents(string: "\(serverURL)/library/metadata/\(ratingKey)/subtitles") else {
+            throw PlexAPIError.invalidURL
+        }
+        components.queryItems = [URLQueryItem(name: "key", value: resultKey)]
+        guard let url = components.url else { throw PlexAPIError.invalidURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        for (key, value) in plexHeaders(authToken: authToken) {
+            request.addValue(value, forHTTPHeaderField: key)
+        }
+        let (_, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             throw PlexAPIError.invalidResponse
@@ -1286,64 +1416,6 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             }
             throw PlexAPIError.invalidResponse
         }
-    }
-
-    // MARK: - Playlists
-
-    /// Get audio playlists
-    func getPlaylists(serverURL: String, authToken: String, playlistType: String = "audio") async throws -> [PlexMetadata] {
-        guard var components = URLComponents(string: "\(serverURL)/playlists") else {
-            throw PlexAPIError.invalidURL
-        }
-
-        components.queryItems = [
-            URLQueryItem(name: "playlistType", value: playlistType),
-            URLQueryItem(name: "X-Plex-Token", value: authToken)
-        ]
-
-        guard let url = components.url else { throw PlexAPIError.invalidURL }
-
-        let data = try await requestData(url, method: "GET", headers: ["X-Plex-Token": authToken])
-        let container: PlexMediaContainerWrapper = try await Self.decodeDetached(data)
-        return container.MediaContainer.Metadata ?? []
-    }
-
-    /// Get items in a playlist
-    func getPlaylistItems(serverURL: String, authToken: String, ratingKey: String) async throws -> [PlexMetadata] {
-        guard var components = URLComponents(string: "\(serverURL)/playlists/\(ratingKey)/items") else {
-            throw PlexAPIError.invalidURL
-        }
-
-        components.queryItems = [
-            URLQueryItem(name: "X-Plex-Token", value: authToken)
-        ]
-
-        guard let url = components.url else { throw PlexAPIError.invalidURL }
-
-        let data = try await requestData(url, method: "GET", headers: ["X-Plex-Token": authToken])
-        let container: PlexMediaContainerWrapper = try await Self.decodeDetached(data)
-        return container.MediaContainer.Metadata ?? []
-    }
-
-    /// Create a new playlist
-    func createPlaylist(serverURL: String, authToken: String, title: String, type: String = "audio", ratingKeys: [String]) async throws {
-        guard var components = URLComponents(string: "\(serverURL)/playlists") else {
-            throw PlexAPIError.invalidURL
-        }
-
-        let uri = "server://\(PlexAPI.clientIdentifier)/com.plexapp.plugins.library/library/metadata/\(ratingKeys.joined(separator: ","))"
-
-        components.queryItems = [
-            URLQueryItem(name: "type", value: type),
-            URLQueryItem(name: "title", value: title),
-            URLQueryItem(name: "smart", value: "0"),
-            URLQueryItem(name: "uri", value: uri),
-            URLQueryItem(name: "X-Plex-Token", value: authToken)
-        ]
-
-        guard let url = components.url else { throw PlexAPIError.invalidURL }
-
-        _ = try await requestData(url, method: "POST", headers: ["X-Plex-Token": authToken])
     }
 
     // MARK: - Streaming URLs
@@ -1676,7 +1748,8 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         useDolbyVision: Bool = true,
         forceVideoTranscode: Bool = false,
         allowAudioDirectStream: Bool = true,
-        step: QualityStep? = nil
+        step: QualityStep? = nil,
+        clientRendersTextSubtitles: Bool = false
     ) -> (url: URL, headers: [String: String])? {
         // Request an HLS remux that keeps the HEVC/Dolby Vision bitstream intact
         // tvOS requires fMP4/CMAF segments for Dolby Vision profiles 5/8
@@ -1723,7 +1796,11 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             // IMPORTANT: exclude flac here so Plex transcodes audio to AAC/AC3/EAC3 for DV HLS
             // segmentContainer=mp4 forces CMAF/fMP4 segments instead of TS (required for DV on tvOS)
             "add-transcode-target(type=videoProfile&context=streaming&protocol=hls&container=mp4&segmentContainer=mp4&videoCodec=h264,hevc&audioCodec=aac,ac3,eac3&replace=true)",
-            "add-transcode-target(type=subtitleProfile&context=streaming&protocol=hls&container=webvtt&subtitleCodec=webvtt)",
+            // Text subtitles either ride the HLS as WebVTT or, when the client
+            // draws them, come from `transcodeSubtitlesURL` as one ASS document.
+            clientRendersTextSubtitles
+                ? "add-transcode-target(type=subtitleProfile&context=all&protocol=http&container=ass&subtitleCodec=ass&replace=true)"
+                : "add-transcode-target(type=subtitleProfile&context=streaming&protocol=hls&container=webvtt&subtitleCodec=webvtt)",
             "add-transcode-target(type=musicProfile&context=streaming&protocol=hls&container=mpegts&audioCodec=aac)",
 
             // Limitations - tells server about codec/format restrictions
@@ -1798,6 +1875,11 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             // Keyframe playlist improves seeking accuracy in HLS streams
             URLQueryItem(name: "includeKeyframePlaylist", value: "1")
         ]
+
+        if clientRendersTextSubtitles {
+            // Without it PMS burns styled ASS in; image formats still burn.
+            items.append(URLQueryItem(name: "advancedSubtitles", value: "text"))
+        }
 
         if let cap {
             // On relay this is the 480p rung stock Plex converts relay items to. Without
@@ -1905,13 +1987,36 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             request.addValue(value, forHTTPHeaderField: key)
         }
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await session.data(for: request)
             if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                 print("[Plex] Transcode decision returned HTTP \(status)")
             }
         } catch {
             print("[Plex] Decision request failed: \(error.localizedDescription)")
         }
+    }
+
+    /// The selected text subtitle of a `start.m3u8` transcode as one ASS document.
+    /// Same query, so PMS attaches it to the running session instead of starting one.
+    static func transcodeSubtitlesURL(forHLS url: URL) -> URL? {
+        let start = "start.m3u8"
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.percentEncodedPath.hasSuffix("/" + start) else { return nil }
+        components.percentEncodedPath = components.percentEncodedPath.dropLast(start.count) + "subtitles"
+        return components.url
+    }
+
+    /// For a response PMS keeps open for a whole playback and that can idle for
+    /// minutes while the transcode is throttled.
+    private lazy var openEndedSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 24 * 3600
+        configuration.timeoutIntervalForResource = 24 * 3600
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }()
+
+    func openEndedBytes(for request: URLRequest) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        try await openEndedSession.bytes(for: request)
     }
 
     /// Stop a Plex transcode session. Call this when stopping playback to free server resources
@@ -1929,7 +2034,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         }
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         } catch {
             // Best-effort — don't block on failure
@@ -2104,13 +2209,12 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         serverURL: String,
         authToken: String
     ) async throws -> [PlexLiveTVChannel] {
-        // The grid endpoint returns ALL channels with their info
-        return try await fetchChannelsFromGrid(serverURL: serverURL, authToken: authToken)
+        try await fetchDVRChannels(serverURL: serverURL, authToken: authToken)
     }
 
-    /// Fetch channels from grid endpoint using DVR lineup
-    /// The grid returns programs with channel info embedded in each program's Media array
-    private func fetchChannelsFromGrid(
+    /// Every DVR's channels, from its lineup. The grid carries the same fields
+    /// inside each programme's Media array and is the fallback.
+    private func fetchDVRChannels(
         serverURL: String,
         authToken: String
     ) async throws -> [PlexLiveTVChannel] {
@@ -2172,14 +2276,30 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             let channelVcn: String?  // Visual channel number
         }
 
-        // One grid request per DVR, fired together: each is a six-hour grid
-        // payload, and awaiting them one after another made cold guide load
-        // scale with the number of tuners.
+        // The lineup lists a DVR's channels in a few KB. The grid buries them in
+        // six hours of programmes, which a slow PMS takes 25s to produce (#338).
+        nonisolated struct LineupContainer: Codable {
+            let MediaContainer: LineupMediaContainer
+        }
+        nonisolated struct LineupMediaContainer: Codable {
+            let Channel: [LineupChannel]?
+        }
+        nonisolated struct LineupChannel: Codable {
+            let id: String?
+            let title: String?
+            let callSign: String?
+            let vcn: String?
+            let thumb: String?
+        }
+
+        // One request per DVR, fired together, so a cold load does not scale
+        // with the number of tuners.
         struct DVRGridRequest {
             let dvrKey: String
             let providerPath: String
             let tunerName: String?
             let url: URL
+            let lineupURL: URL
         }
         let requests: [DVRGridRequest] = dvrs.compactMap { dvr in
             guard let lineup = dvr.lineup, let dvrKey = dvr.key else { return nil }
@@ -2195,33 +2315,62 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
                 URLQueryItem(name: "beginsAt<=", value: "\(sixHoursLater)"),
                 URLQueryItem(name: "endsAt>=", value: "\(now)")
             ]
-            guard let url = components.url else { return nil }
+            guard let url = components.url,
+                  let lineupURL = URL(string: "\(serverURL)/\(providerPath)/lineups/dvr/channels") else { return nil }
             // Named only when there is something to tell apart. One tuner means
             // its tab would list exactly what All Channels already does, so the
             // grouping stays off and the bar is just Favorites + All Channels.
             let tunerName = dvrs.count > 1 ? dvr.guideGroupName : nil
-            return DVRGridRequest(dvrKey: dvrKey, providerPath: providerPath, tunerName: tunerName, url: url)
+            return DVRGridRequest(dvrKey: dvrKey, providerPath: providerPath, tunerName: tunerName,
+                                  url: url, lineupURL: lineupURL)
         }
-        let containers: [GridContainer?] = await fetchConcurrently(
-            requests.map(\.url),
-            headers: plexHeaders(authToken: authToken)
+        let headers = plexHeaders(authToken: authToken)
+        let lineups: [LineupContainer?] = await fetchConcurrently(
+            requests.map(\.lineupURL),
+            headers: headers
         ).map { try? $0.get() }
+        var listings: [[GridMedia]?] = lineups.map { lineup in
+            guard let lineupChannels = lineup?.MediaContainer.Channel, !lineupChannels.isEmpty else { return nil }
+            return lineupChannels.map { channel in
+                GridMedia(
+                    channelCallSign: channel.callSign,
+                    channelIdentifier: channel.id,
+                    channelThumb: channel.thumb,
+                    // The grid's channelTitle is "<number> <name>". Same form
+                    // here, so displayName strips the same thing from either.
+                    channelTitle: channel.title.map { [channel.vcn, $0].compactMap { $0 }.joined(separator: " ") },
+                    channelVcn: channel.vcn
+                )
+            }
+        }
 
-        // Extract unique channels from all programs' Media arrays, across every
-        // DVR. Dedupe is by channel identifier and FIRST WINS: a channel two
-        // tuners both carry is attributed to whichever DVR the server listed
+        // The grid, for any DVR whose lineup gave nothing.
+        let missing = listings.indices.filter { listings[$0] == nil }
+        if !missing.isEmpty {
+            let grids: [GridContainer?] = await fetchConcurrently(
+                missing.map { requests[$0].url },
+                headers: headers,
+                timeout: Self.guideTimeout
+            ).map { try? $0.get() }
+            for (index, grid) in zip(missing, grids) {
+                listings[index] = grid.map { ($0.MediaContainer.Metadata ?? []).flatMap { $0.Media ?? [] } }
+            }
+        }
+
+        // Unique channels across every DVR. Dedupe is by channel identifier and
+        // FIRST WINS: a channel two tuners both carry is attributed to whichever DVR the server listed
         // first, rather than appearing twice under two groups. Results come
         // back in DVR order, so the concurrency does not change who wins.
         var seenChannels = Set<String>()
         var channels: [PlexLiveTVChannel] = []
 
-        for (request, container) in zip(requests, containers) {
+        for (request, listing) in zip(requests, listings) {
             // One unreachable DVR must not cost the user every other tuner's
             // channels, so a failure is logged and skipped rather than thrown.
             // Only a total wipeout surfaces, as an empty list.
-            guard let container else {
+            guard let listing else {
                 let breadcrumb = Breadcrumb(level: .warning, category: "plex_livetv")
-                breadcrumb.message = "Grid fetch failed for one DVR; continuing with the rest"
+                breadcrumb.message = "Channel fetch failed for one DVR; continuing with the rest"
                 breadcrumb.data = [
                     "dvr_key": request.dvrKey,
                     "tuner_name": request.tunerName ?? "unnamed",
@@ -2232,51 +2381,49 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
                 continue
             }
 
-            for program in container.MediaContainer.Metadata ?? [] {
-                for media in program.Media ?? [] {
-                    guard let channelId = media.channelIdentifier,
-                          !seenChannels.contains(channelId) else {
-                        continue
-                    }
-
-                    seenChannels.insert(channelId)
-
-                    let channelTitle = media.channelTitle ?? "Channel \(channelId)"
-                    let channelNumber = media.channelVcn ?? channelId
-
-                    let channel = PlexLiveTVChannel(
-                        ratingKey: channelId,
-                        // Use the DVR's ACTUAL EPG provider (extracted from its
-                        // lineup, e.g. tv.plex.providers.epg.cloud:157). The
-                        // provider was previously hardcoded as epg.xmltv, which
-                        // 400s the transcode start on DVRs using Plex's cloud EPG
-                        // — the tune path pointed at a provider that doesn't exist
-                        // on the server. The DVR key rides inside this path, which
-                        // is how the tune finds the right DVR for the channel.
-                        key: "/\(request.providerPath)/metadata/\(channelId)",
-                        guid: nil,
-                        type: "channel",
-                        title: channelTitle,
-                        summary: nil,
-                        thumb: media.channelThumb,
-                        art: nil,
-                        year: nil,
-                        channelCallSign: media.channelCallSign,
-                        channelIdentifier: channelId,
-                        channelShortTitle: nil,
-                        channelThumb: media.channelThumb,
-                        channelTitle: channelTitle,
-                        channelNumber: channelNumber,
-                        // No direct tuner handoff — all Plex Live TV plays through
-                        // the server (tune → /livetv/sessions).
-                        streamURL: nil,
-                        // Groups the guide by tuner. Assigned here because this is
-                        // the only point that knows which DVR served the lineup.
-                        tunerName: request.tunerName
-                    )
-
-                    channels.append(channel)
+            for media in listing {
+                guard let channelId = media.channelIdentifier,
+                      !seenChannels.contains(channelId) else {
+                    continue
                 }
+
+                seenChannels.insert(channelId)
+
+                let channelTitle = media.channelTitle ?? "Channel \(channelId)"
+                let channelNumber = media.channelVcn ?? channelId
+
+                let channel = PlexLiveTVChannel(
+                    ratingKey: channelId,
+                    // Use the DVR's ACTUAL EPG provider (extracted from its
+                    // lineup, e.g. tv.plex.providers.epg.cloud:157). The
+                    // provider was previously hardcoded as epg.xmltv, which
+                    // 400s the transcode start on DVRs using Plex's cloud EPG
+                    // — the tune path pointed at a provider that doesn't exist
+                    // on the server. The DVR key rides inside this path, which
+                    // is how the tune finds the right DVR for the channel.
+                    key: "/\(request.providerPath)/metadata/\(channelId)",
+                    guid: nil,
+                    type: "channel",
+                    title: channelTitle,
+                    summary: nil,
+                    thumb: media.channelThumb,
+                    art: nil,
+                    year: nil,
+                    channelCallSign: media.channelCallSign,
+                    channelIdentifier: channelId,
+                    channelShortTitle: nil,
+                    channelThumb: media.channelThumb,
+                    channelTitle: channelTitle,
+                    channelNumber: channelNumber,
+                    // No direct tuner handoff — all Plex Live TV plays through
+                    // the server (tune → /livetv/sessions).
+                    streamURL: nil,
+                    // Groups the guide by tuner. Assigned here because this is
+                    // the only point that knows which DVR served the lineup.
+                    tunerName: request.tunerName
+                )
+
+                channels.append(channel)
             }
         }
 
@@ -2298,13 +2445,14 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
     /// read as a cancellation, which the guide and Sentry both drop.
     private func fetchConcurrently<T: Decodable & Sendable>(
         _ urls: [URL],
-        headers: [String: String]
+        headers: [String: String],
+        timeout: TimeInterval? = nil
     ) async -> [Result<T, Error>] {
         await withTaskGroup(of: (Int, Result<T, Error>).self) { group in
             for (index, url) in urls.enumerated() {
                 group.addTask {
                     do {
-                        let value: T = try await self.request(url, headers: headers)
+                        let value: T = try await self.request(url, headers: headers, timeout: timeout)
                         return (index, .success(value))
                     } catch {
                         return (index, .failure(error))
@@ -2604,7 +2752,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw PlexAPIError.invalidResponse
         }
@@ -2750,7 +2898,8 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
         let results: [Result<GridEPGContainer, Error>] = await fetchConcurrently(
             gridURLs,
-            headers: plexHeaders(authToken: authToken)
+            headers: plexHeaders(authToken: authToken),
+            timeout: Self.guideTimeout
         )
         let containers = results.compactMap { try? $0.get() }
         // Every DVR failing is a failure; some failing is a partial guide.
@@ -2980,7 +3129,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
     /// Get the access token for a specific server URL using the user's auth token
     /// This is used after switching users to get a server-specific access token
-    func getServerAccessToken(authToken: String, serverURL: String) async -> String? {
+    func getServerAccessToken(authToken: String, serverURL: String, serverName: String? = nil) async -> String? {
         do {
             let servers = try await getServers(authToken: authToken)
 
@@ -3046,6 +3195,18 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
                 }
             }
 
+            // A raw-address fallback URL matches no advertised uri: match address and port,
+            // only when one server has them (two LANs can share a private address)
+            // and it carries the selected server's name.
+            if let url = URL(string: serverURL), let host = url.host {
+                let matches = servers.filter { server in
+                    (server.connections ?? []).contains { $0.address == host && $0.port == url.port }
+                }
+                if matches.count == 1, matches[0].name == serverName, let accessToken = matches[0].accessToken {
+                    return accessToken
+                }
+            }
+
             // No per-server token found. Returning the input plex.tv-level
             // authToken here was the previous behavior, but for accounts
             // that have multiple servers in their resources list (server
@@ -3093,26 +3254,24 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             throw PlexAPIError.invalidResponse
         }
 
-        // Log response for debugging
+        return try Self.homeUserToken(status: httpResponse.statusCode, data: data)
+    }
 
-        // 200/201 = success, 401 = invalid PIN, 403 = PIN required
-        switch httpResponse.statusCode {
+    /// Reads a /switch response: the profile's token, nil when the PIN was refused
+    /// (401) or missing (403). A success without a token throws: the caller's own
+    /// token must never stand in for the profile's.
+    nonisolated static func homeUserToken(status: Int, data: Data) throws -> String? {
+        switch status {
         case 200, 201:
-            // Parse the user's auth token from response
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let userToken = json["authToken"] as? String {
-                return userToken
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let userToken = json["authToken"] as? String else {
+                throw PlexAPIError.parsingError
             }
-            return authToken // Fall back to original token
-        case 401:
-            print("🌐 PlexNetwork: ❌ Invalid PIN")
-            return nil
-        case 403:
-            print("🌐 PlexNetwork: ❌ PIN required but not provided")
+            return userToken
+        case 401, 403:
             return nil
         default:
-            print("🌐 PlexNetwork: ❌ User switch failed with status \(httpResponse.statusCode)")
-            throw PlexAPIError.httpError(statusCode: httpResponse.statusCode, data: data)
+            throw PlexAPIError.httpError(statusCode: status, data: data)
         }
     }
 }
@@ -3126,31 +3285,7 @@ extension PlexNetworkManager: URLSessionDelegate {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        let host = challenge.protectionSpace.host
-        let port = challenge.protectionSpace.port
-
-        // Trust self-signed certificates for:
-        // - IP addresses (local Plex servers)
-        // - plex.direct domains
-        // - Port 32400 (default Plex port)
-        let isIPAddress = host.range(of: #"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"#, options: .regularExpression) != nil
-        let isPlexDirect = host.hasSuffix(".plex.direct")
-        let isPlexPort = port == 32400
-
-        if isIPAddress || isPlexDirect || isPlexPort {
-            // Trust the self-signed certificate
-            let credential = URLCredential(trust: serverTrust)
-            completionHandler(.useCredential, credential)
-        } else {
-            // Use default handling for other hosts (like plex.tv)
-            completionHandler(.performDefaultHandling, nil)
-        }
+        PlexCertificateDelegate.answer(challenge, completionHandler: completionHandler)
     }
 }
 

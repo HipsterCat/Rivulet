@@ -14,6 +14,10 @@ struct ShellSidebarItem: Hashable {
     let title: String
     /// SF Symbol name.
     let icon: String
+    /// The profile row's picture; the symbol stays where there is none.
+    var avatarURL: URL?
+    /// The profile row only: Select opens the profile switcher.
+    var canSwitchProfile = false
 }
 
 /// A group of rows. `title` renders as a small section header; nil means the
@@ -40,26 +44,43 @@ enum ShellSidebarModel {
         liveTVAbove: Bool,
         serverName: String?,
         profileName: String,
+        profileAvatar: URL? = nil,
+        canSwitchProfile: Bool = false,
         jellyfinServerName: String? = nil,
-        jellyfinLibraries: [MediaLibrary] = []
+        jellyfinLibraries: [MediaLibrary] = [],
+        hasMediaServer: Bool = true
     ) -> [ShellSidebarSection] {
         var sections: [ShellSidebarSection] = []
 
-        var top: [ShellSidebarItem] = [
-            ShellSidebarItem(tab: .account, title: profileName, icon: "person.crop.circle.fill"),
-            ShellSidebarItem(tab: .search, title: "Search", icon: "magnifyingglass"),
-            ShellSidebarItem(tab: .home, title: "Home", icon: "house.fill"),
-        ]
+        // The profile is a header in a section of its own, above the tabs.
+        sections.append(ShellSidebarSection(title: nil, items: [
+            ShellSidebarItem(tab: .account, title: firstName(of: profileName),
+                             icon: "person.crop.circle.fill", avatarURL: profileAvatar,
+                             canSwitchProfile: canSwitchProfile),
+        ]))
+
+        // Search, Discover and the watchlist need a media server. Without one,
+        // Home is only the welcome screen, kept while there is no Live TV instead.
+        let showDiscover = showDiscover && hasMediaServer
+        var top: [ShellSidebarItem] = []
+        if hasMediaServer {
+            top.append(ShellSidebarItem(tab: .search, title: "Search", icon: "magnifyingglass"))
+        }
+        if !opensToLiveTV(hasMediaServer: hasMediaServer, liveTVSources: liveTVSources) {
+            top.append(ShellSidebarItem(tab: .home, title: "Home", icon: "house.fill"))
+        }
         let discover = ShellSidebarItem(tab: .discover, title: "Discover", icon: "sparkles")
         if showDiscover && discoverAbove {
             top.append(discover)
         }
         // The watchlist is account-level, not a library, so it sits with the
         // other whole-app destinations rather than in the server section.
-        if showWatchlist {
+        if showWatchlist && hasMediaServer {
             top.append(ShellSidebarItem(tab: .watchlist, title: "Watchlist", icon: "bookmark.fill"))
         }
-        sections.append(ShellSidebarSection(title: nil, items: top))
+        if !top.isEmpty {
+            sections.append(ShellSidebarSection(title: nil, items: top))
+        }
 
         let librarySection = ShellSidebarSection(
             title: serverName ?? "Library",
@@ -92,6 +113,16 @@ enum ShellSidebarModel {
             title: nil,
             items: [ShellSidebarItem(tab: .settings, title: "Settings", icon: "gearshape.fill")]))
         return sections
+    }
+
+    /// Live TV with no media server: the app opens on Live TV and Home is hidden.
+    static func opensToLiveTV(hasMediaServer: Bool, liveTVSources: [LiveTVDataStore.LiveTVSourceInfo]) -> Bool {
+        !hasMediaServer && !liveTVSources.isEmpty
+    }
+
+    /// The first word of a display name; a one-word name or handle is whole.
+    static func firstName(of displayName: String) -> String {
+        displayName.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? displayName
     }
 
     static func icon(forLibraryType type: String) -> String {

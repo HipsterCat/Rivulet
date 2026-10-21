@@ -10,6 +10,7 @@
 
 import Foundation
 import Combine
+import CryptoKit
 import UIKit
 
 @MainActor
@@ -22,21 +23,29 @@ class LiveTVDataStore: ObservableObject {
     @Published var channels: [UnifiedChannel] = []
 
     /// Current EPG data (channelId -> programs)
-    @Published var epg: [String: [UnifiedProgram]] = [:]
+    @Published var epg: [String: [UnifiedProgram]] = [:] {
+        didSet { rememberEventSlots() }
+    }
 
-    /// End of the currently loaded EPG window. The guide extends past this as
-    /// the user scrolls toward the right edge (see `extendEPG`). nil until the
-    /// first `loadEPG` completes.
+    /// Channels whose guide has carried an event slot (a pregame block or "No
+    /// game scheduled"), so a guide gap on one means no game is on. Kept
+    /// because midweek the loaded window holds no such block.
+    private(set) var eventSlotIds: Set<String> = []
+
+    /// End of the currently loaded EPG window. `fillGuide` moves it out to
+    /// `epgMaxHoursAhead` after each `loadEPG`. nil until the first load completes.
     @Published private(set) var epgLoadedThrough: Date?
 
-    /// True while an incremental `extendEPG` fetch is in flight; the guide's
-    /// scroll-edge trigger checks this so it never stacks concurrent extensions.
-    @Published private(set) var isExtendingEPG = false
-
-    /// Safety ceiling for lazy extension: never fetch EPG more than this far
-    /// past "now". Most providers cap their grid well inside this anyway; the
-    /// bound just stops an endless right-scroll from firing pointless fetches.
-    private let epgMaxHoursAhead = 72
+    /// How far ahead the guide fills. Plex serves 8 days; providers with less
+    /// just return nothing past their end.
+    static let epgMaxHoursAhead = 192
+    /// Hours per background fill request.
+    private static let fillChunkHours = 12
+    private var fillTask: Task<Void, Never>?
+    private var keepFreshTask: Task<Void, Never>?
+    /// Last full `loadEPG`. Past 6 hours a refresh reloads every day, not
+    /// just the next hours, so far-off schedule changes show up too.
+    private var lastFullEPGLoad: Date?
 
     /// Channels played lately, newest first: What's On's Recently Watched row.
     @Published private(set) var recentChannelIds: [String] = []
@@ -79,9 +88,19 @@ class LiveTVDataStore: ObservableObject {
 
     // MARK: - Private Properties
 
-    private var providers: [String: any LiveTVProvider] = [:]
-    private var channelLoadTask: Task<Void, Never>?
-    private var epgLoadTask: Task<Void, Never>?
+    private var providers: [String: any LiveTVProvider] = [:] {
+        didSet { providersGeneration += 1 }
+    }
+    /// Bumped when the source set changes. A load started for an older set is
+    /// cancelled; one for the current set is waited on (see `loadChannels`).
+    private var providersGeneration = 0
+    /// Server and token the Plex source was confirmed under; nil while there is none.
+    private var plexSourceKey: String?
+    private var plexSync: Task<Void, Never>?
+    /// IPTV sources kept from a restricted profile; still saved, back on an unrestricted one.
+    private var withheldIPTVProviders: [String: any LiveTVProvider] = [:]
+    private var channelLoad: (task: Task<Void, Never>, generation: Int)?
+    private var epgLoad: (task: Task<Void, Never>, generation: Int, channelCount: Int, window: DateInterval)?
     private var backgroundPreloadTask: Task<Void, Never>?
 
     // MARK: - Freshness tracking
@@ -100,8 +119,7 @@ class LiveTVDataStore: ObservableObject {
     nonisolated static let defaultMaxAge: TimeInterval = 30 * 60
 
     /// EPG window a staleness refresh fetches. Matches the guide's own
-    /// initial window (EPGTheme.initialGuideHours); the guide extends from
-    /// there as the user scrolls right.
+    /// initial window (EPGTheme.initialGuideHours); `fillGuide` does the rest.
     static let refreshWindowHours = 6
 
     /// Guards `refreshIfStale` so several surfaces appearing at once (the tab
@@ -112,18 +130,20 @@ class LiveTVDataStore: ObservableObject {
     private let favoritesKey = "liveTVFavoriteChannelIds"
     private let unfavoritedKey = "liveTVUnfavoritedChannelIds"
     private let recentsKey = "liveTVRecentChannelIds"
+    private let eventSlotsKey = "liveTVEventSlotChannelIds"
     private let viewingsKey = "liveTVViewings"
     private let sourcesKey = "liveTVSourceConfigurations"
 
     // MARK: - Source Configuration (Persistable)
 
     struct SourceConfiguration: Codable {
-        let id: String
-        let type: String  // "dispatcharr", "m3u", "plex"
+        var id: String
+        let type: String  // "dispatcharr", "m3u", "xtream", "plex"
         let name: String
         let baseURL: String?
-        let m3uURL: String?
-        let epgURL: String?
+        /// Kept in the Keychain (`playlistURLKey`); here only if the Keychain refused it.
+        var m3uURL: String?
+        var epgURL: String?
         var apiToken: String?
 
         /// Dispatcharr channel profile, nil for every channel. Optional so that
@@ -131,9 +151,12 @@ class LiveTVDataStore: ObservableObject {
         /// a missing key leaves it nil, which is the previous all-channels
         /// behavior.
         var channelProfile: String?
+        /// Xtream Codes account name. Its password is in the Keychain (`apiTokenKey`).
+        var username: String?
 
         init(id: String, type: String, name: String, baseURL: String?, m3uURL: String?,
-             epgURL: String?, apiToken: String?, channelProfile: String? = nil) {
+             epgURL: String?, apiToken: String?, channelProfile: String? = nil, username: String? = nil) {
+            self.username = username
             self.id = id
             self.type = type
             self.name = name
@@ -183,12 +206,15 @@ class LiveTVDataStore: ObservableObject {
     // MARK: - Initialization
 
     private init() {
+        secureSavedM3USources()
         loadFavorites()
         recentChannelIds = userDefaults.stringArray(forKey: recentsKey) ?? []
+        eventSlotIds = Set(userDefaults.stringArray(forKey: eventSlotsKey) ?? [])
         viewings = userDefaults.data(forKey: viewingsKey)
             .flatMap { try? JSONDecoder().decode([LiveViewing].self, from: $0) } ?? []
         loadSavedSources()
         observeAppLifecycle()
+        plexContentTokenChanged()
     }
 
     // MARK: - Freshness / refresh
@@ -221,7 +247,7 @@ class LiveTVDataStore: ObservableObject {
     ///
     /// Concurrent callers share one refresh: the tab's `.task` and the
     /// foreground notification routinely fire together, and two overlapping
-    /// EPG fetches would cancel each other through `epgLoadTask` and leave
+    /// EPG fetches would cancel each other through `epgLoad` and leave
     /// the grid empty — the very failure this is meant to fix.
     func refreshIfStale(maxAge: TimeInterval = defaultMaxAge) async {
         guard !providers.isEmpty else { return }
@@ -235,13 +261,47 @@ class LiveTVDataStore: ObservableObject {
             guard let self else { return }
             // Channels first: the EPG fetch is keyed by the channel list, so
             // a source whose line-up changed needs the new list in hand.
+            let count = self.channels.count
             await self.loadChannels()
             guard !self.channels.isEmpty else { return }
-            await self.loadEPG(startDate: Date(), hours: Self.refreshWindowHours)
+            let now = Date()
+            let near = now.addingTimeInterval(Double(Self.refreshWindowHours) * 3600)
+            if self.epg.isEmpty || self.channels.count != count || (self.epgLoadedThrough ?? now) <= near
+                || now.timeIntervalSince(self.lastFullEPGLoad ?? .distantPast) > 6 * 3600 {
+                await self.loadEPG(startDate: now, hours: Self.refreshWindowHours)
+            } else if await self.mergeEPG(from: now, to: near) {
+                // The far days stay; only the next hours are re-read for changes.
+                self.lastEPGLoad = Date()
+            }
         }
         staleRefreshTask = task
         await task.value
         staleRefreshTask = nil
+    }
+
+    /// Re-checks the guide every 10 minutes while the app is open, so a guide
+    /// left on screen (or behind the player) keeps moving forward.
+    private func keepGuideFresh() {
+        guard keepFreshTask == nil else { return }
+        keepFreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.defaultMaxAge / 3))
+                await self?.refreshIfStale()
+                self?.fillGuide()
+            }
+        }
+    }
+
+    /// Pulls the rest of the guide in half-day requests after the first
+    /// window paints. Stops at the ceiling or on a failure; the next refresh
+    /// starts it again.
+    private func fillGuide() {
+        guard fillTask == nil, !epg.isEmpty else { return }
+        fillTask = Task { [weak self] in
+            while !Task.isCancelled, await self?.extendEPG() == true {}
+            // A cancelled fill was already replaced by `loadEPG`.
+            if !Task.isCancelled { self?.fillTask = nil }
+        }
     }
 
     /// Refresh the guide when the app returns to the foreground. tvOS suspends
@@ -252,6 +312,8 @@ class LiveTVDataStore: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
+                // A server that was down at launch gets its DVR found now.
+                self?.plexContentTokenChanged()
                 await self?.refreshIfStale()
             }
         }
@@ -277,7 +339,7 @@ class LiveTVDataStore: ObservableObject {
 
     /// Add a generic M3U source
     func addM3USource(m3uURL: URL, epgURL: URL?, name: String) async {
-        let sourceId = "m3u:\(m3uURL.absoluteString)"
+        let sourceId = Self.m3uSourceId(for: m3uURL)
         let provider = IPTVProvider(
             m3uURL: m3uURL,
             epgURL: epgURL,
@@ -289,6 +351,20 @@ class LiveTVDataStore: ObservableObject {
         await updateSourceInfo()
     }
 
+    /// Add an Xtream Codes source. Re-adding the same login replaces it.
+    func addXtreamSource(account: XtreamAccount, name: String) async {
+        let sourceId = Self.xtreamSourceId(for: account)
+        providers[sourceId] = IPTVProvider(xtream: account, sourceId: sourceId, displayName: name)
+        saveSources()
+        await updateSourceInfo()
+    }
+
+    /// From a hash of the server and username, so neither ends up in channel ids.
+    static func xtreamSourceId(for account: XtreamAccount) -> String {
+        let key = account.server.absoluteString.lowercased() + "\n" + account.username
+        return "xtream:" + SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
     #if DEBUG
     /// DEBUG launch hooks: a source for this run only, never saved.
     func debugAddTransientSource(_ provider: any LiveTVProvider) {
@@ -296,25 +372,47 @@ class LiveTVDataStore: ObservableObject {
     }
     #endif
 
-    /// Add a Plex Live TV source
-    func addPlexSource(provider: any LiveTVProvider) async {
-        providers[provider.sourceId] = provider
-        saveSources()
-        await updateSourceInfo()
+    /// Whether a source with this id is in use.
+    func hasSource(id: String) -> Bool { providers[id] != nil }
+
+    /// Installs the source that follows a signed-in server (Plex DVR, Jellyfin
+    /// Live TV) in place of any of `type`, or just removes them. Never saved.
+    func setServerSource(_ provider: (any LiveTVProvider)?, of type: LiveTVSourceType) {
+        let stale = Set(providers.filter { $0.value.sourceType == type }.keys)
+        guard provider != nil || !stale.isEmpty else { return }
+        dropSources(stale)
+        if let provider { providers[provider.sourceId] = provider }
+        reloadSources()
     }
 
     /// Remove a source by ID
     func removeSource(id: String) async {
-        providers.removeValue(forKey: id)
+        withheldIPTVProviders.removeValue(forKey: id)
         KeychainHelper.delete(Self.apiTokenKey(sourceId: id))
+        KeychainHelper.delete(Self.playlistURLKey(sourceId: id))
+        KeychainHelper.delete(Self.guideURLKey(sourceId: id))
+        dropSources([id])
         saveSources()
         await updateSourceInfo()
+    }
 
+    /// Takes these sources' providers, channels and guide out of use.
+    private func dropSources(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        for id in ids { providers.removeValue(forKey: id) }
         // Collected before the channels go, or there is nothing left to purge.
-        let removed = Set(channels.lazy.filter { $0.sourceId == id }.map(\.id))
-        channels.removeAll { $0.sourceId == id }
+        let removed = Set(channels.lazy.filter { ids.contains($0.sourceId) }.map(\.id))
+        channels.removeAll { ids.contains($0.sourceId) }
         for channelId in removed {
             epg.removeValue(forKey: channelId)
+        }
+    }
+
+    private func reloadSources() {
+        listSources()
+        Task {
+            await loadChannels()
+            await loadEPG()
         }
     }
 
@@ -346,8 +444,10 @@ class LiveTVDataStore: ObservableObject {
                 }
 
             case "m3u":
-                if let m3uString = config.m3uURL, let m3uURL = URL(string: m3uString) {
-                    let epgURL = config.epgURL.flatMap { URL(string: $0) }
+                if let m3uString = KeychainHelper.get(Self.playlistURLKey(sourceId: config.id)) ?? config.m3uURL,
+                   let m3uURL = URL(string: m3uString) {
+                    let epgURL = (KeychainHelper.get(Self.guideURLKey(sourceId: config.id)) ?? config.epgURL)
+                        .flatMap { URL(string: $0) }
                     let provider = IPTVProvider(
                         m3uURL: m3uURL,
                         epgURL: epgURL,
@@ -357,29 +457,46 @@ class LiveTVDataStore: ObservableObject {
                     providers[config.id] = provider
                 }
 
-            case "plex":
-                // Restore Plex source using PlexAuthManager's saved credentials
-                if let serverURL = config.baseURL {
-                    let authManager = PlexAuthManager.shared
-                    if let authToken = authManager.selectedServerToken {
-                        let serverName = authManager.savedServerName ?? "Plex"
-                        let provider = PlexLiveTVProvider(
-                            serverURL: serverURL,
-                            authToken: authToken,
-                            serverName: serverName
-                        )
-                        providers[config.id] = provider
-                    } else {
-                    }
+            case "xtream":
+                if let server = config.baseURL.flatMap(URL.init(string:)), let username = config.username,
+                   let password = KeychainHelper.get(Self.apiTokenKey(sourceId: config.id)) ?? config.apiToken {
+                    providers[config.id] = IPTVProvider(
+                        xtream: XtreamAccount(server: server, username: username, password: password),
+                        sourceId: config.id, displayName: config.name)
                 }
 
             default:
+                // "plex" is saved by builds that added Plex by hand; the
+                // source now follows the server (`plexContentTokenChanged`).
                 break
             }
         }
 
-        // Listed now, so the sidebar's Live TV tab exists from launch; the
-        // connection probe below can take tens of seconds.
+        applyProfileRestrictions()
+        listSources()
+        if configs.contains(where: { $0.type == "plex" }) { saveSources() }
+    }
+
+    /// Moves IPTV sources out of a restricted profile's reach, and back. True when that changed anything.
+    @discardableResult
+    private func applyProfileRestrictions() -> Bool {
+        if PlexUserProfileManager.shared.isRestrictedProfile {
+            // Jellyfin's source leaves with the Jellyfin server, which such a profile does not see.
+            let iptv = providers.filter { !$0.value.sourceType.followsServer }
+            guard !iptv.isEmpty else { return false }
+            withheldIPTVProviders.merge(iptv) { _, new in new }
+            dropSources(Set(iptv.keys))
+            return true
+        }
+        guard !withheldIPTVProviders.isEmpty else { return false }
+        providers.merge(withheldIPTVProviders) { current, _ in current }
+        withheldIPTVProviders = [:]
+        return true
+    }
+
+    /// Lists the sources now, so the sidebar's Live TV tab exists at once; the
+    /// connection probe behind `updateSourceInfo` can take tens of seconds.
+    private func listSources() {
         sources = providers.map { id, provider in
             LiveTVSourceInfo(id: id, sourceType: provider.sourceType, displayName: provider.displayName,
                              channelCount: 0, isConnected: false, lastSync: nil,
@@ -392,11 +509,50 @@ class LiveTVDataStore: ObservableObject {
         }
     }
 
+    /// The Plex content token changed (sign-in, sign-out, server or profile
+    /// switch): the server's DVR, when `/livetv/dvrs` lists one, is the Plex
+    /// source, found again under the new token. IPTV sources hold no Plex
+    /// token and only move for a restricted profile.
+    func plexContentTokenChanged() {
+        let restrictionsChanged = applyProfileRestrictions()
+        let auth = PlexAuthManager.shared
+        let key = Self.plexSourceKey(serverURL: auth.selectedServerURL, token: auth.selectedServerToken)
+        if key != nil, key == plexSourceKey {
+            if restrictionsChanged { reloadSources() }
+            return
+        }
+        plexSync?.cancel()
+        plexSourceKey = nil
+        let stale = Set(providers.filter { $0.value.sourceType == .plex }.keys)
+        dropSources(stale)
+        guard let key, let serverURL = auth.selectedServerURL, let token = auth.selectedServerToken else {
+            if restrictionsChanged || !stale.isEmpty { reloadSources() }
+            return
+        }
+        let name = auth.savedServerName ?? "Plex"
+        plexSync = Task { [weak self] in
+            let hasDVR = await PlexLiveTVProvider.checkAvailability(serverURL: serverURL, authToken: token)
+            guard let self, !Task.isCancelled else { return }
+            if hasDVR {
+                let provider = PlexLiveTVProvider(serverURL: serverURL, authToken: token, serverName: name)
+                plexSourceKey = key
+                providers[provider.sourceId] = provider
+            }
+            if hasDVR || restrictionsChanged || !stale.isEmpty { reloadSources() }
+        }
+    }
+
+    /// What the Plex source is confirmed under; nil without a content token.
+    nonisolated static func plexSourceKey(serverURL: String?, token: String?) -> String? {
+        guard let serverURL, let token else { return nil }
+        return serverURL + "\n" + token
+    }
+
     /// Save current source configurations to UserDefaults
     private func saveSources() {
         var configs: [SourceConfiguration] = []
 
-        for (id, provider) in providers {
+        for (id, provider) in providers.merging(withheldIPTVProviders, uniquingKeysWith: { current, _ in current }) {
             switch provider.sourceType {
             case .dispatcharr:
                 if let iptvProvider = provider as? IPTVProvider {
@@ -419,24 +575,30 @@ class LiveTVDataStore: ObservableObject {
                         type: "m3u",
                         name: provider.displayName,
                         baseURL: nil,
-                        m3uURL: iptvProvider.m3uURL?.absoluteString,
-                        epgURL: iptvProvider.epgURL?.absoluteString,
+                        m3uURL: Self.storeSecret(iptvProvider.m3uURL?.absoluteString,
+                                                 key: Self.playlistURLKey(sourceId: id)),
+                        epgURL: Self.storeSecret(iptvProvider.epgURL?.absoluteString,
+                                                 key: Self.guideURLKey(sourceId: id)),
                         apiToken: nil
                     ))
                 }
 
-            case .plex:
-                if let plexProvider = provider as? PlexLiveTVProvider {
+            case .xtream:
+                if let iptvProvider = provider as? IPTVProvider, let account = iptvProvider.xtreamAccount {
                     configs.append(SourceConfiguration(
                         id: id,
-                        type: "plex",
+                        type: "xtream",
                         name: provider.displayName,
-                        baseURL: plexProvider.serverURL,
+                        baseURL: account.server.absoluteString,
                         m3uURL: nil,
                         epgURL: nil,
-                        apiToken: nil
+                        apiToken: Self.storeAPIToken(account.password, sourceId: id),
+                        username: account.username
                     ))
                 }
+
+            case .plex, .jellyfin:
+                break  // Follows its server; not saved.
             }
         }
 
@@ -451,12 +613,79 @@ class LiveTVDataStore: ObservableObject {
     /// Puts `token` in the Keychain. Returns what the saved config must still
     /// hold: nil, unless the Keychain refused it and the key would be lost.
     private static func storeAPIToken(_ token: String?, sourceId: String) -> String? {
-        let key = apiTokenKey(sourceId: sourceId)
-        guard let token, !token.isEmpty else {
+        storeSecret(token, key: apiTokenKey(sourceId: sourceId))
+    }
+
+    /// Puts `value` in the Keychain. Returns what the saved config must still
+    /// hold: nil, unless the Keychain refused it and the value would be lost.
+    private static func storeSecret(_ value: String?, key: String) -> String? {
+        guard let value, !value.isEmpty else {
             KeychainHelper.delete(key)
             return nil
         }
-        return KeychainHelper.set(token, forKey: key) ? nil : token
+        return KeychainHelper.set(value, forKey: key) ? nil : value
+    }
+
+    /// Keychain accounts for an M3U source's playlist and guide URLs, which
+    /// often embed the provider's username and password.
+    static func playlistURLKey(sourceId: String) -> String { "liveTVSourceM3U_\(sourceId)" }
+    static func guideURLKey(sourceId: String) -> String { "liveTVSourceEPG_\(sourceId)" }
+
+    /// An M3U source's id, from a hash of its playlist URL so the URL never
+    /// becomes part of the channel ids saved in favorites and recents.
+    static func m3uSourceId(for url: URL) -> String {
+        "m3u:" + SHA256.hash(data: Data(url.absoluteString.utf8)).prefix(8)
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func secureSavedM3USources() {
+        guard let data = userDefaults.data(forKey: sourcesKey),
+              var configs = try? JSONDecoder().decode([SourceConfiguration].self, from: data),
+              Self.secureM3USources(&configs, defaults: userDefaults,
+                                    channelListKeys: [favoritesKey, unfavoritedKey, recentsKey, eventSlotsKey],
+                                    viewingsKey: viewingsKey),
+              let encoded = try? JSONEncoder().encode(configs) else { return }
+        userDefaults.set(encoded, forKey: sourcesKey)
+    }
+
+    /// Older builds keyed an M3U source by its full playlist URL and saved both
+    /// URLs in plain text. Re-keys such a source (renaming its channels in
+    /// every saved list, so favorites survive) and moves the URLs into the
+    /// Keychain. True when `configs` changed and must be written back.
+    static func secureM3USources(_ configs: inout [SourceConfiguration], defaults: UserDefaults,
+                                 channelListKeys: [String], viewingsKey: String) -> Bool {
+        var changed = false
+        for index in configs.indices where configs[index].type == "m3u" {
+            guard let m3u = configs[index].m3uURL, let url = URL(string: m3u) else { continue }
+            let oldId = configs[index].id
+            let newId = m3uSourceId(for: url)
+            if newId != oldId {
+                renameChannels(from: "m3u:\(oldId):", to: "m3u:\(newId):", defaults: defaults,
+                               channelListKeys: channelListKeys, viewingsKey: viewingsKey)
+                configs[index].id = newId
+            }
+            configs[index].m3uURL = storeSecret(m3u, key: playlistURLKey(sourceId: newId))
+            configs[index].epgURL = storeSecret(configs[index].epgURL, key: guideURLKey(sourceId: newId))
+            changed = true
+        }
+        return changed
+    }
+
+    private static func renameChannels(from oldPrefix: String, to newPrefix: String, defaults: UserDefaults,
+                                       channelListKeys: [String], viewingsKey: String) {
+        func rename(_ id: String) -> String {
+            id.hasPrefix(oldPrefix) ? newPrefix + id.dropFirst(oldPrefix.count) : id
+        }
+        for key in channelListKeys {
+            if let ids = defaults.stringArray(forKey: key) { defaults.set(ids.map(rename), forKey: key) }
+        }
+        if let data = defaults.data(forKey: viewingsKey),
+           let viewings = try? JSONDecoder().decode([LiveViewing].self, from: data) {
+            let renamed = viewings.map {
+                LiveViewing(channelId: rename($0.channelId), at: $0.at, title: $0.title, labels: $0.labels, genre: $0.genre)
+            }
+            if let encoded = try? JSONEncoder().encode(renamed) { defaults.set(encoded, forKey: viewingsKey) }
+        }
     }
 
     /// Moves API keys saved in plain text by older builds into the Keychain.
@@ -617,8 +846,15 @@ class LiveTVDataStore: ObservableObject {
             return
         }
 
-        // Cancel existing task if any
-        channelLoadTask?.cancel()
+        // Arriving on Live TV calls this from several places at once. They share
+        // one load: PMS keeps working on a request the client abandons, and
+        // that work slows the next one (#338).
+        if let loading = channelLoad, loading.generation == providersGeneration {
+            await loading.task.value
+            if channelLoad?.task == loading.task { channelLoad = nil }
+            return
+        }
+        channelLoad?.task.cancel()
 
         isLoadingChannels = true
         channelsError = nil
@@ -632,7 +868,7 @@ class LiveTVDataStore: ObservableObject {
         // on the main thread while the home screen is still loading. Priority
         // does not change isolation, so `Task(priority:)` is not a substitute.
         // The MainActor.run below is the only main hop.
-        channelLoadTask = Task.detached { [providerEntries] in
+        let task = Task.detached { [providerEntries] in
             let merged = await Self.fetchAndMergeChannels(from: providerEntries, refreshing: false)
 
             // A cancelled (superseded) task must NOT publish: its partial
@@ -655,8 +891,10 @@ class LiveTVDataStore: ObservableObject {
 
             await self.updateSourceInfo()
         }
+        channelLoad = (task, providersGeneration)
 
-        await channelLoadTask?.value
+        await task.value
+        if channelLoad?.task == task { channelLoad = nil }
     }
 
     /// Refresh channels from all sources
@@ -690,12 +928,24 @@ class LiveTVDataStore: ObservableObject {
             return
         }
 
-        epgLoadTask?.cancel()
+        let endDate = Calendar.current.date(byAdding: .hour, value: hours, to: startDate) ?? startDate
+        let window = DateInterval(start: startDate, end: max(startDate, endDate))
+
+        // Same reason as loadChannels: a load in flight is waited out, never
+        // abandoned, and answers this call when it covers the same window.
+        while let loading = epgLoad, loading.generation == providersGeneration {
+            let answers = loading.channelCount == channels.count
+                && Self.epgWindow(loading.window, covers: window)
+            await loading.task.value
+            if epgLoad?.task == loading.task { epgLoad = nil }
+            if answers { return }
+        }
+        epgLoad?.task.cancel()
+        fillTask?.cancel()
+        fillTask = nil
 
         isLoadingEPG = true
         epgIssues = []
-
-        let endDate = Calendar.current.date(byAdding: .hour, value: hours, to: startDate) ?? startDate
 
         // Snapshot provider display names up-front so the task group doesn't
         // need to touch the @MainActor-bound providers dictionary after
@@ -716,7 +966,7 @@ class LiveTVDataStore: ObservableObject {
 
         // Detached for the same reason as loadChannels: `Task {}` would inherit
         // MainActor and put the EPG merge on the main thread.
-        epgLoadTask = Task.detached { [channelsBySource, providersById, providerList, sourceNames] in
+        let task = Task.detached { [channelsBySource, providersById, providerList, sourceNames] in
             var allEPG: [String: [UnifiedProgram]] = [:]
             var issues: [EPGFetchIssue] = []
 
@@ -789,83 +1039,82 @@ class LiveTVDataStore: ObservableObject {
                 self.epgLoadedThrough = endDate
                 self.applyXMLTVChannelLogos(finalLogos)
                 // See the note in loadChannels: an empty grid is not "fresh".
-                if !finalEPG.isEmpty { self.lastEPGLoad = Date() }
+                if !finalEPG.isEmpty { self.lastEPGLoad = Date(); self.lastFullEPGLoad = Date() }
             }
         }
 
-        await epgLoadTask?.value
+        epgLoad = (task, providersGeneration, channels.count, window)
+
+        await task.value
+        if epgLoad?.task == task { epgLoad = nil }
+        fillGuide()
+        if !epg.isEmpty { keepGuideFresh() }
     }
 
-    /// Extend the loaded EPG window forward by `hours`, MERGING the new grid
-    /// into `epg` (append + de-dupe by program id, keep each channel sorted by
-    /// start). Drives the guide's lazy horizontal loading: the grid calls this
-    /// as focus/scroll approaches the loaded right edge, so more programming
-    /// appears before the user reaches empty space. No-op while another load or
-    /// extension is running, once the window reaches `epgMaxHoursAhead`, or
-    /// before the first `loadEPG` set `epgLoadedThrough`.
-    func extendEPG(byHours hours: Int) async {
-        guard !providers.isEmpty, !channels.isEmpty,
-              !isLoadingEPG, !isExtendingEPG,
-              let from = epgLoadedThrough
-        else { return }
+    /// Whether a guide load for `loading` answers a request for `requested`.
+    /// An hour of slack: callers arriving together read "now" at different
+    /// moments, and the guide rounds its start down to the half hour.
+    nonisolated static func epgWindow(_ loading: DateInterval, covers requested: DateInterval) -> Bool {
+        loading.start <= requested.start.addingTimeInterval(3600)
+            && loading.end >= requested.end.addingTimeInterval(-3600)
+    }
 
-        // Respect the look-ahead ceiling; clamp the new end to it.
-        let ceiling = Calendar.current.date(byAdding: .hour, value: epgMaxHoursAhead, to: Date()) ?? from
-        guard from < ceiling else { return }
-        let requestedEnd = Calendar.current.date(byAdding: .hour, value: hours, to: from) ?? from
-        let to = min(requestedEnd, ceiling)
-        guard to > from else { return }
+    /// Extends the loaded window by one fill chunk. False when there is
+    /// nothing left to fetch, no source answered, or a full load replaced the grid.
+    private func extendEPG() async -> Bool {
+        guard !isLoadingEPG, let from = epgLoadedThrough else { return false }
+        let ceiling = Date().addingTimeInterval(Double(Self.epgMaxHoursAhead) * 3600)
+        let to = min(from.addingTimeInterval(Double(Self.fillChunkHours) * 3600), ceiling)
+        // An hour's minimum, so the moving ceiling doesn't buy a request per tick.
+        guard to.timeIntervalSince(from) >= 3600, await mergeEPG(from: from, to: to),
+              epgLoadedThrough == from, !Task.isCancelled
+        else { return false }
+        epgLoadedThrough = to
+        return true
+    }
 
-        isExtendingEPG = true
-        defer { isExtendingEPG = false }
-
-        let sourceNames: [String: String] = providers.reduce(into: [:]) { acc, entry in
-            acc[entry.key] = entry.value.displayName
-        }
+    /// Fetches `from..<to` from every source and replaces that range of `epg`
+    /// with it. Channels a source returned nothing for keep what they had.
+    /// False when every source failed or a full load started meanwhile.
+    private func mergeEPG(from: Date, to: Date) async -> Bool {
+        guard !providers.isEmpty, !channels.isEmpty else { return false }
         let channelsBySource = Dictionary(grouping: channels, by: { $0.sourceId })
 
         var newEPG: [String: [UnifiedProgram]] = [:]
-        var issues: [EPGFetchIssue] = []
+        var answered = 0
 
-        await withTaskGroup(of: (String, Result<[String: [UnifiedProgram]], Error>).self) { group in
+        await withTaskGroup(of: [String: [UnifiedProgram]]?.self) { group in
             for (sourceId, sourceChannels) in channelsBySource {
                 guard let provider = providers[sourceId] else { continue }
                 group.addTask {
-                    do {
-                        let epg = try await provider.fetchEPG(for: sourceChannels, startDate: from, endDate: to)
-                        return (sourceId, .success(epg))
-                    } catch {
-                        return (sourceId, .failure(error))
-                    }
+                    try? await provider.fetchEPG(for: sourceChannels, startDate: from, endDate: to)
                 }
             }
-            for await (sourceId, result) in group {
-                switch result {
-                case .success(let epg):
-                    for (channelId, programs) in epg { newEPG[channelId] = programs }
-                case .failure(let error):
-                    if error is CancellationError || (error as NSError).code == NSURLErrorCancelled { continue }
-                    issues.append(EPGFetchIssue(
-                        sourceId: sourceId,
-                        sourceName: sourceNames[sourceId] ?? sourceId,
-                        reason: Self.shortEPGFailureReason(for: error)))
-                }
+            for await result in group {
+                guard let result else { continue }
+                answered += 1
+                newEPG.merge(result) { _, new in new }
             }
         }
+        guard !isLoadingEPG, !Task.isCancelled else { return false }
+        // No banner on failure: the guide already on screen stays usable.
+        epg = Self.merging(newEPG, into: epg, from: from, to: to)
+        return answered > 0
+    }
 
-        // Merge: append new programs, de-dupe by id (providers re-serve the
-        // boundary programme), keep sorted by start.
+    /// `incoming` replaces each of its channels' programmes overlapping
+    /// `from..<to`; everything outside that range stays.
+    nonisolated static func merging(_ incoming: [String: [UnifiedProgram]],
+                                    into epg: [String: [UnifiedProgram]],
+                                    from: Date, to: Date) -> [String: [UnifiedProgram]] {
         var merged = epg
-        for (channelId, incoming) in newEPG {
-            var existing = merged[channelId] ?? []
-            let known = Set(existing.map(\.id))
-            existing.append(contentsOf: incoming.filter { !known.contains($0.id) })
-            existing.sort { $0.startTime < $1.startTime }
-            merged[channelId] = existing
+        for (channelId, programs) in incoming {
+            let kept = (merged[channelId] ?? []).filter { $0.endTime <= from || $0.startTime >= to }
+            let ids = Set(programs.map(\.id))
+            merged[channelId] = (kept.filter { !ids.contains($0.id) } + programs)
+                .sorted { $0.startTime < $1.startTime }
         }
-        epg = merged
-        epgLoadedThrough = to
-        if !issues.isEmpty { epgIssues = issues }
+        return merged
     }
 
     /// Fills in channel artwork from XMLTV `<channel><icon>` logos for any
@@ -1211,6 +1460,15 @@ class LiveTVDataStore: ObservableObject {
         return channels
             .filter { position[$0.id] != nil || ($0.isFavourite && !unfavorited.contains($0.id)) }
             .sorted { key($0) < key($1) }
+    }
+
+    private func rememberEventSlots() {
+        let seen = epg.compactMap { id, programs in
+            programs.contains { $0.isPregameBlock || $0.isEmptySlot } ? id : nil
+        }
+        guard !eventSlotIds.isSuperset(of: seen) else { return }
+        eventSlotIds.formUnion(seen)
+        userDefaults.set(Array(eventSlotIds), forKey: eventSlotsKey)
     }
 
     private func loadFavorites() {

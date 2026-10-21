@@ -22,6 +22,8 @@ final class SettingsPageViewController: UIViewController {
     var onPush: ((SettingsPage) -> Void)?
     /// A picker option was chosen → container pops back to the parent.
     var onPop: (() -> Void)?
+    /// Pops this page and the one below it (a form opened from a picker).
+    var onPopTwo: (() -> Void)?
     /// A row gained focus → container updates the left description panel.
     var onFocusRow: ((String?) -> Void)?
 
@@ -64,6 +66,8 @@ final class SettingsPageViewController: UIViewController {
         let section = NSCollectionLayoutSection(group: group)
         section.interGroupSpacing = 8
         section.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 24, bottom: 24, trailing: 24)
+        // Insets from the bounds, not the safe area: the container places the pane.
+        section.contentInsetsReference = .none
         let layout = UICollectionViewCompositionalLayout(section: section)
 
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
@@ -184,6 +188,8 @@ final class SettingsPageViewController: UIViewController {
         hasAppeared = true
     }
 
+
+
     /// Rebuild the row models for this page from current manager/UserDefaults
     /// state. Falls back to a single focusable placeholder for empty pages so
     /// focus always has a target (never a focusless page).
@@ -267,6 +273,7 @@ extension SettingsPageViewController: UICollectionViewDataSource, UICollectionVi
         case .cycle(let value, let next):
             next()
             (collectionView.cellForItem(at: indexPath) as? SettingsCell)?.updateValue(value())
+            refreshDimmedRows()
         case .action(_, let handler):
             handler(self)
         case .option(_, let select):
@@ -276,10 +283,11 @@ extension SettingsPageViewController: UICollectionViewDataSource, UICollectionVi
             // The handler owns its own list refresh (it may switch synchronously
             // or present a PIN modal and reload on dismiss).
             handler(self)
-        case .textEntry(let value, let placeholder, let hint, let suggestions, let keyboardType, let isSecure, let set):
+        case .textEntry(let value, _, let hint, let suggestions, let keyboardType, let isSecure, let contentType, let set):
             let entry = TextEntryViewController(
-                title: item.title, initialText: value(), placeholder: placeholder,
-                hint: hint, suggestions: suggestions, keyboardType: keyboardType, isSecure: isSecure,
+                title: item.title, message: hint, initialText: value(),
+                suggestions: suggestions, keyboardType: keyboardType, isSecure: isSecure,
+                contentType: contentType,
                 onCommit: { [weak self] text in
                     set(text)
                     // Reload so the row shows the committed value. A Menu

@@ -12,48 +12,10 @@ import SwiftUI
 import SwiftData
 import Sentry
 
-// MARK: - App Delegate
-
-class RivuletAppDelegate: NSObject, UIApplicationDelegate {
-
-    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
-        Task {
-            await DeepLinkHandler.shared.handle(url: url)
-        }
-        return true
-    }
-
-    func application(_ application: UIApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([any UIUserActivityRestoring]?) -> Void) -> Bool {
-        guard let ratingKey = userActivity.userInfo?["ratingKey"] as? String,
-              !ratingKey.isEmpty else { return false }
-
-        switch userActivity.activityType {
-        case "com.rivulet.viewMedia":
-            Task {
-                await DeepLinkHandler.shared.handle(
-                    url: URL(string: "rivulet://detail?ratingKey=\(ratingKey)")!
-                )
-            }
-            return true
-        case "com.rivulet.playMedia":
-            Task {
-                await DeepLinkHandler.shared.handle(
-                    url: URL(string: "rivulet://play?ratingKey=\(ratingKey)")!
-                )
-            }
-            return true
-        default:
-            return false
-        }
-    }
-}
-
 // MARK: - App
 
 @main
 struct RivuletApp: App {
-    @UIApplicationDelegateAdaptor(RivuletAppDelegate.self) var appDelegate
-
     init() {
         StartupTimer.arm()
         StartupTimer.mark("RivuletApp.init")
@@ -71,10 +33,27 @@ struct RivuletApp: App {
         // latches to "empty" on a fresh sign-in, and without the second, a
         // sign-out leaves the previous server's hubs on screen.
         PlexAuthManager.onAuthenticated = { await PlexDataStore.shared.loadLibrariesIfNeeded() }
-        PlexAuthManager.onSignedOut = { PlexDataStore.shared.reset() }
+        PlexAuthManager.onSignedOut = {
+            MusicQueue.shared.stop()
+            MusicQueue.shared.clear()
+            PlexDataStore.shared.reset()
+            // Older builds recorded token-bearing URLs in the cache metadata.
+            Task { await ImageCacheManager.shared.clearAll() }
+        }
         JellyfinSession.onChanged = { JellyfinDataStore.shared.reload() }
-        PlexUserProfileManager.onProfileChanged = { await PlexDataStore.shared.onProfileSwitched() }
-        PlexUserProfileManager.onInitialProfileSelected = { LibrarySettingsManager.shared.onProfileSwitched() }
+        PlexLiveTimelineKeepalive.releaseOtherSession = { JellyfinLiveTVProvider.closeLiveStream($0) }
+        PlexUserProfileManager.onProfileChanged = {
+            // The queue reports progress with whichever token is current.
+            MusicQueue.shared.stop()
+            MusicQueue.shared.clear()
+            await PlexDataStore.shared.onProfileSwitched()
+            // A restricted profile does not see the Jellyfin server.
+            JellyfinDataStore.shared.reload()
+        }
+        PlexUserProfileManager.onInitialProfileSelected = {
+            LibrarySettingsManager.shared.onProfileSwitched()
+            JellyfinDataStore.shared.reload()
+        }
 
         #if !DEBUG
         // Sentry start is DEFERRED off the launch window. Starting it in init()
@@ -225,8 +204,18 @@ struct RivuletApp: App {
         WindowGroup {
             ContentView()
                 .environment(MediaProviderRegistry.shared)
-                .environment(MusicProviderRegistry.shared)
                 .environment(MetadataSourceRegistry.shared)
+                // A scene-based app gets URLs and activities here; UIKit never
+                // calls the app delegate's open-URL methods for it.
+                .onOpenURL { DeepLinkHandler.shared.handle(url: $0) }
+                .onContinueUserActivity("com.rivulet.viewMedia") { activity in
+                    guard let key = activity.userInfo?["ratingKey"] as? String, !key.isEmpty else { return }
+                    DeepLinkHandler.shared.handleDetail(ratingKey: key)
+                }
+                .onContinueUserActivity("com.rivulet.playMedia") { activity in
+                    guard let key = activity.userInfo?["ratingKey"] as? String, !key.isEmpty else { return }
+                    DeepLinkHandler.shared.handlePlay(ratingKey: key)
+                }
         }
         .modelContainer(sharedModelContainer)
     }

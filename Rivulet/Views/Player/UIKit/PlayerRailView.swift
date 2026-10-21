@@ -69,6 +69,8 @@ final class PlayerRailView: UIView {
     // its sub-tabs, right of it, are reached without crossing another pill.
     let infoButton = PlayerInfoPillButton(title: "Info")
     let chaptersButton = PlayerInfoPillButton(title: "Chapters")
+    /// Live TV only: shown while the programme on screen is a game.
+    let scoresButton = PlayerInfoPillButton(title: "Scores")
     /// "Up Next" on VOD, "Channels" on Live TV.
     let upNextButton = PlayerInfoPillButton(title: "Up Next")
     let insightsButton = PlayerInfoPillButton(title: "Insights")
@@ -79,6 +81,7 @@ final class PlayerRailView: UIView {
     var onAudio: (() -> Void)?
     var onInfo: (() -> Void)?
     var onChapters: (() -> Void)?
+    var onScores: (() -> Void)?
     var onDetails: (() -> Void)?
     /// A pill gained focus. While a pane is open this switches its tab, as AVKit's do.
     var onPillFocused: ((PlayerInfoPillButton) -> Void)?
@@ -109,25 +112,21 @@ final class PlayerRailView: UIView {
         subtitleLabel.textColor = .white
         titleLabel.font = .systemFont(ofSize: 57, weight: .bold)
         titleLabel.textColor = .white
-        for label in [subtitleLabel, titleLabel] {
-            label.layer.shadowColor = UIColor.black.cgColor
-            label.layer.shadowOpacity = 0.2
-            label.layer.shadowRadius = 30
-            label.layer.shadowOffset = .zero
-        }
+        applyChromeTextShadow([subtitleLabel, titleLabel])
 
-        // Custom tools sit left of Subtitles/Audio, as AVKit places them.
+        // Up from the video lands on the leftmost tool, so the rarely used ones
+        // (Content Filter, then Quality) sit right of Subtitles/Audio.
         toolRow.axis = .horizontal
         toolRow.spacing = Metrics.toolGap
         toolRow.alignment = .center
-        [multiviewButton, recordButton, goLiveButton, filterButton, qualityButton, subtitlesButton, audioButton].forEach {
+        [multiviewButton, recordButton, goLiveButton, subtitlesButton, audioButton, filterButton, qualityButton].forEach {
             toolRow.addArrangedSubview($0)
         }
 
         pillRow.axis = .horizontal
         pillRow.spacing = Metrics.pillGap
         pillRow.alignment = .center
-        [infoButton, chaptersButton, upNextButton, detailsButton, insightsButton].forEach {
+        [infoButton, scoresButton, chaptersButton, upNextButton, detailsButton, insightsButton].forEach {
             pillRow.addArrangedSubview($0)
         }
         insightsTabRow.axis = .horizontal
@@ -164,6 +163,7 @@ final class PlayerRailView: UIView {
         audioButton.onPress = { [weak self] in self?.onAudio?() }
         infoButton.onPress = { [weak self] in self?.onInfo?() }
         chaptersButton.onPress = { [weak self] in self?.onChapters?() }
+        scoresButton.onPress = { [weak self] in self?.onScores?() }
         detailsButton.onPress = { [weak self] in self?.onDetails?() }
         insightsButton.onPress = { [weak self] in self?.onInsights?() }
         upNextButton.onPress = { [weak self] in self?.onUpNext?() }
@@ -175,6 +175,7 @@ final class PlayerRailView: UIView {
         insightsButton.isHidden = true
         upNextButton.isHidden = true
         chaptersButton.isHidden = true
+        scoresButton.isHidden = true
         detailsButton.isHidden = true
         // Hidden until a host shows it — the Live TV rail shares this view but
         // has no content filter.
@@ -197,7 +198,7 @@ final class PlayerRailView: UIView {
     }
 
     /// Reflect whether the content filter is acting in the toggle glyph
-    /// (filled = filtering, outline = paused for this title).
+    /// (filled = filtering, outline = paused or nothing to act on).
     func setFilterActive(_ active: Bool) {
         filterButton.setIcon(UIImage(systemName: active ? "hand.raised.fill" : "hand.raised"))
     }
@@ -300,6 +301,13 @@ final class PlayerRailView: UIView {
         guard goLiveButton.isHidden == available else { return }
         goLiveButton.isHidden = !available
         if !available, lastFocusedButton === goLiveButton { lastFocusedButton = nil }
+    }
+
+    /// Live TV: the Scores pill, while the programme on screen matches a game.
+    func setScoresAvailable(_ available: Bool) {
+        guard scoresButton.isHidden == available else { return }
+        scoresButton.isHidden = !available
+        if !available, lastFocusedButton === scoresButton { lastFocusedButton = nil }
     }
 
     /// Live TV: the record button, filled while the current programme is set

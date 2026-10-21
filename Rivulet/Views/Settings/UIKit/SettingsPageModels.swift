@@ -73,7 +73,8 @@ struct SettingsRowItem {
         /// `isSecure` masks the text while typing and shows "Set" on the row.
         case textEntry(value: () -> String, placeholder: String, hint: String?,
                        suggestions: [(label: String, value: String)],
-                       keyboardType: UIKeyboardType, isSecure: Bool = false, set: (String) -> Void)
+                       keyboardType: UIKeyboardType, isSecure: Bool = false,
+                       contentType: UITextContentType? = nil, set: (String) -> Void)
     }
 
     let id: String
@@ -138,7 +139,7 @@ struct SettingsRowItem {
         case .selectable(_, let value, _): return value()
         // Show the current value; fall back to the placeholder (or "Not set")
         // when empty.
-        case .textEntry(let value, let placeholder, _, _, _, let isSecure, _):
+        case .textEntry(let value, let placeholder, _, _, _, let isSecure, _, _):
             let current = value()
             if current.isEmpty { return placeholder.isEmpty ? "Not set" : placeholder }
             return isSecure ? "Set" : current
@@ -167,7 +168,17 @@ enum SettingsContent {
                          jellyfin: JellyfinDataStore.shared.account?.serverName ?? "Jellyfin")
     }
 
+    /// Rows a restricted (managed) Plex profile does not get: other servers,
+    /// sources, sign-out, and the parental controls themselves.
+    static let ownerOnlyRowIDs: Set<String> = ["cat_servers", "liveTVSources", "cat_contentFilter", "profilePickerOnLaunch"]
+
     static func rows(for page: SettingsPage) -> [SettingsRowItem] {
+        let rows = allRows(for: page)
+        guard PlexUserProfileManager.shared.isRestrictedProfile else { return rows }
+        return rows.filter { !ownerOnlyRowIDs.contains($0.id) }
+    }
+
+    private static func allRows(for page: SettingsPage) -> [SettingsRowItem] {
         switch page {
         case .root:        return root
         case .appearance:  return appearance
@@ -176,6 +187,7 @@ enum SettingsContent {
         case .music:       return music
         case .servers:     return servers
         case .plex:        return plex
+        case .plexServerPicker: return plexServerPicker
         case .jellyfin:    return jellyfin
         case .libraries:   return libraries
         case .homeRows:    return homeRows
@@ -184,14 +196,21 @@ enum SettingsContent {
         case .liveTVSourceDetail: return liveTVSourceDetail
         case .liveTVFavorites: return liveTVFavorites
         case .addLiveTVSource:  return addLiveTVSource
+        case .addXtream:        return addXtream
         case .addOwnServer:     return addOwnServer
         case .addPlaylistURL:   return addPlaylistURL
         case .about:       return about
         case .displaySizePicker:      return displaySizePicker
         case .autoplayCountdownPicker: return autoplayCountdownPicker
         case .skipIntervalPicker:     return skipIntervalPicker
+        case .skipBackIntervalPicker: return skipBackIntervalPicker
+        case .heightSpeakersPicker:   return heightSpeakersPicker
+        case .subtitleModePicker:     return subtitleModePicker
+        case .autoplayLimitPicker:    return autoplayLimitPicker
         case .homeQualityPicker:      return qualityPicker(home: true)
         case .awayQualityPicker:      return qualityPicker(home: false)
+        case .audioLanguagePicker:    return audioLanguagePicker
+        case .subtitleLanguagePicker: return subtitleLanguagePicker
         case .contentFilter:          return contentFilter
         case .contentFilterStrength:  return contentFilterStrength
         }
@@ -223,6 +242,42 @@ enum SettingsContent {
         }
     }
 
+    private static var skipBackIntervalPicker: [SettingsRowItem] {
+        SkipInterval.allCases.map { opt in
+            SettingsRowItem(id: "sbi_\(opt.rawValue)", title: opt.description, kind: .option(
+                isSelected: { Int(InputConfig.tapSeekBackSeconds) == opt.rawValue },
+                select: { SettingsStore.setInt(SkipInterval.backStorageKey, opt.rawValue) }))
+        }
+    }
+
+    /// Forced Only is set only by a player pick, so it is listed only while it is current.
+    private static var subtitleModePicker: [SettingsRowItem] {
+        let current = SubtitleMode(TrackIntentStore.effectiveSubtitleIntent)
+        let modes: [SubtitleMode] = [.off, .foreignAudio, .always] + (current == .forcedOnly ? [.forcedOnly] : [])
+        return modes.map { mode in
+            SettingsRowItem(id: "sm_\(mode)", title: mode.rawValue, kind: .option(
+                isSelected: { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent) == mode },
+                select: { setSubtitles(mode: mode) }))
+        }
+    }
+
+    private static var autoplayLimitPicker: [SettingsRowItem] {
+        AutoplayLimit.allCases.map { opt in
+            SettingsRowItem(id: "alim_\(opt.rawValue)", title: opt.description, kind: .option(
+                isSelected: { AutoplayLimit.current == opt },
+                select: { SettingsStore.setInt(AutoplayLimit.storageKey, opt.rawValue) }))
+        }
+    }
+
+    /// "" is Off; the rest are the layouts the engine renders heights into.
+    private static var heightSpeakersPicker: [SettingsRowItem] {
+        ["", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "9.1.6"].map { layout in
+            SettingsRowItem(id: "hs_\(layout.isEmpty ? "off" : layout)", title: layout.isEmpty ? "Off" : layout, kind: .option(
+                isSelected: { heightSpeakers == layout },
+                select: { SettingsStore.setString(AetherPlayer.heightSpeakersKey, layout) }))
+        }
+    }
+
     /// Read at play time by the player (`StreamingQuality.setting`).
     private static func qualityPicker(home: Bool) -> [SettingsRowItem] {
         let key = home ? StreamingQuality.homeKey : StreamingQuality.awayKey
@@ -230,6 +285,72 @@ enum SettingsContent {
             SettingsRowItem(id: "sq_\(choice.rawValue)", title: choice.label, kind: .option(
                 isSelected: { StreamingQuality.setting(home: home) == choice },
                 select: { SettingsStore.setString(key, choice.rawValue) }))
+        }
+    }
+
+    private static var audioLanguagePicker: [SettingsRowItem] {
+        let languages = TrackLanguage.choices.sorted { TrackLanguage.displayName($0) < TrackLanguage.displayName($1) }
+        return ([TrackLanguage.original] + languages).map { code in
+            SettingsRowItem(id: "al_\(code)", title: audioLanguageName(code), kind: .option(
+                isSelected: { TrackLanguage.normalize(TrackIntentStore.effectiveAudioIntent.language) == code },
+                select: { TrackIntentStore.audioIntent = AudioIntent(language: code) }))
+        }
+    }
+
+    private static var subtitleLanguagePicker: [SettingsRowItem] {
+        TrackLanguage.choices.sorted { TrackLanguage.displayName($0) < TrackLanguage.displayName($1) }.map { code in
+            SettingsRowItem(id: "sl_\(code)", title: TrackLanguage.displayName(code), kind: .option(
+                isSelected: { TrackLanguage.normalize(subtitleLanguage) == code },
+                select: { setSubtitles(mode: SubtitleMode(TrackIntentStore.effectiveSubtitleIntent), language: code) }))
+        }
+    }
+
+    // MARK: Audio and subtitles (read and written through TrackIntentStore)
+
+    private static func audioLanguageName(_ code: String) -> String {
+        if code == TrackLanguage.original { return "Original" }
+        // An untagged or unknown pick resolves to English (see resolveAudio).
+        return TrackLanguage.isKnown(code) ? TrackLanguage.displayName(code) : TrackLanguage.displayName(TrackLanguage.english)
+    }
+
+    private enum SubtitleMode: String {
+        case foreignAudio = "Foreign Audio", always = "Always", off = "Off", forcedOnly = "Forced Only"
+
+        init(_ intent: SubtitleIntent) {
+            switch intent {
+            case .off: self = .off
+            case .foreignAudio: self = .foreignAudio
+            case .track(_, let forced, _, _): self = forced ? .forcedOnly : .always
+            }
+        }
+    }
+
+    private static var subtitleLanguage: String {
+        TrackIntentStore.effectiveSubtitleIntent.language ?? TrackLanguage.device
+    }
+
+    private static var heightSpeakers: String {
+        SettingsStore.string(AetherPlayer.heightSpeakersKey, default: "")
+    }
+
+    private static var subtitleSDH: Bool {
+        switch TrackIntentStore.effectiveSubtitleIntent {
+        case .off: return false
+        case .track(_, _, let hi, _), .foreignAudio(_, let hi): return hi
+        }
+    }
+
+    private static func setSubtitles(mode: SubtitleMode, language: String? = nil, sdh: Bool? = nil) {
+        let language = language ?? subtitleLanguage
+        let sdh = sdh ?? subtitleSDH
+        switch mode {
+        case .off:
+            TrackIntentStore.subtitleIntent = .off
+        case .foreignAudio:
+            TrackIntentStore.subtitleIntent = .foreignAudio(language: language, hearingImpaired: sdh)
+        case .always, .forcedOnly:
+            TrackIntentStore.subtitleIntent = .track(language: language, forced: mode == .forcedOnly,
+                                                     hearingImpaired: sdh, codec: nil)
         }
     }
 
@@ -241,8 +362,8 @@ enum SettingsContent {
             SettingsRowItem(id: "cat_playback",   title: "Playback",   kind: .navigation(.playback)),
             // Music settings withdrawn until the audio features behind them
             // exist — all three rows were no-ops (see the `music` builder).
-            // Music BROWSING is unaffected: the sidebar still shows
-            // MusicHomeView for every visible Plex music library.
+            // Music BROWSING is unaffected: the sidebar still shows the
+            // Music library for every visible Plex music library.
 //            SettingsRowItem(id: "cat_music",      title: "Music",      kind: .navigation(.music)),
             SettingsRowItem(id: "cat_liveTV",     title: "Live TV",    kind: .navigation(.liveTV)),
             SettingsRowItem(id: "cat_servers",    title: "Servers",    kind: .navigation(.servers)),
@@ -312,38 +433,69 @@ enum SettingsContent {
     // MARK: Playback
 
     private static var playback: [SettingsRowItem] {
-        [
-            toggle("autoSkipIntro", "Auto-Skip Intro", key: "autoSkipIntro", default: false),
-            toggle("autoSkipCredits", "Auto-Skip Credits", key: "autoSkipCredits", default: false),
-            toggle("autoSkipAds", "Auto-Skip Ads", key: "autoSkipAds", default: false),
-            toggle("autoSkipRecap", "Auto-Skip Recap", key: "autoSkipRecap", default: false),
+        let subtitlesOn = { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent) != .off }
+        // Leading block unheaded, like Appearance; the rest grouped under
+        // headers whose titles the rows then drop ("Intro" under AUTO-SKIP).
+        return [
+            SettingsRowItem(id: "cat_contentFilter", title: "Content Filtering",
+                            kind: .navigationValue(.contentFilter, value: {
+                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? "On" : "Off"
+                            })),
+            .header("Audio & Subtitles"),
+            SettingsRowItem(id: "audioLanguage", title: "Audio Language",
+                            kind: .navigationValue(.audioLanguagePicker, value: {
+                                audioLanguageName(TrackLanguage.normalize(TrackIntentStore.effectiveAudioIntent.language))
+                            })),
+            SettingsRowItem(id: "subtitleMode", title: "Subtitles",
+                            kind: .navigationValue(.subtitleModePicker, value: { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent).rawValue })),
+            SettingsRowItem(id: "subtitleLanguage", title: "Subtitle Language",
+                            kind: .navigationValue(.subtitleLanguagePicker, value: {
+                                TrackLanguage.displayName(TrackLanguage.normalize(subtitleLanguage))
+                            }), isEnabled: subtitlesOn),
+            SettingsRowItem(id: "subtitleSDH", title: "SDH Subtitles",
+                            kind: .toggle(get: { subtitleSDH },
+                                          set: { setSubtitles(mode: SubtitleMode(TrackIntentStore.effectiveSubtitleIntent), sdh: $0) }),
+                            isEnabled: subtitlesOn),
+            SettingsRowItem(id: "heightSpeakers", title: "Height Speakers",
+                            kind: .navigationValue(.heightSpeakersPicker, value: { heightSpeakers.isEmpty ? "Off" : heightSpeakers })),
+            .header("Auto-Skip"),
+            toggle("autoSkipIntro", "Intro", key: "autoSkipIntro", default: false),
+            toggle("autoSkipCredits", "Credits", key: "autoSkipCredits", default: false),
+            toggle("autoSkipAds", "Ads", key: "autoSkipAds", default: false),
+            toggle("autoSkipRecap", "Recap", key: "autoSkipRecap", default: false),
             toggle("useIntroDB", "Community Marker Database", key: "useIntroDB", default: false),
+            .header("Remote"),
+            SettingsRowItem(id: "skipLength", title: "Skip Forward",
+                            kind: .navigationValue(.skipIntervalPicker, value: {
+                                SkipInterval(rawValue: SettingsStore.int(SkipInterval.storageKey, default: SkipInterval.defaultValue.rawValue))?.description ?? ""
+                            })),
+            SettingsRowItem(id: "skipBackLength", title: "Skip Back",
+                            kind: .navigationValue(.skipBackIntervalPicker, value: {
+                                SkipInterval(rawValue: Int(InputConfig.tapSeekBackSeconds))?.description ?? ""
+                            })),
+            .header("Streaming Quality"),
+            SettingsRowItem(id: "homeStreamingQuality", title: "Home",
+                            kind: .navigationValue(.homeQualityPicker, value: {
+                                StreamingQuality.setting(home: true).label
+                            })),
+            SettingsRowItem(id: "awayStreamingQuality", title: "Away",
+                            kind: .navigationValue(.awayQualityPicker, value: {
+                                StreamingQuality.setting(home: false).label
+                            })),
+            .header("Resume"),
             toggle("instantResume", "Instant Resume", key: "continueWatchingInstantResume", default: true),
             // The prompt only has anything to interrupt while a Continue
             // Watching tile plays on Select, so it dims with Instant Resume off.
             toggle("promptResumeOrRestart", "Resume or Restart Prompt", key: "promptResumeOrRestart", default: false,
                    enabledWhen: { SettingsStore.bool("continueWatchingInstantResume", default: true) }),
-            SettingsRowItem(id: "homeStreamingQuality", title: "Home Streaming Quality",
-                            kind: .navigationValue(.homeQualityPicker, value: {
-                                StreamingQuality.setting(home: true).label
-                            })),
-            SettingsRowItem(id: "awayStreamingQuality", title: "Away Streaming Quality",
-                            kind: .navigationValue(.awayQualityPicker, value: {
-                                StreamingQuality.setting(home: false).label
-                            })),
-            SettingsRowItem(id: "autoplayCountdown", title: "Autoplay Countdown",
+            .header("Autoplay"),
+            SettingsRowItem(id: "autoplayCountdown", title: "Countdown",
                             kind: .navigationValue(.autoplayCountdownPicker, value: {
                                 AutoplayCountdown(rawValue: SettingsStore.int("autoplayCountdown", default: AutoplayCountdown.fiveSeconds.rawValue))?.description ?? ""
                             })),
-            SettingsRowItem(id: "skipLength", title: "Skip Length",
-                            kind: .navigationValue(.skipIntervalPicker, value: {
-                                SkipInterval(rawValue: SettingsStore.int(SkipInterval.storageKey, default: SkipInterval.defaultValue.rawValue))?.description ?? ""
-                            })),
-            toggle("showPostVideoUpNext", "Show Up Next Panel", key: "showPostVideoUpNext", default: true),
-            SettingsRowItem(id: "cat_contentFilter", title: "Content Filtering",
-                            kind: .navigationValue(.contentFilter, value: {
-                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? "On" : "Off"
-                            }))
+            SettingsRowItem(id: "autoplayLimit", title: "Limit",
+                            kind: .navigationValue(.autoplayLimitPicker, value: { AutoplayLimit.current.description })),
+            toggle("showPostVideoUpNext", "Up Next Panel", key: "showPostVideoUpNext", default: true),
         ]
     }
 
@@ -492,8 +644,8 @@ enum SettingsContent {
     ///     playback has no crossfade to configure.
     ///   - Loudness Normalization gated `MusicAudioProcessor.adjustedVolume(for:)`,
     ///     which has no callers.
-    ///   - Audio Quality Badges gated `AudioQualityBadge`, a view that is never
-    ///     instantiated anywhere.
+    ///   - Audio Quality Badges gated `AudioQualityBadge`, a view that was never
+    ///     instantiated and has since been deleted.
     /// Restore the rows below once one of those is actually wired up, and fix
     /// the crossfade key/type mismatch when you do.
     private static var music: [SettingsRowItem] {
@@ -531,14 +683,13 @@ enum SettingsContent {
         let auth = PlexAuthManager.shared
         if auth.isAuthenticated {
             var rows: [SettingsRowItem] = []
-            if let name = auth.savedServerName {
-                rows.append(SettingsRowItem(id: "plexServerInfo", title: "Server",
-                                            kind: .info(value: { name })))
-            }
+            rows.append(SettingsRowItem(id: "plexServerPicker", title: "Server",
+                                        kind: .navigationValue(.plexServerPicker, value: {
+                PlexAuthManager.shared.savedServerName ?? ""
+            })))
             rows.append(SettingsRowItem(id: "signOut", title: "Sign Out",
                                         kind: .action(destructive: true, handler: { vc in
-                // Asks first: it is the page's only focus target, so one stray
-                // Select on arrival would otherwise sign out.
+                // Ask first. An accidental Select must not sign out.
                 presentConfirm(on: vc, title: "Sign Out of Plex?",
                                message: "You can sign in again from this page.",
                                confirmTitle: "Sign Out", destructive: true) {
@@ -559,6 +710,73 @@ enum SettingsContent {
                     presenter.present(auth, animated: true)
                 }))
             ]
+        }
+    }
+
+    // MARK: Plex server picker
+
+    /// The servers on the account. The page loads them each time it opens.
+    /// The value is nil until they arrive.
+    private static var plexServers: [PlexDevice]?
+    private static var plexServersFailed = false
+    /// The server of the current switch. The page ignores other selections until the switch completes.
+    private static var connectingPlexServerID: String?
+
+    private static var plexServerPicker: [SettingsRowItem] {
+        // This row can get focus. The container sets focus only on push.
+        // If no row can get focus, focus is lost when the servers arrive.
+        guard let servers = plexServers, !servers.isEmpty else {
+            if plexServersFailed || plexServers != nil {
+                return [SettingsRowItem(id: "plexServersRetry",
+                                        title: plexServersFailed ? "Couldn’t Load Servers" : "No Servers Found",
+                                        kind: .action(destructive: false, handler: { vc in
+                    loadPlexServers { [weak vc] in (vc as? SettingsPageViewController)?.reloadRows() }
+                }))]
+            }
+            return [SettingsRowItem(id: "plexServersLoading", title: "Loading Servers…",
+                                    kind: .action(destructive: false, handler: { _ in }))]
+        }
+        return servers.map { server in
+            SettingsRowItem(id: "plexServer_\(server.clientIdentifier)", title: server.name, kind: .selectable(
+                isSelected: { connectingPlexServerID == nil && PlexAuthManager.shared.isCurrentServer(server) },
+                value: {
+                    if connectingPlexServerID == server.clientIdentifier { return "Connecting…" }
+                    return server.owned == false ? server.sourceTitle : nil
+                },
+                handler: { vc in switchPlexServer(to: server, on: vc) }))
+        }
+    }
+
+    private static func loadPlexServers(reload: @escaping () -> Void) {
+        plexServers = nil
+        plexServersFailed = false
+        reload()
+        Task { @MainActor in
+            if let token = PlexAuthManager.shared.authToken,
+               let servers = try? await PlexNetworkManager.shared.getServers(authToken: token) {
+                plexServers = servers
+            } else {
+                plexServersFailed = true
+            }
+            reload()
+        }
+    }
+
+    private static func switchPlexServer(to server: PlexDevice, on vc: UIViewController) {
+        guard connectingPlexServerID == nil, !PlexAuthManager.shared.isCurrentServer(server) else { return }
+        let current = PlexAuthManager.shared.savedServerName ?? "your current server"
+        connectingPlexServerID = server.clientIdentifier
+        (vc as? SettingsPageViewController)?.reloadRows()
+        Task { @MainActor [weak vc] in
+            let switched = await PlexDataStore.shared.switchServer(to: server)
+            connectingPlexServerID = nil
+            guard let page = vc as? SettingsPageViewController else { return }
+            page.reloadRows()
+            guard !switched else { return }
+            page.present(ConfirmationPopupViewController(
+                title: "Couldn’t Connect",
+                message: "\(server.name) isn’t reachable right now. Rivulet is still using \(current).",
+                confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
         }
     }
 
@@ -682,7 +900,7 @@ enum SettingsContent {
 
     private static var libraries: [SettingsRowItem] {
         let mgr = LibrarySettingsManager.shared
-        let libs = mgr.sortLibraries(PlexDataStore.shared.libraries.filter { $0.isVideoLibrary || $0.isMusicLibrary })
+        let libs = mgr.sortLibraries(PlexDataStore.shared.libraries.filter(\.hasBrowseSurface))
         // Jellyfin's in the user's order, hidden ones included so they can
         // come back; each server reorders within its own run.
         let jellyfinStore = JellyfinDataStore.shared
@@ -744,7 +962,7 @@ enum SettingsContent {
     private static func moveMediaLibrary(key: String, up: Bool) {
         let mgr = LibrarySettingsManager.shared
         let mediaLibs = mgr.sortLibraries(
-            PlexDataStore.shared.libraries.filter { $0.isVideoLibrary || $0.isMusicLibrary })
+            PlexDataStore.shared.libraries.filter(\.hasBrowseSurface))
         mgr.moveLibrary(key: key, up: up, among: mediaLibs.map { $0.key })
     }
 
@@ -757,7 +975,10 @@ enum SettingsContent {
                 presentConfirm(on: vc, title: "Force Refresh Libraries?",
                                message: "This clears the metadata cache and reloads library content from your Plex server.",
                                confirmTitle: "Refresh", destructive: false) {
-                    Task { await CacheManager.shared.clearAllCache() }
+                    Task {
+                        await CacheManager.shared.clearAllCache()
+                        await reloadFromServer()
+                    }
                 }
             })),
             SettingsRowItem(id: "clearAllCache", title: "Clear All Cache",
@@ -768,10 +989,19 @@ enum SettingsContent {
                     Task {
                         await ImageCacheManager.shared.clearAll()
                         await CacheManager.shared.clearAllCache()
+                        await reloadFromServer()
                     }
                 }
             }))
         ]
+    }
+
+    /// Refetches libraries and Home rows, then tells every surface to repaint.
+    private static func reloadFromServer() async {
+        await PlexDataStore.shared.refreshLibraries()
+        await PlexDataStore.shared.refreshHubs()
+        await PlexDataStore.shared.refreshLibraryHubs()
+        NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
     }
 
     /// Canonical confirm/cancel prompt: the Liquid-Glass card
@@ -805,8 +1035,13 @@ enum SettingsContent {
         return rows
     }
 
+    /// Set while Refresh Channels runs, so the row says so and ignores a second press.
+    private static var refreshingSourceID: String?
+
     private static var liveTVSourceDetail: [SettingsRowItem] {
-        guard let source = pendingSourceDetail else { return [] }
+        guard let pending = pendingSourceDetail else { return [] }
+        // Read live: the snapshot taken when the page opened goes stale on a refresh.
+        let source = LiveTVDataStore.shared.sources.first { $0.id == pending.id } ?? pending
         var rows: [SettingsRowItem] = [
             SettingsRowItem(id: "src_status", title: "Status",
                             kind: .info(value: { source.isConnected ? "Connected" : "Disconnected" })),
@@ -823,13 +1058,21 @@ enum SettingsContent {
             rows.append(SettingsRowItem(id: "src_lastSync", title: "Last Synced",
                                         kind: .info(value: { lastSync.formatted(date: .abbreviated, time: .shortened) })))
         }
-        rows.append(SettingsRowItem(id: "refreshChannels", title: "Refresh Channels",
+        let refreshing = refreshingSourceID == source.id
+        rows.append(SettingsRowItem(id: "refreshChannels", title: refreshing ? "Refreshing Channels…" : "Refresh Channels",
                                     kind: .action(destructive: false, handler: { vc in
+            guard refreshingSourceID == nil else { return }
+            refreshingSourceID = source.id
+            (vc as? SettingsPageViewController)?.reloadRows()
             Task {
                 await LiveTVDataStore.shared.refreshChannels()
+                await LiveTVDataStore.shared.loadEPG()
+                refreshingSourceID = nil
                 (vc as? SettingsPageViewController)?.reloadRows()
             }
         })))
+        // A server's own Live TV leaves with its sign-in; removed here it would come straight back.
+        guard !source.sourceType.followsServer else { return rows }
         rows.append(SettingsRowItem(id: "removeSource", title: "Remove Source",
                                     kind: .action(destructive: true, handler: { vc in
             presentConfirm(on: vc, title: "Remove Source?",
@@ -856,6 +1099,8 @@ enum SettingsContent {
             // failure text must not survive leaving the flow.
             resetAddSourceFlow()
             reload()
+        case .plexServerPicker:
+            loadPlexServers(reload: reload)
         case .liveTVFavorites where LiveTVDataStore.shared.channels.isEmpty:
             // Settings can open before Live TV has loaded its channels.
             Task { @MainActor in

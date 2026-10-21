@@ -17,7 +17,7 @@ workflows:
         APP_STORE_APPLE_ID: 6756892857
       # Keep this the Xcode you build with locally; the GitHub build checks
       # read it. Older compilers time out type-checking code newer ones accept.
-      xcode: 27.0
+      xcode: 27.1
 
     triggering:
       events:
@@ -57,10 +57,26 @@ workflows:
             --create
 
       - name: Add certificates to keychain
-        script: keychain add-certificates
+        script: |
+          keychain add-certificates
+          rm -f "$CM_BUILD_DIR/cert_key.pem"
 
       - name: Apply fetched signing profiles to Xcode project
         script: xcode-project use-profiles
+
+      - name: Restore package traits dropped by use-profiles
+        script: python3 Scripts/restore-package-traits.py
+
+      - name: Generate Secrets.swift from env
+        script: |
+          cat > RivuletCore/Config/Secrets.swift <<EOF
+          import Foundation
+
+          enum Secrets {
+              static let sentryDSN = "${SENTRY_DSN:-}"
+          }
+          EOF
+          echo "Wrote RivuletCore/Config/Secrets.swift (dsn set: $([ -n "${SENTRY_DSN:-}" ] && echo yes || echo no))"
 
       - name: Set build number from the tag
         script: |
@@ -105,8 +121,7 @@ workflows:
             --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME" \
             --config Release \
-            --archive-xcargs "RIVULET_SENTRY_DSN=${SENTRY_DSN:-}" \
-            --archive-flags="-destination 'generic/platform=tvOS'"
+            --archive-flags="-destination 'generic/platform=tvOS' -onlyUsePackageVersionsFromResolvedFile"
 
       - name: Upload dSYMs to Sentry
         ignore_failure: true
@@ -115,7 +130,7 @@ workflows:
             echo "No SENTRY_AUTH_TOKEN set, skipping dSYM upload."
             exit 0
           fi
-          which sentry-cli >/dev/null 2>&1 || curl -sL https://sentry.io/get-cli/ | bash
+          which sentry-cli >/dev/null 2>&1 || brew install getsentry/tools/sentry-cli
           sentry-cli debug-files upload \
             --auth-token "$SENTRY_AUTH_TOKEN" \
             --org "$SENTRY_ORG" \
@@ -174,7 +189,7 @@ workflows:
         XCODE_PROJECT: "Rivulet.xcodeproj"
         BUNDLE_ID: "com.gstudios.rivulet"
         APP_STORE_APPLE_ID: 6756892857
-      xcode: 27.0
+      xcode: 27.1
 
     # Separate tag prefix from tvOS. The two platforms share one App Store
     # Connect record but ship independently, and a single `v*` tag firing both
@@ -215,10 +230,27 @@ workflows:
             --create
 
       - name: Add certificates to keychain
-        script: keychain add-certificates
+        script: |
+          keychain add-certificates
+          rm -f "$CM_BUILD_DIR/cert_key.pem"
 
       - name: Apply fetched signing profiles to Xcode project
         script: xcode-project use-profiles
+
+      - name: Restore package traits dropped by use-profiles
+        script: python3 Scripts/restore-package-traits.py
+
+      - name: Generate Secrets.swift from env
+        script: |
+          mkdir -p RivuletCore/Config
+          cat > RivuletCore/Config/Secrets.swift <<EOF
+          import Foundation
+
+          enum Secrets {
+              static let sentryDSN = "${SENTRY_DSN:-}"
+          }
+          EOF
+          echo "Wrote RivuletCore/Config/Secrets.swift (dsn set: $([ -n "${SENTRY_DSN:-}" ] && echo yes || echo no))"
 
       - name: Set build number from the tag
         script: |
@@ -250,8 +282,7 @@ workflows:
             --project "$XCODE_PROJECT" \
             --scheme "$XCODE_SCHEME" \
             --config Release \
-            --archive-xcargs "RIVULET_SENTRY_DSN=${SENTRY_DSN:-}" \
-            --archive-flags="-destination 'generic/platform=iOS'"
+            --archive-flags="-destination 'generic/platform=iOS' -onlyUsePackageVersionsFromResolvedFile"
 
       # Without this the in-app frames on iOS crash and app-hang events resolve
       # as <unknown>, which is what made RIVULET-41 unreadable on tvOS.
@@ -262,7 +293,7 @@ workflows:
             echo "No SENTRY_AUTH_TOKEN set, skipping dSYM upload."
             exit 0
           fi
-          which sentry-cli >/dev/null 2>&1 || curl -sL https://sentry.io/get-cli/ | bash
+          which sentry-cli >/dev/null 2>&1 || brew install getsentry/tools/sentry-cli
           sentry-cli debug-files upload \
             --auth-token "$SENTRY_AUTH_TOKEN" \
             --org "$SENTRY_ORG" \

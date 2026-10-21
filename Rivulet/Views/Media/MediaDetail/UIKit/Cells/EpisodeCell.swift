@@ -106,11 +106,11 @@ final class EpisodeCell: UIView {
     /// "description → thumb, thumb → pills" decision.
     var onFocusKindChanged: ((EpisodeFocusKind) -> Void)?
 
-    // ATV+ details rail: 410pt card slots with ~30pt gutters. Keeping the
-    // hosted view the same width as the compositional item avoids the airy
-    // effective 80pt gaps caused by a narrower inner view.
-    static let cardWidth: CGFloat = 436
-    static let thumbHeight: CGFloat = 245   // 16:9 at the detail rail width (ATV+ shows ~4 across)
+    // Four across on the grid. The cell is the resting artwork's width; the
+    // thumbnail card overhangs it by its focus reserve on both sides, so the
+    // focus engine lands cell edges, and with them the artwork, on the margin.
+    static let cardWidth = MediaRowMetrics.gridWidth(columns: 4)
+    static let thumbHeight: CGFloat = 245   // the card's frame, reserve included
     private static let cornerRadius: CGFloat = 16
 
     // MARK: - Subviews
@@ -177,7 +177,7 @@ final class EpisodeCell: UIView {
         // ContinueWatchingCell). The card draws its own rounded shape; the
         // contentView background is the placeholder grey behind the image.
         thumbnailCard.translatesAutoresizingMaskIntoConstraints = false
-        thumbnailCard.contentSize = CGSize(width: Self.cardWidth, height: Self.thumbHeight)
+        thumbnailCard.contentSize = CGSize(width: Self.cardWidth + MediaRowMetrics.focusGrowth, height: Self.thumbHeight)
         thumbnailCard.contentView.backgroundColor = UIColor(white: 0.15, alpha: 1)
         thumbnailCard.onSelect = { [weak self] in self?.onPlay?() }
         thumbnailCard.onFocusChange = { [weak self] focused, next, coordinator in
@@ -314,8 +314,8 @@ final class EpisodeCell: UIView {
             widthAnchor.constraint(equalToConstant: Self.cardWidth),
 
             thumbnailCard.topAnchor.constraint(equalTo: topAnchor),
-            thumbnailCard.leadingAnchor.constraint(equalTo: leadingAnchor),
-            thumbnailCard.trailingAnchor.constraint(equalTo: trailingAnchor),
+            thumbnailCard.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -MediaRowMetrics.focusGrowth / 2),
+            thumbnailCard.trailingAnchor.constraint(equalTo: trailingAnchor, constant: MediaRowMetrics.focusGrowth / 2),
             thumbnailCard.heightAnchor.constraint(equalToConstant: Self.thumbHeight),
 
             thumbnailImageView.topAnchor.constraint(equalTo: thumbnailCard.contentView.topAnchor),
@@ -436,8 +436,10 @@ final class EpisodeCell: UIView {
         // Thumbnail (async)
         imageToken &+= 1
         let token = imageToken
-        thumbnailImageView.image = nil
-        if let url = episode.artwork.thumbnail ?? episode.artwork.poster {
+        // A memory hit paints in this pass (no pop after the rail's fade).
+        let url = episode.artwork.thumbnail ?? episode.artwork.poster
+        thumbnailImageView.image = url.flatMap { ImageCacheManager.shared.cachedImage(for: $0) }
+        if let url, thumbnailImageView.image == nil {
             Task { [weak self] in
                 let image = await ImageCacheManager.shared.image(for: url)
                 await MainActor.run {
@@ -480,8 +482,9 @@ final class EpisodeCell: UIView {
 
         imageToken &+= 1
         let token = imageToken
-        thumbnailImageView.image = nil
-        if let url = trailer.artworkURL {
+        let url = trailer.artworkURL
+        thumbnailImageView.image = url.flatMap { ImageCacheManager.shared.cachedImage(for: $0) }
+        if let url, thumbnailImageView.image == nil {
             Task { [weak self] in
                 let image = await ImageCacheManager.shared.image(for: url)
                 await MainActor.run {

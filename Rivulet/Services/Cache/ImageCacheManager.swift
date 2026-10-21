@@ -26,14 +26,14 @@ enum ImageQuality: Sendable {
     /// Large surfaces that fill much of the screen: home hero, carousel, detail backdrops.
     case full
 
-    var maxPixelSize: CGFloat {
+    nonisolated var maxPixelSize: CGFloat {
         switch self {
         case .thumb: return 900
         case .full:  return 3840
         }
     }
 
-    fileprivate var keySuffix: String {
+    nonisolated fileprivate var keySuffix: String {
         switch self {
         case .thumb: return "t"
         case .full:  return "f"
@@ -64,8 +64,9 @@ actor ImageCacheManager: NSObject {
 
     // MARK: - Caches
 
-    private let memoryCache = NSCache<NSString, UIImage>()
-    private let keyCache = NSCache<NSString, NSString>()
+    // NSCache is thread-safe, which is what lets `cachedImage` be nonisolated.
+    nonisolated(unsafe) private let memoryCache = NSCache<NSString, UIImage>()
+    nonisolated(unsafe) private let keyCache = NSCache<NSString, NSString>()
     private var cacheMetadata: [String: ImageCacheEntry] = [:]
     private var metadataLoaded = false
 
@@ -86,7 +87,14 @@ actor ImageCacheManager: NSObject {
 
     // MARK: - Active Downloads (prevent duplicate byte fetches)
 
-    private var activeDownloads: [URL: Task<Data?, Never>] = [:]
+    /// A shared fetch, cancelled once every caller waiting on it is cancelled,
+    /// so tiles scrolled past do not queue ahead of the ones on screen.
+    private struct Download {
+        let id: UUID
+        let task: Task<Data?, Never>
+        var waiters: Int
+    }
+    private var activeDownloads: [URL: Download] = [:]
 
     // MARK: - Cache Directory
 
@@ -100,6 +108,8 @@ actor ImageCacheManager: NSObject {
     override private init() {
         super.init()
         memoryCache.countLimit = maxMemoryCacheCount
+        // By bytes too: 100 screen-sized bitmaps are several GB.
+        memoryCache.totalCostLimit = 400 * 1024 * 1024
         keyCache.countLimit = maxKeyCacheCount
         Task {
             await createCacheDirectoryIfNeeded()
@@ -115,13 +125,14 @@ actor ImageCacheManager: NSObject {
     // MARK: - Public API
 
     /// Check memory cache only (for instant display without loading state).
-    func cachedImage(for url: URL, quality: ImageQuality = .thumb) -> UIImage? {
+    /// Synchronous from any thread.
+    nonisolated func cachedImage(for url: URL, quality: ImageQuality = .thumb) -> UIImage? {
         memoryCache.object(forKey: memoryKey(diskKey: cacheKey(for: url), quality: quality))
     }
 
     /// Disk cache key (per URL). The on-disk file is the original downloaded bytes,
     /// independent of decode size, so the key does not include quality.
-    private func cacheKey(for url: URL) -> String {
+    nonisolated private func cacheKey(for url: URL) -> String {
         let urlKey = url.absoluteString as NSString
         if let cachedKey = keyCache.object(forKey: urlKey) {
             return cachedKey as String
@@ -133,8 +144,12 @@ actor ImageCacheManager: NSObject {
 
     /// Memory cache key (per URL *and* decode size). A poster shown as a small card and
     /// the same poster shown full-screen must not evict each other's decoded bitmap.
-    private func memoryKey(diskKey: String, quality: ImageQuality) -> NSString {
+    nonisolated private func memoryKey(diskKey: String, quality: ImageQuality) -> NSString {
         "\(diskKey)#\(quality.keySuffix)" as NSString
+    }
+
+    nonisolated private static func byteCost(_ image: UIImage) -> Int {
+        image.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
     }
 
     /// Get an image at the requested `quality`, decoded off the main thread.
@@ -158,7 +173,7 @@ actor ImageCacheManager: NSObject {
             }.value
 
             if let decoded {
-                memoryCache.setObject(decoded, forKey: memKey)
+                memoryCache.setObject(decoded, forKey: memKey, cost: Self.byteCost(decoded))
                 updateAccessTime(for: diskKey)
                 scheduleStaleRefresh(url: url, key: diskKey)
                 return decoded
@@ -169,7 +184,7 @@ actor ImageCacheManager: NSObject {
         guard let data = await fetchOriginalData(url: url, key: diskKey) else { return nil }
         let decoded = await decodeDownsampled(data: data, maxPixelSize: quality.maxPixelSize)
         if let decoded {
-            memoryCache.setObject(decoded, forKey: memKey)
+            memoryCache.setObject(decoded, forKey: memKey, cost: Self.byteCost(decoded))
         }
         return decoded
     }
@@ -289,15 +304,18 @@ actor ImageCacheManager: NSObject {
     /// Download the original image bytes, validate, persist to disk, and return them.
     /// Coalesced per-URL so concurrent requests share a single network fetch.
     private func fetchOriginalData(url: URL, key: String) async -> Data? {
-        if let existing = activeDownloads[url] {
-            return await existing.value
+        if var existing = activeDownloads[url] {
+            existing.waiters += 1
+            activeDownloads[url] = existing
+            return await wait(for: existing, url: url)
         }
 
+        let id = UUID()
         let task = Task<Data?, Never> { [weak self] in
             guard let self = self else { return nil }
 
             defer {
-                Task { await self.removeActiveDownload(for: url) }
+                Task { await self.removeActiveDownload(for: url, id: id) }
             }
 
             // Bounded retry: Plex's image/transcode endpoints transiently 5xx, time
@@ -345,6 +363,7 @@ actor ImageCacheManager: NSObject {
                     }
                     return nil
                 } catch {
+                    if Task.isCancelled { return nil }
                     // Network error / timeout — retryable.
                     print("💾 ImageCacheManager: Download failed for \(url.lastPathComponent) (attempt \(attempt + 1)/\(maxAttempts)): \(error.localizedDescription)")
                     if isLastAttempt { return nil }
@@ -355,12 +374,32 @@ actor ImageCacheManager: NSObject {
             return nil
         }
 
-        activeDownloads[url] = task
-        return await task.value
+        let download = Download(id: id, task: task, waiters: 1)
+        activeDownloads[url] = download
+        return await wait(for: download, url: url)
     }
 
-    private func removeActiveDownload(for url: URL) {
-        activeDownloads.removeValue(forKey: url)
+    private func wait(for download: Download, url: URL) async -> Data? {
+        await withTaskCancellationHandler {
+            await download.task.value
+        } onCancel: {
+            Task { await self.dropWaiter(for: url, id: download.id) }
+        }
+    }
+
+    private func dropWaiter(for url: URL, id: UUID) {
+        guard var download = activeDownloads[url], download.id == id else { return }
+        download.waiters -= 1
+        if download.waiters > 0 {
+            activeDownloads[url] = download
+        } else {
+            activeDownloads[url] = nil
+            download.task.cancel()
+        }
+    }
+
+    private func removeActiveDownload(for url: URL, id: UUID) {
+        if activeDownloads[url]?.id == id { activeDownloads[url] = nil }
     }
 
     // MARK: - Disk Operations
@@ -374,7 +413,7 @@ actor ImageCacheManager: NSObject {
 
             // Update metadata
             let entry = ImageCacheEntry(
-                url: url.absoluteString,
+                url: SensitiveDataRedactor.redact(url.absoluteString),  // written to Caches; no token on disk
                 cachedAt: Date(),
                 lastAccessedAt: Date(),
                 fileSize: Int64(data.count)
@@ -444,6 +483,15 @@ actor ImageCacheManager: NSObject {
 
         cacheMetadata = decoded
         metadataLoaded = true
+
+        // One-time scrub of tokens older builds wrote into the metadata file.
+        let tokenized = decoded.filter { $0.value.url.contains("Token=") && !$0.value.url.contains("Token=[redacted]") }
+        guard !tokenized.isEmpty else { return }
+        for (key, entry) in tokenized {
+            cacheMetadata[key] = ImageCacheEntry(url: SensitiveDataRedactor.redact(entry.url), cachedAt: entry.cachedAt,
+                                                 lastAccessedAt: entry.lastAccessedAt, fileSize: entry.fileSize)
+        }
+        saveMetadata()
     }
 
     private func saveMetadata() {
@@ -533,34 +581,12 @@ actor ImageCacheManager: NSObject {
 // MARK: - URLSessionDelegate (SSL Certificate Handling)
 
 extension ImageCacheManager: URLSessionDelegate {
-    /// Handle SSL certificate challenges for self-signed certificates (same as PlexNetworkManager)
+    /// The Plex server certificate rule (see `PlexCertificateDelegate.trustsServer`).
     nonisolated func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-
-        let host = challenge.protectionSpace.host
-        let port = challenge.protectionSpace.port
-
-        // Trust self-signed certificates for:
-        // - IP addresses (local Plex servers)
-        // - plex.direct domains
-        // - Port 32400 (default Plex port)
-        let isIPAddress = host.range(of: #"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$"#, options: .regularExpression) != nil
-        let isPlexDirect = host.hasSuffix(".plex.direct")
-        let isPlexPort = port == 32400
-
-        if isIPAddress || isPlexDirect || isPlexPort {
-            let credential = URLCredential(trust: serverTrust)
-            completionHandler(.useCredential, credential)
-        } else {
-            completionHandler(.performDefaultHandling, nil)
-        }
+        PlexCertificateDelegate.answer(challenge, completionHandler: completionHandler)
     }
 }

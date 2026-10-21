@@ -30,9 +30,11 @@ final class JellyfinDataStore: ObservableObject {
     @Published private(set) var homeRows: CachedHomeRail = []
     @Published private(set) var isLoading = false
 
-    /// Video libraries only. Music and photo libraries render through
-    /// Plex-only views; they join when those views take a provider.
-    static let browsableKinds: Set<MediaLibrary.LibraryKind> = [.movies, .shows, .mixed]
+    /// Video, photo and music libraries.
+    static let browsableKinds: Set<MediaLibrary.LibraryKind> = [.movies, .shows, .mixed, .photos, .music]
+
+    /// Libraries with a Recently Added row. Photo and music tiles would open the video detail.
+    static let homeRowKinds: Set<MediaLibrary.LibraryKind> = [.movies, .shows, .mixed]
 
     private var loadTask: Task<Void, Never>?
     private var refreshObserver: NSObjectProtocol?
@@ -41,7 +43,7 @@ final class JellyfinDataStore: ObservableObject {
         guard observesRefresh else { return }
         // Before the first sidebar render, so a Jellyfin-only launch never
         // flashes the signed-out welcome.
-        account = JellyfinSession.account
+        account = PlexUserProfileManager.shared.isRestrictedProfile ? nil : JellyfinSession.account
         // Watch-state changes (detail page, tile menus, playback) post this.
         refreshObserver = NotificationCenter.default.addObserver(
             forName: .plexDataNeedsRefresh, object: nil, queue: .main
@@ -93,7 +95,9 @@ final class JellyfinDataStore: ObservableObject {
         loadTask?.cancel()
         // Assigned only on change: Plex-only users reach here on every launch,
         // foreground and watch-state change, and each publish redraws Home.
-        update(\.account, JellyfinSession.account)
+        update(\.account, PlexUserProfileManager.shared.isRestrictedProfile ? nil : JellyfinSession.account)
+        // The server's Live TV follows the account into and out of Live TV.
+        JellyfinLiveTVProvider.sync(account.flatMap { MediaProviderRegistry.shared.provider(for: $0.providerID) } as? JellyfinProvider)
         guard let account,
               let provider = MediaProviderRegistry.shared.provider(for: account.providerID) else {
             update(\.libraries, [])
@@ -122,7 +126,7 @@ final class JellyfinDataStore: ObservableObject {
         }
         let browsable = fetched.filter { Self.browsableKinds.contains($0.kind) }
         var recent: [CachedHomeHub] = []
-        for library in browsable {
+        for library in browsable where Self.homeRowKinds.contains(library.kind) {
             let suffix = "|\(library.id).recentlyAdded"
             do {
                 if let hub = try await provider.recentlyAddedHub(in: library) { recent.append(Self.row(hub)) }

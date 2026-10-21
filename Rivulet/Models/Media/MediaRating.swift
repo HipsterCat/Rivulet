@@ -24,7 +24,8 @@ nonisolated struct MediaRating: Sendable, Hashable {
     /// Nil for a missing or zero score: Plex, Jellyfin and TMDB all send 0
     /// for "no score yet".
     init?(_ value: Double?, source: Source) {
-        guard let value, value > 0 else { return nil }
+        // Server-supplied: a NaN or huge value would trap the badge's Int conversion.
+        guard let value, value > 0, value <= 100 else { return nil }
         self.value = value
         self.source = source
     }
@@ -42,9 +43,6 @@ nonisolated struct MediaRating: Sendable, Hashable {
             ? "\(Int((value * 10).rounded()))%"
             : String(format: "%.1f", value)
     }
-
-    /// Star glyph beside the badge. A percent with a star reads as an average.
-    var showsStar: Bool { source != .rottenTomatoes }
 
     /// Prose form for text that describes the score.
     var summary: String {

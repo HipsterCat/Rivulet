@@ -47,12 +47,14 @@ enum CrossfadeOption: String, CaseIterable, Hashable, CustomStringConvertible {
 enum SettingsPage: Hashable, CaseIterable {
     case root
     case appearance, playback, music, liveTV, servers, about
-    case plex, jellyfin, iptv, libraries, cache
+    case plex, plexServerPicker, jellyfin, iptv, libraries, cache
     case homeRows
     case liveTVSourceDetail, liveTVFavorites
-    case addLiveTVSource, addOwnServer, addPlaylistURL
-    case displaySizePicker, autoplayCountdownPicker, skipIntervalPicker
+    case addLiveTVSource, addXtream, addOwnServer, addPlaylistURL
+    case displaySizePicker, autoplayCountdownPicker, skipIntervalPicker, skipBackIntervalPicker
+    case heightSpeakersPicker, subtitleModePicker, autoplayLimitPicker
     case homeQualityPicker, awayQualityPicker
+    case audioLanguagePicker, subtitleLanguagePicker
     case contentFilter, contentFilterStrength
 
     var title: String {
@@ -65,11 +67,13 @@ enum SettingsPage: Hashable, CaseIterable {
         case .servers: return "Servers"
         case .about: return "About"
         case .plex: return "Plex Server"
+        case .plexServerPicker: return "Server"
         case .jellyfin: return "Jellyfin Server"
         case .iptv: return "Live TV Sources"
         case .liveTVSourceDetail: return "Source Details"
         case .liveTVFavorites: return "Favorites"
         case .addLiveTVSource: return "Add a Source"
+        case .addXtream: return "Xtream Codes"
         case .addOwnServer: return "My Own Server"
         case .addPlaylistURL: return "Playlist URL"
         case .libraries: return "Sidebar Libraries"
@@ -77,9 +81,15 @@ enum SettingsPage: Hashable, CaseIterable {
         case .cache: return "Cache & Storage"
         case .displaySizePicker: return "Display Size"
         case .autoplayCountdownPicker: return "Autoplay Countdown"
-        case .skipIntervalPicker: return "Skip Length"
+        case .skipIntervalPicker: return "Skip Forward Length"
+        case .skipBackIntervalPicker: return "Skip Back Length"
+        case .heightSpeakersPicker: return "Height Speakers"
+        case .subtitleModePicker: return "Subtitles"
+        case .autoplayLimitPicker: return "Autoplay Limit"
         case .homeQualityPicker: return "Home Streaming"
         case .awayQualityPicker: return "Away Streaming"
+        case .audioLanguagePicker: return "Audio Language"
+        case .subtitleLanguagePicker: return "Subtitle Language"
         case .contentFilter: return "Content Filtering"
         case .contentFilterStrength: return "Profanity Strength"
         }
@@ -104,6 +114,28 @@ enum AutoplayCountdown: Int, CaseIterable, CustomStringConvertible {
     }
 }
 
+// MARK: - Autoplay Limit
+
+/// Episodes that may play in a row before Up Next waits for the remote.
+enum AutoplayLimit: Int, CaseIterable, CustomStringConvertible {
+    case off = 0
+    case two = 2
+    case three = 3
+    case four = 4
+    case five = 5
+
+    static let storageKey = "autoplayLimit"
+
+    static var current: AutoplayLimit {
+        AutoplayLimit(rawValue: UserDefaults.standard.integer(forKey: storageKey)) ?? .off
+    }
+
+    var description: String { self == .off ? "Off" : "\(rawValue) Episodes" }
+
+    /// Whether Up Next may count down after `count` episodes in a row.
+    func allowsAutoplay(afterEpisodesInARow count: Int) -> Bool { self == .off || count < rawValue }
+}
+
 // MARK: - Skip Length
 
 /// Single Left/Right tap-skip length (seconds). Drives `InputConfig.tapSeekSeconds`.
@@ -117,6 +149,8 @@ enum SkipInterval: Int, CaseIterable, CustomStringConvertible {
 
     /// UserDefaults key backing the Skip Length setting.
     static let storageKey = "skipSeconds"
+    /// Backs Skip Back Length; unset means "same as forward".
+    static let backStorageKey = "skipBackSeconds"
     static let defaultValue: SkipInterval = .thirtySeconds
 
     var description: String { "\(rawValue) seconds" }

@@ -120,7 +120,7 @@ struct GuideLayoutView: View {
     }
 
     /// Timeline width in minutes, tracking the loaded EPG window so the grid
-    /// grows as `extendEPG` pulls more programming. Floors at the initial load
+    /// grows as the store fills in more programming. Floors at the initial load
     /// so the first paint has room, and never runs past the placeholder ceiling.
     private var totalMinutes: Int {
         let floor = EPGTheme.initialGuideHours * 60
@@ -260,9 +260,6 @@ struct GuideLayoutView: View {
                     focusedProgram = program ?? channel.flatMap { dataStore.getCurrentProgram(for: $0) }
                 },
                 onSelect: { channel, _ in selectChannel(channel) },
-                onNeedMore: {
-                    Task { await dataStore.extendEPG(byHours: EPGTheme.lazyLoadChunkHours) }
-                },
                 transparent: true,                 // dark see-through boxes + rounded clipping
                 // Reserve the info bar + category bar above the ruler.
                 topInset: EPGTheme.infoBarHeight + EPGTheme.categoryBarHeight,
@@ -507,6 +504,9 @@ struct GuideLayoutView: View {
         vc.onOpenMultiview = { session in
             presentMultiview(adopting: session, adding: nil, fromPlayer: true)
         }
+        vc.onWatchWithScores = { [weak vc] in
+            vc?.openMultiview { presentMultiview(adopting: $0, adding: nil, fromPlayer: true, scores: true) }
+        }
         vc.onDismiss = { lastChannel in
             // The viewer may have changed channels in the player; land on the
             // one that was on screen, at the programme airing now.
@@ -523,7 +523,7 @@ struct GuideLayoutView: View {
     /// `fromPlayer`: the full-screen player just closed without animation, and
     /// multiview takes over its picture (see `entersFromFullScreen`).
     private func presentMultiview(adopting session: LiveTVSessionHandoff?, adding channel: UnifiedChannel?,
-                                  fromPlayer: Bool = false) {
+                                  fromPlayer: Bool = false, scores: Bool = false) {
         guard let top = LiveProgramMenu.topViewController() else {
             session?.stop()
             return
@@ -531,6 +531,7 @@ struct GuideLayoutView: View {
         let multiview = LiveMultiviewViewController(adopting: session, adding: channel,
                                                     sourceIdFilter: sourceIdFilter)
         multiview.entersFromFullScreen = fromPlayer
+        multiview.startsWithScores = scores
         multiview.onWatchFullScreen = { session in
             guard let top = LiveProgramMenu.topViewController() else {
                 session.stop()

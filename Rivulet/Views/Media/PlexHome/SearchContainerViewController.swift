@@ -17,11 +17,7 @@
 //  focus fell through to the content underneath. Do not reintroduce
 //  `.searchable` here; it is not a styling choice, it is the bug.
 //
-//  It lives outside `UIKit/` on purpose: the music hand-off hosts a SwiftUI
-//  detail, and `Views/**/UIKit/**` is the path the no-SwiftUI lint rule scans.
-//
 
-import SwiftUI
 import UIKit
 
 final class SearchContainerViewController: UIViewController {
@@ -111,7 +107,16 @@ final class SearchContainerViewController: UIViewController {
 
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
-        guard preferredHalf == .keyboard else { return [results] }
+        guard preferredHalf == .keyboard else {
+            // Coming back from outside the page (the sidebar): the tile focus left.
+            // The page has not scrolled meanwhile, so the view is still that tile.
+            if let tile = lastResultsFocus, tile.window != nil,
+               let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView,
+               !focused.isDescendant(of: view) {
+                return [tile, results]
+            }
+            return [results]
+        }
         // ORDER matters, and both entries are load-bearing.
         //
         // The container alone is not enough. `results` IS the search
@@ -134,31 +139,11 @@ final class SearchContainerViewController: UIViewController {
 
     // MARK: - Music hand-off
 
-    /// Artists and albums open the SwiftUI music detail; tracks play directly
-    /// and are intercepted in the results controller, never reaching here.
+    /// Artists and albums open the Music pages; tracks play directly and are
+    /// intercepted in the results controller, never reaching here.
     private func presentMusicDetail(_ meta: PlexMetadata) {
-        let kind: MusicSearchDetailRouter.Kind
-        switch meta.type {
-        case "artist": kind = .artist
-        case "album": kind = .album
-        default: return
-        }
-
-        // The stack is what the pushed album/artist detail navigates within, so
-        // Menu inside it pops as it always did. `onExitCommand` sits on the
-        // ROOT view only, so it fires just when there is nothing left to pop.
-        let root = NavigationStack {
-            MusicSearchDetailRouter(plexMeta: meta, kind: kind)
-                .onExitCommand { [weak self] in
-                    self?.dismiss(animated: true)
-                }
-        }
-        .environment(MusicProviderRegistry.shared)
-
-        let host = UIHostingController(rootView: root)
-        host.modalPresentationStyle = .fullScreen
-        reportNested(true)
-        present(host, animated: true)
+        guard meta.type == "artist" || meta.type == "album" else { return }
+        if MusicPresenter.showDetail(for: meta, from: self) { reportNested(true) }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -186,10 +171,22 @@ final class SearchContainerViewController: UIViewController {
 
     // MARK: - Keyboard ⇄ results hand-off
 
-    /// Which half of the page the next focus REQUEST should aim at. Only the
-    /// press hand-off below writes it, so it always reflects a deliberate move.
+    /// Which half of the page the next focus REQUEST should aim at. Written by
+    /// the press hand-off below, and by `didUpdateFocus` for the engine's own moves.
     private enum Half { case keyboard, results }
     private var preferredHalf: Half = .keyboard
+    private weak var lastResultsFocus: UIView?
+
+    /// Follow the engine's own moves, so Right out of the sidebar returns to
+    /// the half focus left. Focus leaving the page (the sidebar) changes nothing.
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        guard let next = context.nextFocusedView, next.isDescendant(of: view) else { return }
+        let inResults = next.isDescendant(of: results.view)
+        preferredHalf = inResults ? .results : .keyboard
+        if inResults { lastResultsFocus = next }
+    }
 
     /// Re-expand the collapsed keyboard.
     ///

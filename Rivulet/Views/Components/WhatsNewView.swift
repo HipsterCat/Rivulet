@@ -149,6 +149,56 @@ struct WhatsNewView: View {
     // MARK: - Changelog Data
 
     static let changelogs: [(version: String, features: [String])] = [
+        ("1.1.0 (102)", [
+            "Added Jellyfin music libraries.",
+            "Added Jellyfin Live TV. Plex and Jellyfin Live TV now show up automatically.",
+            "Live TV guide now loads days ahead and stays up to date.",
+            "Fixed Atmos and DTS:X height channels not working.",
+            "Fixed full Dolby Vision for Profile 7 FEL titles not turning on.",
+            "Height Speakers now opens a list to pick your speaker layout.",
+        ]),
+        ("1.1.0 (101)", [
+            "Fixed the empty Enhance Dialogue levels menu on titles with many audio tracks.",
+        ]),
+        ("1.1.0 (100)", [
+            "Added folder view.",
+            "Added delete to the long press menu.",
+            "Added audio and subtitle language options to Settings.",
+            "Switch Plex servers in Settings without signing out.",
+            "New welcome screen.",
+            "If you only use Live TV, Rivulet opens straight to it.",
+            "Added Xtream Codes sources to Live TV.",
+            "Added Enhance Dialogue levels to the audio menu.",
+            "Atmos and DTS:X height channels, in Settings under Playback.",
+            "UI tweaks.",
+            "Updated AetherEngine to 7.44.0",
+        ]),
+        ("1.1.0 (98)", [
+            "Full Dolby Vision for Profile 7 FEL titles on Dolby Vision TVs.",
+            "Fixed the white edge on Continue Watching corners when a card is selected.",
+            "Updated AetherEngine to 7.39.0",
+        ]),
+        ("1.1.0 (97)", [
+            "New scores for Live TV games. Very pleased with this. Access them from a sports match in the \"Scores\" button below the scrubber.",
+            "New scores layout in Multiview when viewing a sports match.",
+            "Up Next is now a dismissable glass card.",
+            "Search and download subtitles from the menu.",
+            "Added autoplay limit (passout protection).",
+            "App attestation bug fix.",
+            "Fixed: text subtitles on transcoded playback keep original style.",
+        ]),
+        ("1.1.0 (96)", [
+            "Lots of improvements for Music libraries! Really happy about it.",
+            "Initial support for photo libraries.",
+            "Apple's Vision places title logos on Continue Watching, Top Shelf and Pause.",
+            "Better library grid scrolling.",
+            "Improved Search.",
+            "Improved Content Filtering (still a work in progress).",
+            "Separate Skip Back and Skip Forward settings.",
+            "Plex Live TV guide loads on slow servers.",
+            "Fixed Top Shelf buttons not opening the item.",
+            "Other bug fixes.",
+        ]),
         ("1.0.7 (95)", [
             "Cast page improvements.",
             "Subtitles turn on briefly when you skip back.",

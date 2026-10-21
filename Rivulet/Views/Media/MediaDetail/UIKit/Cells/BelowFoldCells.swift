@@ -203,8 +203,8 @@ final class TrailerCollectionCell: UICollectionViewCell {
 
         imageToken &+= 1
         let token = imageToken
-        imageView.image = nil
-        guard let url = trailer.artworkURL else { return }
+        imageView.image = trailer.artworkURL.flatMap { ImageCacheManager.shared.cachedImage(for: $0) }
+        guard let url = trailer.artworkURL, imageView.image == nil else { return }
         Task { [weak self] in
             let image = await ImageCacheManager.shared.image(for: url)
             await MainActor.run {
@@ -306,7 +306,9 @@ final class BelowFoldSectionHeader: UICollectionReusableView {
 /// the rail's focus order is unchanged.
 final class SeasonDividerCell: UICollectionViewCell {
     static let reuseID = "SeasonDividerCell"
-    static let cardWidth: CGFloat = 100
+    /// Wide enough that the chip is fully off screen when the next season's
+    /// first episode rests on the 80 pt margin.
+    static let cardWidth: CGFloat = 140
 
     private let topLine = UIView()
     private let bottomLine = UIView()

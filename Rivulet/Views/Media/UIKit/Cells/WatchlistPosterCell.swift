@@ -7,7 +7,7 @@
 //
 //  Poster tile for the Watchlist hub row on the UIKit home. Mirrors
 //  SwiftUI `WatchlistTile` (`WatchlistHubRow.swift:237-290`):
-//   - 260x390 frame, 16pt rounded-rect mask, .continuous corner curve
+//   - poster image surface, 20pt rounded-rect mask, .continuous corner curve
 //   - no resting drop shadow (ATV+ ref: cards float clean over the background)
 //   - `.hoverEffect(.highlight)` approximated via `TVPosterView` focus motion
 //   - placeholder when no posterURL: dark gradient + film/tv SF symbol
@@ -35,8 +35,10 @@ final class WatchlistPosterCell: UICollectionViewCell {
 
     private var imageLoadTask: Task<Void, Never>?
     private var currentURL: URL?
+    /// True once real artwork is showing; `posterView.image` is never nil.
+    private var hasArtwork = false
 
-    private let cornerRadius: CGFloat = 16
+    private let cornerRadius: CGFloat = 20
     private let posterWidth: CGFloat = MediaRowMetrics.posterWidth
     private let posterHeight: CGFloat = MediaRowMetrics.posterHeight
 
@@ -55,6 +57,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
         // page background; see Docs/atv_ref/below_home_hero_ref.md).
 
         posterView.translatesAutoresizingMaskIntoConstraints = false
+        posterView.image = PosterCell.blankArtwork
         contentView.addSubview(posterView)
 
         // Placeholder underlay (dark gradient + centred SF symbol). Visible
@@ -86,10 +89,10 @@ final class WatchlistPosterCell: UICollectionViewCell {
             posterView.widthAnchor.constraint(equalToConstant: posterWidth),
             posterView.heightAnchor.constraint(equalToConstant: posterHeight),
 
-            placeholderView.topAnchor.constraint(equalTo: posterView.topAnchor),
-            placeholderView.bottomAnchor.constraint(equalTo: posterView.bottomAnchor),
-            placeholderView.leadingAnchor.constraint(equalTo: posterView.leadingAnchor),
-            placeholderView.trailingAnchor.constraint(equalTo: posterView.trailingAnchor),
+            placeholderView.topAnchor.constraint(equalTo: posterView.imageView.topAnchor),
+            placeholderView.bottomAnchor.constraint(equalTo: posterView.imageView.bottomAnchor),
+            placeholderView.leadingAnchor.constraint(equalTo: posterView.imageView.leadingAnchor),
+            placeholderView.trailingAnchor.constraint(equalTo: posterView.imageView.trailingAnchor),
 
             placeholderIcon.centerXAnchor.constraint(equalTo: placeholderView.centerXAnchor),
             placeholderIcon.centerYAnchor.constraint(equalTo: placeholderView.centerYAnchor),
@@ -128,7 +131,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
         imageLoadTask?.cancel()
         imageLoadTask = nil
         currentURL = nil
-        posterView.image = nil
+        clearArtwork()
         placeholderView.isHidden = false
         placeholderIcon.image = nil
     }
@@ -138,17 +141,25 @@ final class WatchlistPosterCell: UICollectionViewCell {
         // Update the placeholder icon regardless of whether we have a URL.
         placeholderIcon.image = failureIcon
         guard let url else {
-            posterView.image = nil
+            clearArtwork()
             currentURL = nil
             // No URL: show placeholder (no fade-out animation needed).
             placeholderView.isHidden = false
             return
         }
-        if currentURL == url, posterView.image != nil {
+        if currentURL == url, hasArtwork {
             placeholderView.isHidden = true
             return
         }
         currentURL = url
+        // Memory hit paints in this pass, so a tile realized for the carousel
+        // exit has artwork to fly to.
+        if let cached = ImageCacheManager.shared.cachedImage(for: url) {
+            posterView.image = cached
+            hasArtwork = true
+            placeholderView.isHidden = true
+            return
+        }
         placeholderView.isHidden = false  // visible while loading
         let key = url.absoluteString as AnyHashable
         imageLoadTask = Task { [weak self] in
@@ -159,6 +170,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
                 guard let self, self.currentURL == url else { return }
                 if let image {
                     self.posterView.image = image
+                    self.hasArtwork = true
                     self.placeholderView.isHidden = true
                 } else {
                     // Load failed: keep placeholder visible.
@@ -166,6 +178,11 @@ final class WatchlistPosterCell: UICollectionViewCell {
                 }
             }
         }
+    }
+
+    private func clearArtwork() {
+        posterView.image = PosterCell.blankArtwork
+        hasArtwork = false
     }
 
     /// MediaItem failure icon -- maps MediaKind to a system image name.
@@ -182,6 +199,12 @@ final class WatchlistPosterCell: UICollectionViewCell {
         return UIImage(systemName: name)?
             .withConfiguration(UIImage.SymbolConfiguration(pointSize: 32, weight: .light))
     }
+}
+
+extension WatchlistPosterCell: PreviewSourceTile {
+    var previewArtworkView: UIView { posterView.imageView }
+    var previewCornerRadius: CGFloat { cornerRadius }
+    var previewArtworkLoaded: Bool { hasArtwork }
 }
 
 #if DEBUG
@@ -203,3 +226,4 @@ import SwiftUI
     .background(.black)
 }
 #endif
+

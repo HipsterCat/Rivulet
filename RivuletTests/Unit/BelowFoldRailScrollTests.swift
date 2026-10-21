@@ -19,7 +19,7 @@ import UIKit
 final class BelowFoldRailScrollTests: XCTestCase {
 
     private let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
-    private let railGap: CGFloat = 16
+    private let railGap = BelowFoldCollectionView.episodeGap
     /// Enough episodes that season 2's first card can sit at the leading edge
     /// without the scroller clamping at the end of the rail.
     private let episodesPerSeason = 8
@@ -59,6 +59,33 @@ final class BelowFoldRailScrollTests: XCTestCase {
         view.scrollEpisodesToSeason(seasonRefID: "s1")
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.6))
         XCTAssertEqual(scroller.contentOffset.x, rest, accuracy: 2)
+    }
+
+    /// The carousel peek's load reports when its episodes are in (the rail's
+    /// fade waits on that), and a different show empties the rail at once.
+    func test_episodesOnlyLoadReportsAppliedAndClearsForANewShow() throws {
+        let stub = StubMediaProvider()
+        for show in ["a", "b"] {
+            stub.episodesByShow[show] = (1...3).map { item("\(show)\($0)", .episode, parent: "s", season: 1, episode: $0) }
+        }
+        MediaProviderRegistry.shared.register(stub)
+        defer { MediaProviderRegistry.shared.unregister(providerID: stub.id) }
+
+        let view = BelowFoldCollectionView(frame: screen)
+        let collection = try XCTUnwrap(view.subviews.compactMap { $0 as? UICollectionView }.first)
+
+        let applied = expectation(description: "episodes applied")
+        view.configureEpisodesOnly(item: item("a", .show, parent: nil))
+        XCTAssertTrue(view.isLoadingEpisodes)
+        view.onEpisodesApplied = { applied.fulfill() }
+        wait(for: [applied], timeout: 3)
+        XCTAssertFalse(view.isLoadingEpisodes)
+        XCTAssertEqual(collection.numberOfSections, 1)
+        XCTAssertEqual(collection.numberOfItems(inSection: 0), 3)
+
+        view.configureEpisodesOnly(item: item("b", .show, parent: nil))
+        XCTAssertEqual(collection.numberOfSections, 0, "the previous show's episodes stayed under the next card")
+        XCTAssertTrue(view.isLoadingEpisodes)
     }
 
     /// The compositional layout's orthogonal section scrolls in its own embedded

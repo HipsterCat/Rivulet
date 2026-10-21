@@ -14,6 +14,8 @@ import SwiftUI
 struct ProfilePickerOverlay: View {
     @StateObject private var profileManager = PlexUserProfileManager.shared
     @Binding var isPresented: Bool
+    /// Called when a profile was entered, just before the picker closes.
+    var onSelected: () -> Void = {}
 
     @State private var selectedUserForPin: PlexHomeUser?
     @State private var showPinEntry = false
@@ -59,6 +61,14 @@ struct ProfilePickerOverlay: View {
                 }
                 .padding(.horizontal, 120)
 
+                // The profile list did not load (plex.tv unreachable): nothing to pick yet.
+                if profileManager.homeUsers.isEmpty {
+                    Button("Try Again") {
+                        Task { await profileManager.fetchHomeUsers() }
+                    }
+                    .disabled(profileManager.isLoadingUsers)
+                }
+
                 Spacer()
             }
         }
@@ -80,6 +90,10 @@ struct ProfilePickerOverlay: View {
                 )
             }
         }
+        // The picker is a gate (launch setting, or content withheld): Menu must
+        // not close it. Swallowing the exit command also keeps tvOS from
+        // dismissing the cover. The PIN sheet handles its own Menu.
+        .onExitCommand {}
         .onAppear {
             // Focus first profile
             if let first = profileManager.homeUsers.first {
@@ -106,7 +120,7 @@ struct ProfilePickerOverlay: View {
                     if success {
                         isLoading = false
                         selectedUserForPin = nil
-                        isPresented = false
+                        finish()
                     } else {
                         isLoading = false
                         // Show PIN entry with error if PIN was invalid
@@ -127,10 +141,15 @@ struct ProfilePickerOverlay: View {
                 isLoading = false
                 selectedUserForPin = nil
                 if success {
-                    isPresented = false
+                    finish()
                 }
             }
         }
+    }
+
+    private func finish() {
+        onSelected()
+        isPresented = false
     }
 
     private func verifyAndSwitch(user: PlexHomeUser, pin: String, rememberPin: Bool) async {
@@ -145,7 +164,7 @@ struct ProfilePickerOverlay: View {
             }
             showPinEntry = false
             selectedUserForPin = nil
-            isPresented = false
+            finish()
         } else {
             pinEntryError = "Incorrect PIN. Please try again."
         }

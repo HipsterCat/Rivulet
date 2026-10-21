@@ -23,19 +23,9 @@ struct LiveTVConnectError: LocalizedError, Equatable {
     static func source(_ message: String) -> LiveTVConnectError {
         LiveTVConnectError(title: "Couldn't Add Source", message: message)
     }
-
-    static func plex(_ message: String) -> LiveTVConnectError {
-        LiveTVConnectError(title: "Couldn't Add Plex Live TV", message: message)
-    }
 }
 
 struct LiveTVSourceConnector {
-    struct PlexRequest {
-        let serverURL: String
-        let token: String
-        let serverName: String
-    }
-
     struct ServerRequest {
         let baseURL: URL
         let channelProfile: String?
@@ -49,6 +39,11 @@ struct LiveTVSourceConnector {
         let epgURL: URL?
     }
 
+    struct XtreamRequest {
+        let account: XtreamAccount
+        let service: XtreamService
+    }
+
     static let defaultServerName = "Live TV"
     static let defaultPlaylistName = "IPTV"
 
@@ -57,28 +52,6 @@ struct LiveTVSourceConnector {
 
     init(session: URLSession? = nil) {
         self.session = session
-    }
-
-    // MARK: Plex
-
-    static func plexRequest() throws -> PlexRequest {
-        let auth = PlexAuthManager.shared
-        guard let serverURL = auth.selectedServerURL,
-              let token = auth.selectedServerToken,
-              let serverName = auth.savedServerName else {
-            throw LiveTVConnectError.plex("Plex server is not connected.")
-        }
-        return PlexRequest(serverURL: serverURL, token: token, serverName: serverName)
-    }
-
-    func connect(_ request: PlexRequest) async throws {
-        guard await PlexLiveTVProvider.checkAvailability(serverURL: request.serverURL, authToken: request.token) else {
-            throw LiveTVConnectError.plex("No DVR or tuners are set up on this Plex server.")
-        }
-        let store = LiveTVDataStore.shared
-        await store.addPlexSource(provider: PlexLiveTVProvider(serverURL: request.serverURL, authToken: request.token,
-                                                               serverName: request.serverName))
-        await Self.load(store)
     }
 
     // MARK: Own server (Dispatcharr)
@@ -171,6 +144,58 @@ struct LiveTVSourceConnector {
         await store.addM3USource(m3uURL: request.m3uURL, epgURL: request.epgURL,
                                  name: name.isEmpty ? Self.defaultPlaylistName : name)
         await Self.load(store)
+    }
+
+    // MARK: Xtream Codes
+
+    /// A login pasted into the address (a provider's `get.php` link) fills in
+    /// whatever the username and password fields left empty.
+    func xtreamRequest(address: String, username: String, password: String) throws -> XtreamRequest {
+        guard !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LiveTVConnectError.source("Enter your provider's server address first.")
+        }
+        let parsed = XtreamService.parseAddress(address)
+        let username = username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? parsed.username ?? "" : username.trimmingCharacters(in: .whitespacesAndNewlines)
+        let password = password.isEmpty ? parsed.password ?? "" : password
+        guard !username.isEmpty, !password.isEmpty else {
+            throw LiveTVConnectError.source("Enter the username and password from your provider.")
+        }
+        guard let server = URL(string: parsed.server), server.host != nil else {
+            throw LiveTVConnectError.source("That address doesn't look right. Check it and try again.")
+        }
+        let account = XtreamAccount(server: server, username: username, password: password)
+        return XtreamRequest(account: account, service: XtreamService(account: account, session: session))
+    }
+
+    func connect(_ request: XtreamRequest, name: String) async throws {
+        do {
+            let info = try await request.service.verify()
+            let channels = try await request.service.fetchChannels(
+                format: XtreamService.streamFormat(allowed: info.allowedFormats))
+            guard !channels.isEmpty else {
+                throw LiveTVConnectError.source("Signed in, but this account has no live channels.")
+            }
+        } catch let error as LiveTVConnectError {
+            throw error
+        } catch {
+            throw LiveTVConnectError.source(Self.xtreamFailureCopy(for: error))
+        }
+        let store = LiveTVDataStore.shared
+        await store.addXtreamSource(account: request.account, name: name.isEmpty ? Self.defaultPlaylistName : name)
+        await Self.load(store)
+    }
+
+    static func xtreamFailureCopy(for error: Error) -> String {
+        switch error as? XtreamError {
+        case .invalidLogin: "The server didn't accept that username and password."
+        case .expired: "This account has expired. Contact your provider to renew it."
+        case .banned: "Your provider has blocked this account."
+        case .disabled: "This account is turned off. Contact your provider."
+        case .notXtream: "That address isn't an Xtream Codes server. Check the address and port."
+        case .refused(let reason): "The server said: \(reason)"
+        case .httpError, nil: failureCopy(for: error)
+        }
     }
 
     // MARK: Shared

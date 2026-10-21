@@ -29,6 +29,12 @@ enum SettingsDescriptorStore {
         if id.hasPrefix("pinnedCollection_") { return descriptors["pinnedCollection"] }
         if id.hasPrefix("fav_") { return descriptors["liveTVFavoriteRow"] }
         if id.hasPrefix("sq_") { return descriptors["streamingQualityOption"] }
+        if id.hasPrefix("al_") { return descriptors["audioLanguage"] }
+        if id.hasPrefix("sl_") { return descriptors["subtitleLanguage"] }
+        if id.hasPrefix("hs_") { return descriptors["heightSpeakers"] }
+        if id.hasPrefix("sm_") { return descriptors["subtitleMode"] }
+        if id.hasPrefix("alim_") { return descriptors["autoplayLimit"] }
+        if id.hasPrefix("plexServer_") { return descriptors["plexServerOption"] }
         return nil
     }
 
@@ -158,13 +164,41 @@ enum SettingsDescriptorStore {
             icon: "dial.medium",
             description: "Original plays the file untouched. Auto measures your connection and converts only when the file will not fit. A fixed rate converts anything above it; converted video plays without HDR, Dolby Vision or Atmos."
         ),
+        "audioLanguage": SettingDescriptor(
+            icon: "waveform",
+            description: "The audio track to play when a title has several. Original plays the file's main track, so foreign films and anime keep their own language. Picking a track in the player also changes this."
+        ),
+        "subtitleMode": SettingDescriptor(
+            icon: "captions.bubble",
+            description: "Foreign Audio shows subtitles when the audio is not in your subtitle language, and forced subtitles for foreign lines otherwise. Always shows them on every title. Picking a track in the player also changes this."
+        ),
+        "subtitleLanguage": SettingDescriptor(
+            icon: "globe",
+            description: "The language subtitles are shown in."
+        ),
+        "subtitleSDH": SettingDescriptor(
+            icon: "ear",
+            description: "Prefers subtitles for the deaf and hard of hearing, which also describe sounds and name who is speaking."
+        ),
+        "heightSpeakers": SettingDescriptor(
+            icon: "hifispeaker.2",
+            description: "Keeps the height channels of Dolby TrueHD Atmos and DTS:X soundtracks, in a lossy format. Off plays lossless 7.1 without them. DTS:X needs 7.1.4 or 9.1.6."
+        ),
         "autoplayCountdown": SettingDescriptor(
             icon: "forward.end.alt",
             description: "How long to wait before automatically playing the next episode. Set to Off to disable autoplay."
         ),
+        "autoplayLimit": SettingDescriptor(
+            icon: "moon.zzz",
+            description: "After this many episodes play in a row, the next one waits for you instead of starting on its own."
+        ),
         "skipLength": SettingDescriptor(
             icon: "forward.fill",
-            description: "How far a single Left or Right press skips during playback."
+            description: "How far a single Right press skips ahead during playback."
+        ),
+        "skipBackLength": SettingDescriptor(
+            icon: "backward.fill",
+            description: "How far a single Left press skips back during playback."
         ),
         "showPostVideoUpNext": SettingDescriptor(
             icon: "rectangle.stack",
@@ -226,7 +260,23 @@ enum SettingsDescriptorStore {
         // MARK: Servers
         "plexServer": SettingDescriptor(
             icon: "server.rack",
-            description: "Manage your Plex server connection, view server details, or sign out."
+            description: "Manage your Plex server connection, switch to another server on your account, or sign out."
+        ),
+        "plexServerPicker": SettingDescriptor(
+            icon: "server.rack",
+            description: "The Plex server Rivulet browses and plays from. Choose another server on your account to switch to it."
+        ),
+        "plexServerOption": SettingDescriptor(
+            icon: "server.rack",
+            description: "Switch to this server. Home and your libraries reload from it. A server shared with you shows who owns it."
+        ),
+        "plexServersLoading": SettingDescriptor(
+            icon: "server.rack",
+            description: "Finding the servers on your Plex account."
+        ),
+        "plexServersRetry": SettingDescriptor(
+            icon: "arrow.clockwise",
+            description: "Plex didn't return your servers. Check your network, then select to try again."
         ),
         "signOut": SettingDescriptor(
             icon: "rectangle.portrait.and.arrow.right",
@@ -238,7 +288,7 @@ enum SettingsDescriptorStore {
         ),
         "jellyfinURL": SettingDescriptor(
             icon: "globe",
-            description: "Your Jellyfin server's address, including the port. You can paste the address from your browser."
+            description: "Your Jellyfin server's address, including the port, for example http://192.168.1.100:8096. You can paste the address from your browser."
         ),
         "jellyfinUsername": SettingDescriptor(
             icon: "person",
@@ -282,7 +332,7 @@ enum SettingsDescriptorStore {
         ),
         "addLiveTVSource": SettingDescriptor(
             icon: "plus.circle.fill",
-            description: "Connect a Live TV source you already have access to: your Plex server's tuners, a server you run yourself, or a playlist URL from an IPTV provider."
+            description: "Connect a Live TV source you already have access to: your Plex server's tuners, a login or playlist from an IPTV provider, or a server you run yourself."
         ),
         "refreshChannels": SettingDescriptor(
             icon: "arrow.clockwise",
@@ -292,9 +342,21 @@ enum SettingsDescriptorStore {
             icon: "trash",
             description: "Remove this Live TV source and all its channels."
         ),
-        "addPlexLiveTV": SettingDescriptor(
-            icon: "play.rectangle.fill",
-            description: "Add the tuners already set up on your Plex server. One press adds them and loads the channel list."
+        "addXtream": SettingDescriptor(
+            icon: "person.badge.key",
+            description: "Sign in with the server address, username and password your IPTV provider gave you, often called an Xtream Codes login. Rivulet loads the channels, categories and guide. It supplies no channels of its own."
+        ),
+        "xtreamServerField": SettingDescriptor(
+            icon: "globe",
+            description: "The server address from your provider, with its port, for example http://provider.example:8080. If your provider gave you a single link with your username and password in it, enter that instead: Rivulet fills in the rest."
+        ),
+        "xtreamUsernameField": SettingDescriptor(
+            icon: "person",
+            description: "The username your provider gave you."
+        ),
+        "xtreamPasswordField": SettingDescriptor(
+            icon: "key",
+            description: "The password your provider gave you. Rivulet keeps it in the Keychain."
         ),
         "addOwnServer": SettingDescriptor(
             icon: "server.rack",
@@ -302,7 +364,7 @@ enum SettingsDescriptorStore {
         ),
         "addPlaylistURL": SettingDescriptor(
             icon: "list.bullet.rectangle",
-            description: "A playlist link from an IPTV provider you subscribe to. Rivulet supplies no channels of its own."
+            description: "An M3U playlist link from an IPTV provider you subscribe to, with an optional guide link. Rivulet supplies no channels of its own."
         ),
         "serverURL": SettingDescriptor(
             icon: "globe",
@@ -310,7 +372,7 @@ enum SettingsDescriptorStore {
         ),
         "displayNameField": SettingDescriptor(
             icon: "textformat",
-            description: "What this source is called in the sidebar and the guide."
+            description: "What this source is called in Live TV. Optional."
         ),
         "usernameField": SettingDescriptor(
             icon: "person",
@@ -326,11 +388,11 @@ enum SettingsDescriptorStore {
         ),
         "m3uURLField": SettingDescriptor(
             icon: "list.bullet.rectangle",
-            description: "The playlist link your IPTV provider gave you. It usually ends in .m3u or .m3u8."
+            description: "The playlist link your IPTV provider gave you, for example http://provider.example/playlist.m3u. It usually ends in .m3u or .m3u8."
         ),
         "epgURLField": SettingDescriptor(
             icon: "calendar",
-            description: "Optional. An XMLTV guide link from the same provider, so channels show what is on."
+            description: "Optional. An XMLTV guide link from the same provider, so channels show what is on. Leave it empty if the playlist names its own guide."
         ),
         "addSourceConfirm": SettingDescriptor(
             icon: "plus.circle.fill",
@@ -358,7 +420,7 @@ enum SettingsDescriptorStore {
         // MARK: Content Filtering
         "cat_contentFilter": SettingDescriptor(
             icon: "hand.raised.fill",
-            description: "Mute strong language and skip scenes during playback, without ever changing the file. Language is found in the title's subtitles, even with subtitles turned off; scene skips come from an imported filter list."
+            description: "Mute strong language and skip scenes during playback, without ever changing the file. Language is found in the title's English subtitles, even with subtitles turned off. Scene skips come from an imported filter list."
         ),
         "cf_master": SettingDescriptor(
             icon: "hand.raised.fill",
@@ -366,7 +428,7 @@ enum SettingsDescriptorStore {
         ),
         "cf_profanity": SettingDescriptor(
             icon: "exclamationmark.bubble.fill",
-            description: "Mutes profane words in the dialogue. Rivulet reads the title's subtitle file even when subtitles are off; a title whose only subtitles are inside the video file needs them turned on. Use Profanity Strength to choose how much is filtered."
+            description: "Mutes profane words in the dialogue. Rivulet reads the title's subtitles even when they are off, including ones inside the video file. Use Profanity Strength to choose how much is filtered."
         ),
         "cf_strength": SettingDescriptor(
             icon: "dial.medium.fill",
@@ -422,6 +484,7 @@ enum SettingsDescriptorStore {
         case .servers: return ("server.rack", .systemOrange)
         case .about: return ("info.circle.fill", .systemGray)
         case .plex: return ("server.rack", .systemOrange)
+        case .plexServerPicker: return ("server.rack", .systemOrange)
         case .jellyfin: return ("server.rack", .systemPurple)
         case .iptv: return ("tv.and.mediabox", .systemBlue)
         case .libraries: return ("sidebar.squares.left", .systemPurple)
@@ -430,13 +493,20 @@ enum SettingsDescriptorStore {
         case .displaySizePicker: return ("textformat.size", .systemOrange)
         case .autoplayCountdownPicker: return ("forward.end.alt", .systemPurple)
         case .skipIntervalPicker: return ("forward.fill", .systemBlue)
+        case .skipBackIntervalPicker: return ("backward.fill", .systemBlue)
+        case .heightSpeakersPicker: return ("hifispeaker.2", .systemCyan)
+        case .subtitleModePicker: return ("captions.bubble", .systemYellow)
+        case .autoplayLimitPicker: return ("moon.zzz", .systemPurple)
         case .homeQualityPicker: return ("house.fill", .systemBlue)
         case .awayQualityPicker: return ("antenna.radiowaves.left.and.right", .systemBlue)
+        case .audioLanguagePicker: return ("waveform", .systemCyan)
+        case .subtitleLanguagePicker: return ("captions.bubble", .systemYellow)
         case .contentFilter: return ("hand.raised.fill", .systemOrange)
         case .contentFilterStrength: return ("dial.medium.fill", .systemOrange)
         case .liveTVSourceDetail: return ("tv.and.mediabox", .systemBlue)
         case .liveTVFavorites: return ("star.fill", .systemYellow)
         case .addLiveTVSource: return ("plus.circle.fill", .systemBlue)
+        case .addXtream: return ("person.badge.key.fill", .systemIndigo)
         case .addOwnServer: return ("server.rack", .systemBlue)
         case .addPlaylistURL: return ("list.bullet.rectangle", .systemGreen)
         }

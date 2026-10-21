@@ -17,12 +17,19 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
     case plex = "plex"
     case dispatcharr = "dispatcharr"
     case genericM3U = "m3u"
+    case xtream = "xtream"
+    case jellyfin = "jellyfin"
+
+    /// Follows a signed-in media server: added and removed with it, never saved.
+    var followsServer: Bool { self == .plex || self == .jellyfin }
 
     var displayName: String {
         switch self {
         case .plex: return "Plex Live TV"
         case .dispatcharr: return "Dispatcharr"
         case .genericM3U: return "M3U Playlist"
+        case .xtream: return "Xtream Codes"
+        case .jellyfin: return "Jellyfin Live TV"
         }
     }
 
@@ -31,6 +38,8 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
         case .plex: return "server.rack"
         case .dispatcharr: return "antenna.radiowaves.left.and.right"
         case .genericM3U: return "list.bullet"
+        case .xtream: return "person.badge.key"
+        case .jellyfin: return "server.rack"
         }
     }
 }
@@ -38,7 +47,7 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
 // MARK: - Unified Channel
 
 /// A unified channel representation that works across all Live TV sources
-struct UnifiedChannel: Identifiable, Hashable, Sendable {
+nonisolated struct UnifiedChannel: Identifiable, Hashable, Sendable {
     let id: String
     let sourceType: LiveTVSourceType
     let sourceId: String
@@ -130,7 +139,7 @@ struct UnifiedChannel: Identifiable, Hashable, Sendable {
 // MARK: - Unified Program (EPG)
 
 /// A unified EPG program representation
-struct UnifiedProgram: Identifiable, Hashable, Sendable {
+nonisolated struct UnifiedProgram: Identifiable, Hashable, Sendable {
     let id: String
     let channelId: String
     let title: String
@@ -358,7 +367,7 @@ enum LiveTVProviderError: LocalizedError {
 
 extension M3UParser.ParsedChannel {
     /// What a channel's id is built from. Playlists repeat it (SD and HD feeds share a tvg-id).
-    nonisolated var channelKey: String { tvgId ?? tvgName ?? name }
+    nonisolated var channelKey: String { key ?? tvgId ?? tvgName ?? name }
 
     /// Convert to UnifiedChannel. `occurrence` counts earlier entries with the same
     /// `channelKey` in the source; the 2nd and later get "#n" so ids stay unique and

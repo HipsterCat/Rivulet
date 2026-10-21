@@ -163,9 +163,11 @@ nonisolated struct PlexLibrary: Codable, Identifiable, Hashable, Sendable {
     let key: String
     let type: String          // "movie", "show", "artist", etc.
     var title: String
-    let agent: String
-    let scanner: String
-    let language: String
+    // Optional: nothing reads them, and one section without them would
+    // otherwise fail the whole list.
+    let agent: String?
+    let scanner: String?
+    let language: String?
     let uuid: String
     let updatedAt: Int?
     let createdAt: Int?
@@ -198,6 +200,16 @@ nonisolated struct PlexLibrary: Codable, Identifiable, Hashable, Sendable {
     /// Check if this is a music library
     var isMusicLibrary: Bool {
         type == "artist"
+    }
+
+    /// Movie/show section with no metadata agent: browsed by folder.
+    var hasNoMetadataAgent: Bool {
+        isVideoLibrary && (agent == "tv.plex.agents.none" || agent == "com.plexapp.agents.none")
+    }
+
+    /// Check if this is a photo library
+    var isPhotoLibrary: Bool {
+        type == "photo"
     }
 }
 

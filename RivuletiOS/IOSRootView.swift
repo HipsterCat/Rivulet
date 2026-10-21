@@ -12,6 +12,8 @@ struct IOSRootView: View {
     @StateObject private var playback = IOSPlaybackController()
     @State private var showingAccount = false
     @State private var showingWhatsNew = false
+    @ObservedObject private var profiles = PlexUserProfileManager.shared
+    @State private var choosingProfile = false
     @AppStorage("lastSeenBuild") private var lastSeenBuild = ""
     @State private var backgroundedAt: Date?
     /// The Library stack's path, so "Go to Downloads" can push the list from any tab.
@@ -60,12 +62,23 @@ struct IOSRootView: View {
         .environment(\.openDownloads, openDownloads)
         .sheet(isPresented: $showingAccount) { IOSAccountView() }
         .sheet(isPresented: $showingWhatsNew) { IOSWhatsNewSheet(version: IOSChangelog.currentVersion) }
+        .sheet(isPresented: $choosingProfile) { IOSProfilePickerSheet() }
+        // Content is withheld until a profile is entered: ask who is watching,
+        // and nothing of the locked profile's keeps playing.
+        .onChange(of: profiles.needsProfileSelection, initial: true) { _, needed in
+            if needed { playback.close() }
+            choosingProfile = needed
+        }
         .iosPlaybackHost(playback)
         .task { showWhatsNewIfUpdated() }
         #if DEBUG
         .task { await applyScreenshotState() }
         #endif
-        .task { await plex.verifyConnection() }
+        .task {
+            await plex.verifyConnection()
+            // A launch that first had to enter the saved profile is signed in only now.
+            showWhatsNewIfUpdated()
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
@@ -74,9 +87,15 @@ struct IOSRootView: View {
                 // The one foreground trigger: re-test a connection left for a while, then refetch stale content.
                 let longAway = backgroundedAt.map { Date.now.timeIntervalSince($0) > 5 * 60 } ?? false
                 Task {
-                    if longAway { await plex.verifyConnection() }
+                    if longAway {
+                        await plex.verifyConnection()
+                        // The list may have loaded just now and found the profile locked.
+                        if profiles.needsProfileSelection, profiles.hasLoadedProfiles { choosingProfile = true }
+                    }
                     await plex.refreshIfStale()
                 }
+                // A dismissed picker leaves content locked; ask again on return.
+                if profiles.needsProfileSelection, profiles.hasLoadedProfiles { choosingProfile = true }
                 backgroundedAt = nil
             default:
                 break
