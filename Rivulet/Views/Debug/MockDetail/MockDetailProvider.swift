@@ -76,7 +76,7 @@ final class MockDetailProvider: MediaProvider, @unchecked Sendable {
     func hubs() async throws -> [MediaHub] { [] }
     func hubs(in library: MediaLibrary) async throws -> [MediaHub] { [] }
 
-    func resolveStream(for itemRef: MediaItemRef, sourceID: String?) async throws -> StreamInfo {
+    func resolveStream(for itemRef: MediaItemRef, sourceID: String?, maxBitrate: Int?) async throws -> StreamInfo {
         throw MediaProviderError.notPlayable
     }
 

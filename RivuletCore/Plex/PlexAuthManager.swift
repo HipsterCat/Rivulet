@@ -909,6 +909,28 @@ class PlexAuthManager: ObservableObject {
         authToken != nil && userDefaults.string(forKey: serverURLKey) != nil
     }
 
+    #if DEBUG
+    /// Offline demo seed: same gates as a real sign-in (`hasCredentials`,
+    /// `selectedServerToken`) without a reachable server. Used by the kino.pub
+    /// demo catalog so Home renders rails instead of the not-connected state.
+    func applyOfflineDemoSession(serverURL: String, serverName: String, username: String, token: String) {
+        userDefaults.set(serverURL, forKey: serverURLKey)
+        userDefaults.set(serverName, forKey: serverNameKey)
+        userDefaults.set(username, forKey: usernameKey)
+        userDefaults.set(true, forKey: hasPersistedSessionKey)
+        KeychainHelper.set(token, forKey: keychainTokenKey)
+        KeychainHelper.set(token, forKey: keychainServerTokenKey)
+
+        authToken = token
+        self.username = username
+        selectedServerURL = serverURL
+        selectedServerToken = token
+        isConnected = true
+        connectionError = nil
+        state = .authenticated
+    }
+    #endif
+
     /// Get saved server name
     var savedServerName: String? {
         userDefaults.string(forKey: serverNameKey)

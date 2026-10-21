@@ -233,19 +233,19 @@ final class ComponentSandboxViewController: UIViewController {
                 return self.shelf(
                     itemW: MediaRowMetrics.posterWidth,
                     itemH: MediaRowMetrics.posterHeight + MediaRowMetrics.focusGrowthPadding,
-                    gap: MediaRowMetrics.posterGap
+                    gap: MediaRowMetrics.tileGap
                 )
             case .posters, .watchlist, .related:
                 return self.shelf(
                     itemW: MediaRowMetrics.posterWidth,
                     itemH: MediaRowMetrics.posterHeight + MediaRowMetrics.focusGrowthPadding,
-                    gap: MediaRowMetrics.posterGap
+                    gap: MediaRowMetrics.tileGap
                 )
             case .continueWatching:
                 return self.shelf(
                     itemW: MediaRowMetrics.cwWidth,
                     itemH: MediaRowMetrics.cwHeight + MediaRowMetrics.focusGrowthPadding,
-                    gap: MediaRowMetrics.cwGap
+                    gap: MediaRowMetrics.tileGap
                 )
             case .seasonPills:
                 return self.shelf(itemW: 180, itemH: 64, gap: 16)

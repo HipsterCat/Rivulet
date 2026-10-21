@@ -483,8 +483,6 @@ final class SandboxHeroButtonsCell: UICollectionViewCell {
 final class SandboxBadgesCell: UICollectionViewCell {
     static let reuseID = "SandboxBadgesCell"
 
-    private var audioHost: UIHostingController<AnyView>?
-
     override init(frame: CGRect) {
         super.init(frame: frame)
 
@@ -515,19 +513,8 @@ final class SandboxBadgesCell: UICollectionViewCell {
         miscRow.spacing = 20
         miscRow.alignment = .center
 
-        let audio = HStack(spacing: 12) {
-            AudioQualityBadge(quality: MusicAudioProcessor.audioQuality(codec: "flac", bitrate: nil, sampleRate: 96_000))
-            AudioQualityBadge(quality: MusicAudioProcessor.audioQuality(codec: "flac", bitrate: nil, sampleRate: 44_100))
-            AudioQualityBadge(quality: MusicAudioProcessor.audioQuality(codec: "aac", bitrate: 320, sampleRate: nil))
-            AudioQualityBadge(quality: MusicAudioProcessor.audioQuality(codec: "mp3", bitrate: 192, sampleRate: nil))
-        }
-        .fixedSize()
-        let hosting = UIHostingController(rootView: AnyView(audio))
-        hosting.view.backgroundColor = .clear
-        audioHost = hosting
-
-        let captions = ["Content rating", "Quality", "Watched / rewatch", "Audio quality"]
-        let rows: [UIView] = [ratingRow, qualityRow, miscRow, hosting.view]
+        let captions = ["Content rating", "Quality", "Watched / rewatch"]
+        let rows: [UIView] = [ratingRow, qualityRow, miscRow]
         let labeled = zip(captions, rows).map { caption, row -> UIStackView in
             let label = UILabel()
             label.text = caption

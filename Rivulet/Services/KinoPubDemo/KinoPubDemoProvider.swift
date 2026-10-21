@@ -160,7 +160,7 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
 
     // MARK: - Playback and state (deliberately inert)
 
-    func resolveStream(for itemRef: MediaItemRef, sourceID: String?) async throws -> StreamInfo {
+    func resolveStream(for itemRef: MediaItemRef, sourceID: String?, maxBitrate: Int?) async throws -> StreamInfo {
         throw MediaProviderError.notPlayable
     }
 

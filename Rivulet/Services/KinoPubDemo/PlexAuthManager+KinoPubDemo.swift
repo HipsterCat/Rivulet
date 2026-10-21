@@ -12,31 +12,14 @@
 import Foundation
 
 extension PlexAuthManager {
-    /// The keys `hasCredentials` reads. Written verbatim because the demo has to
-    /// satisfy the same gate a real sign-in does, and the properties holding
-    /// these names are private.
-    private enum DemoKey {
-        static let serverURL = "selectedServerURL"
-        static let serverName = "selectedServerName"
-        static let username = "plexUsername"
-        static let hasPersistedSession = "plexHasPersistedSession"
-    }
-
     @MainActor
     func applyKinoPubDemoSession() {
-        let defaults = UserDefaults.standard
-        defaults.set(KinoPubDemo.serverURL, forKey: DemoKey.serverURL)
-        defaults.set("kino.pub", forKey: DemoKey.serverName)
-        defaults.set("Демо", forKey: DemoKey.username)
-        defaults.set(true, forKey: DemoKey.hasPersistedSession)
-
-        authToken = KinoPubDemo.token
-        username = "Демо"
-        selectedServerURL = KinoPubDemo.serverURL
-        selectedServerToken = KinoPubDemo.token
-        isConnected = true
-        connectionError = nil
-        state = .authenticated
+        applyOfflineDemoSession(
+            serverURL: KinoPubDemo.serverURL,
+            serverName: "kino.pub",
+            username: "Демо",
+            token: KinoPubDemo.token
+        )
     }
 }
 #endif
