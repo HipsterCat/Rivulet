@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 // Duration and easing of the driven vertical re-center scroll on Home rows and the below-fold
 // detail. We drive it because the focus engine's own scroll animator races a CADisplayLink driver.
 // Keep other timings (carousel morph, backdrop crossfade, detail slide) out of here.

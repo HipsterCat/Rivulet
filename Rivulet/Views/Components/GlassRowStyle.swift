@@ -75,3 +75,91 @@ struct AppStoreActionButtonStyle: ButtonStyle {
             .animation(.spring(response: 0.15, dampingFraction: 0.9), value: configuration.isPressed)
     }
 }
+
+#Preview("App Store Button Style") {
+    VStack(spacing: 20) {
+        Button("Refresh") {}
+            .buttonStyle(AppStoreButtonStyle())
+        
+        Button("Retry") {}
+            .buttonStyle(AppStoreButtonStyle())
+        
+        Button("Try Again") {}
+            .buttonStyle(AppStoreButtonStyle(cornerRadius: 20))
+    }
+    .padding()
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color.black)
+}
+
+#Preview("App Store Action Button Style") {
+    VStack(spacing: 30) {
+        // Focused state
+        VStack(spacing: 20) {
+            Text("Focused State")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            
+            Button {
+                // Play action
+            } label: {
+                HStack {
+                    Image(systemName: "play.fill")
+                    Text("Play")
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(AppStoreActionButtonStyle(isFocused: true, isPrimary: true))
+            
+            Button {
+                // Shuffle action
+            } label: {
+                HStack {
+                    Image(systemName: "shuffle")
+                    Text("Shuffle")
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(AppStoreActionButtonStyle(isFocused: true, isPrimary: false))
+        }
+        
+        Divider()
+        
+        // Unfocused state
+        VStack(spacing: 20) {
+            Text("Unfocused State")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            
+            Button {
+                // Play action
+            } label: {
+                HStack {
+                    Image(systemName: "play.fill")
+                    Text("Play")
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(AppStoreActionButtonStyle(isFocused: false, isPrimary: true))
+            
+            Button {
+                // Shuffle action
+            } label: {
+                HStack {
+                    Image(systemName: "shuffle")
+                    Text("Shuffle")
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 14)
+            }
+            .buttonStyle(AppStoreActionButtonStyle(isFocused: false, isPrimary: false))
+        }
+    }
+    .padding()
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Color.black)
+}
+

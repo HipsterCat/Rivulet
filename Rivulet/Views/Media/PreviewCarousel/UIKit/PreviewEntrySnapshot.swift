@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  Row tile snapshots the presenter captures for the carousel's entry morph.
 
 import UIKit

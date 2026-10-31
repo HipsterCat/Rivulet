@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  All carousel artwork, behind the collection view. Each visible card gets its own
 //  clipping window with an oversized, parallaxed image inside; a shared mask would let
 //  panels bleed into each other. On expand the centred window grows to full screen.

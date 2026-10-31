@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  The expanded layout: the cell at `expandedIndex` fills the viewport; the others keep
 //  their carousel frames at alpha 0 so collapse reverses cleanly (UIKIT_FOUNDATIONS §1).
 

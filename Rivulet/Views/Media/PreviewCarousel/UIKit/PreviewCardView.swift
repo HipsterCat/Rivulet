@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  One carousel card: Apple's scrim and a `MediaDetailChromeView`, over the artwork
 //  `BackdropPlaneView` draws. The centred card's chrome fades in over 0.5 s once paging
 //  settles and fades against its travel when paging away (`setPagingFade`).

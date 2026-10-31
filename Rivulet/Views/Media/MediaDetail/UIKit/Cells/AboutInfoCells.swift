@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  The detail's About cards and Information / Languages / Accessibility columns
 //  (Docs/atv_ref/carousel_details_ref_about, _information). The cells are not focusable; their cards are.
 

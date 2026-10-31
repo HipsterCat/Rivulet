@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
 
 //  Collection cells hosting the below-fold views, plus the section header. Each forwards
 //  focus to its view and resets it in prepareForReuse, or fast scrolls leave a stuck scale.

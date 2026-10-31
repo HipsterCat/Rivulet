@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  Preview carousel geometry. The card shell follows Apple's TV app (read from its
 //  binary, tvOS 26.5); see Docs/PREVIEW_CAROUSEL_REFERENCE_LAYOUT.md.
 

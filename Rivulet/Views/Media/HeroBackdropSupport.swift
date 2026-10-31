@@ -1,9 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
-//
-//  HeroBackdropSupport.swift
-//  Rivulet
 //
 //  Shared hero/backdrop resolution and full-size crossfade rendering for
 //  preview/detail/loading surfaces. Artwork URLs come from whatever type

@@ -1,9 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  HeroPlaySession.swift
-//  Rivulet
 //
 //  Resolves "play immediately" targets for hero-carousel items.
 //  Movies and episodes play directly; shows/seasons resolve to the OnDeck

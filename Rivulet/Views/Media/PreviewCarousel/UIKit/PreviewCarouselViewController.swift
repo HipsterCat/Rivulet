@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  The preview carousel modal: a paging card carousel over `PreviewCarouselLayout`
 //  that expands into the full detail. Entry and dismiss morph the source row's
 //  tile snapshots (or one `morphSnapshot`) to and from the card frames.

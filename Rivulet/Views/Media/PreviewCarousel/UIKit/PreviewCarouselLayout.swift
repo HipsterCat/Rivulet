@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  The carousel layout: fixed-width cards one stride apart, with alpha and z-order
 //  from each card's distance to the centre. `BackdropPlaneView` reads its geometry;
 //  the expand morph swaps to `PreviewExpandedLayout`.

@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Copyright (C) 2025-2026 Bain Gurley
-
 //  A collection view whose horizontal contentOffset can be pinned. `setCollectionViewLayout`
 //  zeroes the offset later and repeatedly, without consulting `targetContentOffset`, which
 //  throws a non-first expanded cell off screen; the pin holds from expand to collapse.
