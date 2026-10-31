@@ -5,13 +5,8 @@
 //  PostVideoOverlayView.swift
 //  Rivulet
 //
-//  The end-of-episode "Up Next" card: a glass card that slides in from the
-//  right over the still-playing credits, with the next episode, the autoplay
-//  countdown ring, and Play Next / Dismiss. Back slides it away.
-//
-//  The view IS the card's footprint (the container pins it to the trailing
-//  edge): anything larger above the player's content anchor would make the
-//  anchor unfocusable while the card slides out.
+//  The end-of-episode Up Next card, sliding in over the credits. The view is
+//  exactly the card's footprint: anything larger would occlude the content anchor.
 //
 
 import UIKit
@@ -34,8 +29,8 @@ final class PostVideoOverlayView: UIView {
     /// A focus move the user made with the remote. Cancels the countdown.
     var onUserFocusMove: (() -> Void)?
 
-    /// The rail panels' glass: `.clear` plus their wash.
-    private let glass = UIVisualEffectView(effect: UIGlassEffect(style: .clear))
+    /// The rail panels' glass.
+    private let glass = UIVisualEffectView(effect: TransportControlButton.glassEffect())
     private let contentStack = UIStackView()
     private let headerLabel = UILabel()
     private let headerSubtitleLabel = UILabel()
@@ -63,7 +58,6 @@ final class PostVideoOverlayView: UIView {
         backgroundColor = .clear
         transform = CGAffineTransform(translationX: Metrics.offscreen, y: 0)
 
-        glass.contentView.backgroundColor = PlayerRailPanelView.glassWash
         glass.clipsToBounds = true
         glass.layer.cornerRadius = Metrics.cornerRadius
         glass.layer.cornerCurve = .continuous
@@ -280,7 +274,11 @@ final class NextEpisodeCardView: UIView {
         configuredRatingKey = episode.ratingKey
         showLabel.text = episode.grandparentTitle
         showLabel.isHidden = (episode.grandparentTitle ?? "").isEmpty
-        numberLabel.text = String(format: "S%02dE%02d", episode.parentIndex ?? 0, episode.index ?? 0)
+        // A playlist's next item can be a movie: year in place of SxEy.
+        numberLabel.text = episode.type == "episode"
+            ? String(format: "S%02dE%02d", episode.parentIndex ?? 0, episode.index ?? 0)
+            : episode.year.map(String.init)
+        numberLabel.isHidden = numberLabel.text == nil
         titleLabel.text = episode.title ?? "Episode"
         summaryLabel.text = episode.summary
         summaryLabel.isHidden = (episode.summary ?? "").isEmpty

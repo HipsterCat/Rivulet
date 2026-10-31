@@ -54,6 +54,12 @@ final class JellyfinMediaMapperTests: XCTestCase {
         XCTAssertEqual(ep.grandparentArtwork?.poster?.absoluteString, "http://jf.local:8096/Items/show1/Images/Primary?tag=showPrim")
     }
 
+    func test_playlist_cardArt_isPrimaryFilledTo16x9() {
+        let list = item(#"{"Id":"pl1","Name":"Road Trip","Type":"Playlist","ImageTags":{"Primary":"pp"}}"#)
+        XCTAssertEqual(list.artwork.backdrop?.absoluteString,
+                       "http://jf.local:8096/Items/pl1/Images/Primary?tag=pp&fillWidth=1280&fillHeight=720")
+    }
+
     func test_artwork_carriesNoToken() {
         XCTAssertFalse(item(JellyfinFixtures.episode).artwork.poster!.absoluteString.contains("ApiKey"))
     }
@@ -164,6 +170,13 @@ final class JellyfinMediaMapperTests: XCTestCase {
         return JellyfinMediaMapper.videoTrack(stream)?.videoRange
     }
 
+    func test_dolbyVisionWithHDR10Plus_keepsHDR10PlusFlag() {
+        let stream: JFMediaStream = JellyfinFixtures.decode(JellyfinFixtures.videoStream(rangeType: "DOVIWithHDR10Plus", transfer: "smpte2084"))
+        let track = JellyfinMediaMapper.videoTrack(stream)
+        XCTAssertEqual(track?.videoRange, .dolbyVision(profile: 0))
+        XCTAssertEqual(track?.hasHDR10Plus, true)
+    }
+
     func test_dolbyVisionVariants_mapToDolbyVision() {
         XCTAssertEqual(range("DOVI", transfer: "smpte2084"), .dolbyVision(profile: 0))
         XCTAssertEqual(range("DOVIWithHDR10", transfer: "smpte2084"), .dolbyVision(profile: 0))
@@ -204,7 +217,7 @@ final class JellyfinMediaMapperTests: XCTestCase {
         XCTAssertEqual(d.tagline, "Remember my name")
         XCTAssertEqual(d.genres, ["Drama"])
         XCTAssertEqual(d.studios, ["AMC"])
-        XCTAssertEqual(d.rating, MediaRating(8.9, source: .unknown))
+        XCTAssertEqual(d.ratings, [MediaRating(8.9, source: .unknown)])
         XCTAssertEqual(d.regionOfOrigin, "United States of America")
         XCTAssertEqual(d.nextEpisode?.ref.itemID, "ep1")
     }
@@ -224,6 +237,21 @@ final class JellyfinMediaMapperTests: XCTestCase {
         XCTAssertEqual(item(#"{"Id":"s","Type":"Season","SeriesName":"Abbott Elementary"}"#).seriesTitle,
                        "Abbott Elementary")
         XCTAssertNil(item(JellyfinFixtures.movie).seriesTitle)
+    }
+
+    func test_detail_extras_trailersAndSpecialFeatures() {
+        let trailer: JFItem = JellyfinFixtures.decode(#"{"Id":"t1","Name":"Trailer","RunTimeTicks":1200000000}"#)
+        let feature: JFItem = JellyfinFixtures.decode(
+            #"{"Id":"f1","Name":"Making Of","ExtraType":"BehindTheScenes","ImageTags":{"Primary":"ft"}}"#)
+        let extras = JellyfinMediaMapper.detail(
+            JellyfinFixtures.decode(JellyfinFixtures.movie), nextEpisode: nil,
+            trailers: [trailer], specialFeatures: [feature], providerID: pid, baseURL: base, token: "tok"
+        ).extras
+        XCTAssertEqual(extras.map(\.subtype), [.trailer, .behindTheScenes])
+        XCTAssertEqual(extras.map(\.playbackKey), ["t1", "f1"])
+        XCTAssertEqual(extras.map(\.providerID), [pid, pid])
+        XCTAssertEqual(extras[0].duration, 120)
+        XCTAssertEqual(extras[1].thumbnailURL?.absoluteString, "http://jf.local:8096/Items/f1/Images/Primary?tag=ft")
     }
 
     func test_detail_providerIds_becomeLowercaseExternalIDs() {

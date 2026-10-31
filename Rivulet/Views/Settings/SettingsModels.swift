@@ -47,15 +47,15 @@ enum CrossfadeOption: String, CaseIterable, Hashable, CustomStringConvertible {
 enum SettingsPage: Hashable, CaseIterable {
     case root
     case appearance, playback, music, liveTV, servers, about
-    case plex, plexServerPicker, jellyfin, iptv, libraries, cache
+    case plex, plexServerDetail, jellyfin, iptv, libraries, cache
     case homeRows
     case liveTVSourceDetail, liveTVFavorites
-    case addLiveTVSource, addXtream, addOwnServer, addPlaylistURL
-    case displaySizePicker, autoplayCountdownPicker, skipIntervalPicker, skipBackIntervalPicker
+    case addLiveTVSource, addXtream, addDispatcharr, addTvheadend, addThreadfin, addPlaylistURL
+    case appIconPicker, homeHeroPicker, detailRatingPicker, autoplayCountdownPicker, skipIntervalPicker, skipBackIntervalPicker
     case heightSpeakersPicker, subtitleModePicker, autoplayLimitPicker
     case homeQualityPicker, awayQualityPicker
     case audioLanguagePicker, subtitleLanguagePicker
-    case contentFilter, contentFilterStrength
+    case contentFilter, contentFilterStrength, contentFilterWords
 
     var title: String {
         switch self {
@@ -66,20 +66,24 @@ enum SettingsPage: Hashable, CaseIterable {
         case .liveTV: return "Live TV"
         case .servers: return "Servers"
         case .about: return "About"
-        case .plex: return "Plex Server"
-        case .plexServerPicker: return "Server"
+        case .plex: return "Plex"
+        case .plexServerDetail: return "Server"
         case .jellyfin: return "Jellyfin Server"
         case .iptv: return "Live TV Sources"
         case .liveTVSourceDetail: return "Source Details"
         case .liveTVFavorites: return "Favorites"
         case .addLiveTVSource: return "Add a Source"
         case .addXtream: return "Xtream Codes"
-        case .addOwnServer: return "My Own Server"
+        case .addDispatcharr: return "Dispatcharr"
+        case .addTvheadend: return "Tvheadend"
+        case .addThreadfin: return "Threadfin"
         case .addPlaylistURL: return "Playlist URL"
-        case .libraries: return "Sidebar Libraries"
+        case .libraries: return "Sidebar"
         case .homeRows: return "Home Rows"
         case .cache: return "Cache & Storage"
-        case .displaySizePicker: return "Display Size"
+        case .appIconPicker: return "App Icon"
+        case .homeHeroPicker: return "Hero"
+        case .detailRatingPicker: return "Rating"
         case .autoplayCountdownPicker: return "Autoplay Countdown"
         case .skipIntervalPicker: return "Skip Forward Length"
         case .skipBackIntervalPicker: return "Skip Back Length"
@@ -91,7 +95,8 @@ enum SettingsPage: Hashable, CaseIterable {
         case .audioLanguagePicker: return "Audio Language"
         case .subtitleLanguagePicker: return "Subtitle Language"
         case .contentFilter: return "Content Filtering"
-        case .contentFilterStrength: return "Profanity Strength"
+        case .contentFilterStrength: return "Profanity"
+        case .contentFilterWords: return "Custom Words"
         }
     }
 }
@@ -155,5 +160,3 @@ enum SkipInterval: Int, CaseIterable, CustomStringConvertible {
 
     var description: String { "\(rawValue) seconds" }
 }
-
-// Note: DisplaySize enum is in Services/UIScale.swift for global access.

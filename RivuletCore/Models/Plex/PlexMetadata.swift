@@ -78,6 +78,14 @@ nonisolated struct PlexGuid: Codable, Sendable {
     var id: String?
 }
 
+/// One `Rating` entry: `image` names the source ("imdb://image.rating",
+/// "rottentomatoes://image.rating.upright"), `type` is "critic" or "audience".
+nonisolated struct PlexRatingEntry: Codable, Hashable, Sendable {
+    var image: String?
+    var value: Double?
+    var type: String?
+}
+
 /// A show's external IDs (any may be nil), used to resolve a TMDB id when Plex
 /// didn't hand us a `tmdb://` guid directly.
 nonisolated struct ShowExternalIDs: Sendable, Equatable {
@@ -284,21 +292,28 @@ nonisolated struct PlexMarker: Codable, Identifiable, Sendable {
 /// Plex media item metadata (movie, show, season, episode)
 nonisolated struct PlexMetadata: Codable, Identifiable, Hashable, Sendable {
     var id: String {
-        return ratingKey ?? UUID().uuidString
+        let key = ratingKey ?? UUID().uuidString
+        return serverID.map { "\($0)/\(key)" } ?? key
     }
+
+    /// The machineIdentifier of the account's other Plex server this came from;
+    /// nil for the selected server. Set by the app on fetch, never by Plex.
+    var serverID: String?
 
     // MARK: - Core Identifiers
     var ratingKey: String?
     var key: String?
     var guid: String?
     var type: String?             // "movie", "show", "season", "episode"
+    /// A playlist row's own id, unique per row even when a title repeats.
+    var playlistItemID: Int? = nil
 
     // MARK: - Display Info
     var title: String?
     var originalTitle: String?
     var editionTitle: String?     // Plex movie edition, e.g. "Director's Cut"
     var studio: String?
-    var contentRating: String?    // "PG-13", "TV-MA", etc.
+    var contentRating: String?    // "PG-13", "TV-MA", or country-prefixed "uk/12A"
     var summary: String?
     var tagline: String?
     var year: Int?
@@ -308,6 +323,8 @@ nonisolated struct PlexMetadata: Codable, Identifiable, Hashable, Sendable {
     var audienceRating: Double?
     var ratingImage: String?
     var audienceRatingImage: String?
+    /// Every source's score, on full metadata only (absent on hub items).
+    var Rating: [PlexRatingEntry]?
 
     // MARK: - Artwork
     var thumb: String?
@@ -394,10 +411,11 @@ nonisolated struct PlexMetadata: Codable, Identifiable, Hashable, Sendable {
     // MARK: - Hashable
     func hash(into hasher: inout Hasher) {
         hasher.combine(ratingKey)
+        hasher.combine(serverID)
     }
 
     static func == (lhs: PlexMetadata, rhs: PlexMetadata) -> Bool {
-        lhs.ratingKey == rhs.ratingKey
+        lhs.ratingKey == rhs.ratingKey && lhs.serverID == rhs.serverID
     }
 
     // MARK: - Convenience Init for Previews/Testing
@@ -615,14 +633,9 @@ extension PlexMetadata {
         return String(token)
     }
 
-    /// For an episode, the SHOW's external IDs read only from the grandparent /
-    /// parent guid STRINGS. It deliberately does NOT read this item's `Guid`
-    /// array: on an episode that array holds the EPISODE's own ids
-    /// (e.g. tmdb://<episodeId>), and using them as a show id sends a wrong,
-    /// non-existent id to Insights. Legacy agents (thetvdb://77921/…,
-    /// themoviedb://<showId>/…) put a usable inline show id in grandparentGuid;
-    /// modern plex:// guids carry none, so the caller must fetch the show's own
-    /// metadata to get its external ids.
+    /// For an episode, the show's external IDs, read only from the grandparent and
+    /// parent guid strings: the item's own `Guid` array holds episode ids. Modern
+    /// plex:// guids carry none, so the caller fetches the show's metadata.
     var showExternalIDs: ShowExternalIDs {
         var tmdb: Int?
         var tvdb: Int?
@@ -977,5 +990,22 @@ extension PlexMetadata {
     /// All markers
     var allMarkers: [PlexMarker] {
         Marker ?? []
+    }
+}
+
+
+extension PlexMetadata {
+    /// `contentRating` for display: Plex stores non-US ratings with an ISO
+    /// country prefix ("uk/12A") and its own clients show what follows the
+    /// first slash. The raw value stays in `contentRating`.
+    var displayContentRating: String? {
+        Self.displayContentRating(contentRating)
+    }
+
+    static func displayContentRating(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        guard let slash = raw.firstIndex(of: "/") else { return raw }
+        let stripped = raw[raw.index(after: slash)...].trimmingCharacters(in: .whitespaces)
+        return stripped.isEmpty ? raw : stripped
     }
 }

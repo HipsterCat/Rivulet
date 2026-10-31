@@ -26,6 +26,17 @@ final class JellyfinBrowseSurfaceTests: XCTestCase {
         XCTAssertNil(cell.sourceBadgeText, "configure alone never adds a badge")
     }
 
+    func test_posterCell_noArtwork_showsTitle() {
+        let cell = PosterCell(frame: CGRect(x: 0, y: 0, width: 220, height: 400))
+        var show = PlexMetadata()
+        show.type = "show"
+        show.title = "Some Show"
+        cell.configure(item: show)
+        XCTAssertEqual(cell.failureTitleShown, "Some Show")
+        cell.prepareForReuse()
+        XCTAssertNil(cell.failureTitleShown)
+    }
+
     // MARK: - Plex paths
 
     func test_isJellyfin() {
@@ -125,11 +136,46 @@ final class JellyfinBrowseSurfaceTests: XCTestCase {
         XCTAssertEqual(hero.count, 10)
     }
 
+    func test_heroItems_trendingFirst_fallsBackToRecentWhenTooFew() {
+        func art(_ id: String) -> MediaItem {
+            let base = JellyfinFixtures.mediaItem(id, kind: .movie)
+            return MediaItem(ref: base.ref, kind: .movie, title: id, sortTitle: nil, overview: nil, year: nil,
+                             runtime: nil, parentRef: nil, grandparentRef: nil, episodeNumber: nil,
+                             seasonNumber: nil, childProgress: nil, userState: base.userState,
+                             artwork: MediaArtwork(poster: nil, backdrop: URL(string: "http://x/\(id)"),
+                                                   thumbnail: nil, logo: nil),
+                             parentArtwork: nil, grandparentArtwork: nil)
+        }
+        let rows: CachedHomeRail = [
+            CachedHomeHub(id: "ra", title: "Recently Added in Movies", isContinueWatching: false, hubKey: nil,
+                          hubIdentifier: nil, totalSize: nil, items: [art("new")])
+        ]
+
+        let trending = PlexHomeViewController.heroItems(trending: [[art("m1"), art("m2")], [art("s1")]], rows: rows)
+        XCTAssertEqual(trending.map(\.ref.itemID), ["m1", "s1", "m2"], "one library at a time")
+
+        let few = PlexHomeViewController.heroItems(trending: [[art("m1")], [art("s1")]], rows: rows)
+        XCTAssertEqual(few.map(\.ref.itemID), ["new"], "two matches are too few for a hero, as on Plex")
+    }
+
     // MARK: - Home
 
     private func row(_ id: String, cw: Bool = false, pin: Bool = false) -> CachedHomeHub {
         CachedHomeHub(id: id, title: id, isContinueWatching: cw, hubKey: nil,
                       hubIdentifier: pin ? "rivulet.pin.\(id)" : id, totalSize: nil, items: [])
+    }
+
+    func test_homeRail_followsTheLibraryOrderAcrossServers_pinsStayWithTheirLibrary() {
+        func lib(_ id: String, _ key: String?) -> CachedHomeHub {
+            var hub = row(id)
+            hub.libraryKey = key
+            return hub
+        }
+        let rail = PlexHomeViewController.homeRail(
+            plex: [row("plex-cw", cw: true), lib("angel-movies", "1"), lib("pin", nil), lib("angel-tv", "2")],
+            jellyfin: [lib("test-movies", "plex:test/1")],
+            libraryOrder: ["1", "plex:test/1", "2"])
+        XCTAssertEqual(rail.map(\.row.id), ["plex-cw", "angel-movies", "pin", "test-movies", "angel-tv"])
     }
 
     func test_homeRail_pairsContinueWatching_thenEachServersLibraryRows_pinsInPlace() {
@@ -159,9 +205,9 @@ final class JellyfinBrowseSurfaceTests: XCTestCase {
             return menu(item).flatMap { $0 }.map(\.title)
         }
         XCTAssertTrue(titles(#"{"Id":"m1","Name":"Heat","Type":"Movie","MediaSourceCount":2}"#)
-            .contains("Play Version…"))
+            .contains("Play Version"))
         XCTAssertFalse(titles(#"{"Id":"m1","Name":"Heat","Type":"Movie","MediaSourceCount":1}"#)
-            .contains("Play Version…"))
+            .contains("Play Version"))
     }
 
     func test_sourceBadge_onlyWhileBothServersAreSignedIn() {
@@ -184,12 +230,10 @@ final class JellyfinBrowseSurfaceTests: XCTestCase {
     // MARK: - Settings server headers
 
     func test_serverRunHeaders_suffixOnlyWhenNamesMatch() {
-        let same = SettingsContent.serverRunHeaders(plex: "Media", jellyfin: "Media")
-        XCTAssertEqual(same.plex, "Media (Plex)")
-        XCTAssertEqual(same.jellyfin, "Media (Jellyfin)")
-        let different = SettingsContent.serverRunHeaders(plex: "Den", jellyfin: "Attic")
-        XCTAssertEqual(different.plex, "Den")
-        XCTAssertEqual(different.jellyfin, "Attic")
+        XCTAssertEqual(SettingsContent.serverRunHeaders([("Media", .plex), ("Media", .jellyfin)]),
+                       ["Media (Plex)", "Media (Jellyfin)"])
+        XCTAssertEqual(SettingsContent.serverRunHeaders([("Den", .plex), ("Office", .plex), ("Attic", .jellyfin)]),
+                       ["Den", "Office", "Attic"])
     }
 
     func test_sourceBadgeView_hidesWithoutText() {

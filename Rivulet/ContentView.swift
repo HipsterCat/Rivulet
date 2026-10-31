@@ -65,12 +65,8 @@ struct ContentView: View {
             }
         }
         .onChange(of: profileManager.isPresentingLaunchPicker) { _, isPresenting in
-            // The launch picker path defers hub loading until after selection,
-            // so isHomeContentReady never fires and the splash would otherwise
-            // ride its full 15s timeout while the picker sits behind it. Drop
-            // the splash immediately so the picker is the launch surface. This
-            // only fires when the picker actually presents (picker-on-launch +
-            // multiple profiles); every other launch is untouched.
+            // Hubs wait for the picker's selection, so content-ready never fires:
+            // drop the splash now instead of riding the 15 s timeout behind the picker.
             if isPresenting {
                 splashLog.info("Launch profile picker presenting — dismissing splash")
                 showSplash = false
@@ -90,7 +86,8 @@ struct ContentView: View {
             MediaProviderRegistry.shared.populateFromCurrentAuth()
             MusicProviderRegistry.shared.populateFromCurrentAuth()
             MusicQueue.shared.configure(registry: MusicProviderRegistry.shared)
-            JellyfinDataStore.shared.reload()
+            ServerDataStore.shared.reload()
+            PlexExtraServers.shared.refreshForAccount()
             StartupTimer.mark("registries bootstrapped")
 
             #if DEBUG
@@ -121,34 +118,27 @@ struct ContentView: View {
         .onChange(of: authManager.selectedServerURL) { _, _ in
             MediaProviderRegistry.shared.populateFromCurrentAuth()
             MusicProviderRegistry.shared.populateFromCurrentAuth()
+            ServerDataStore.shared.reload()
         }
         .onChange(of: authManager.selectedServerToken) { _, _ in
             MediaProviderRegistry.shared.populateFromCurrentAuth()
             MusicProviderRegistry.shared.populateFromCurrentAuth()
+            // A PIN lock or another profile changes which other Plex servers show.
+            ServerDataStore.shared.reload()
         }
-        // Refresh the server-side library list on every transition
-        // to .active so a library added or renamed on the Plex server
-        // while Rivulet was backgrounded (or while the user was on the
-        // tvOS Home Screen) surfaces without an app restart.
-        // `loadLibrariesIfNeeded` returns early once the cache is
-        // populated, so without this hook the cached list never
-        // reconciles against current server state. Library visibility
-        // is fail-open (a hidden-libraries deny-list), so a freshly
-        // discovered library auto-appears in the sidebar.
+        // Refresh libraries on every return to .active: `loadLibrariesIfNeeded` stops at
+        // the cache, so a library added on the server would never appear otherwise.
         .onChange(of: scenePhase) { _, phase in
+            DiagLog.notice(.launch, "Scene \(phase)")
             if phase == .active {
                 Task { await dataStore.refreshLibraries() }
-                JellyfinDataStore.shared.reload()
+                ServerDataStore.shared.reload()
             }
         }
     }
 
-    /// The splash covers the home until it's *fully* settled: content ready AND
-    /// the hero backdrop on screen (when the hero is enabled). Gating on the
-    /// hero too is what stops it popping in a beat after the rows paint. If the
-    /// hero is disabled there's nothing to wait for, so content-ready alone
-    /// dismisses. When content is ready but the hero is still loading, arm a
-    /// short cap so a slow image can't hold the splash up.
+    /// Dismisses the splash once content is ready and, with the hero on, its backdrop is too,
+    /// so the hero does not pop in after the rows. A short cap keeps a slow image from holding it.
     private func evaluateSplashDismissal(trigger: String) {
         guard showSplash else { return }
 
@@ -232,6 +222,15 @@ private struct AutoPlayLauncherModifier: ViewModifier {
                 hasLaunched = true
                 print("[AutoPlay] Starting: ratingKey=\(ratingKey) duration=\(testDuration)s skipLifecycle=\(skipLifecycle) offset=\(startOffset.map { String(format: "%.0f", $0) } ?? "none")")
 
+                #if DEBUG
+                // RIVULET_AUTOPLAY_SERVER=<machineIdentifier>: play the key from
+                // another Plex server on the account, through the real tile route.
+                if let machineID = env["RIVULET_AUTOPLAY_SERVER"] {
+                    await ContentView.autoplayOnOtherServer(machineID, ratingKey: ratingKey, duration: testDuration)
+                    return
+                }
+                #endif
+
                 // Wait for auth to be ready
                 let authManager = PlexAuthManager.shared
                 let deadline = Date().addingTimeInterval(30)
@@ -284,7 +283,6 @@ private struct AutoPlayLauncherModifier: ViewModifier {
                         serverURL: serverURL,
                         authToken: authToken,
                         startOffset: startOffset,
-                        shuffledQueue: [],
                         loadingArtImage: nil,
                         loadingThumbImage: nil
                     )
@@ -337,6 +335,36 @@ private struct AutoPlayLauncherModifier: ViewModifier {
             }
     }
 }
+
+#if DEBUG
+extension ContentView {
+    /// The autoplay hook for an extra Plex server's item: waits for its provider,
+    /// then plays it the way a tile does (`ProviderPlayer.play`).
+    @MainActor
+    static func autoplayOnOtherServer(_ machineID: String, ratingKey: String, duration: TimeInterval) async {
+        let providerID = "plex:\(machineID)"
+        let deadline = Date().addingTimeInterval(45)
+        while MediaProviderRegistry.shared.provider(for: providerID) == nil {
+            guard Date() < deadline else { return print("[AutoPlay] ERROR: \(providerID) never registered") }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        guard let provider = MediaProviderRegistry.shared.provider(for: providerID),
+              let detail = try? await provider.fullDetail(for: MediaItemRef(providerID: providerID, itemID: ratingKey)),
+              let rootVC = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.windows.first?.rootViewController
+        else { return print("[AutoPlay] ERROR: could not resolve \(ratingKey) on \(providerID)") }
+        print("[AutoPlay] Other server: \(detail.item.title) on \(providerID) isPlex=\(detail.item.ref.isPlex)")
+        ProviderPlayer.play(detail.item, fromBeginning: false, from: rootVC, onDismiss: nil)
+        // Unstructured: presenting the player cancels the view's .task, which would end the sleep at once.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(duration))
+            print("[AutoPlay] Test duration elapsed (\(duration)s), exiting")
+            rootVC.dismiss(animated: false)
+            try? await Task.sleep(for: .seconds(2))
+            exit(0)
+        }
+    }
+}
+#endif
 
 #Preview {
     ContentView()

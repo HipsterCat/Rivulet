@@ -113,8 +113,10 @@ final class KinoPubDemoProvider: MediaProvider, @unchecked Sendable {
             mediaSources: [],
             trailerURL: nil,
             contentRating: raw.displayRating,
-            rating: MediaRating(raw.kinopoiskRating, source: .unknown)
-                ?? MediaRating(raw.imdbRating, source: .imdb),
+            ratings: MediaRating.ordered([
+                MediaRating(raw.imdbRating, source: .imdb),
+                MediaRating(raw.kinopoiskRating, source: .unknown),
+            ]),
             nextEpisode: raw.isSeries ? episode(raw, season: 1, number: 1) : nil,
             collections: []
         )

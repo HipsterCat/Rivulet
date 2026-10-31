@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  FocusableActionButton.swift
-//  Rivulet
-//
-//  A focusable rounded button for the expanded-detail action row (Play pill +
-//  circle buttons). Renders its own background; the caller adds the content
-//  (icon / label / progress) as subviews and registers which of those should
-//  invert to black on focus. On tvOS the focus engine focuses it (canBecomeFocused)
-//  and Select fires `.primaryActionTriggered`; the focused appearance (scale +
-//  white fill + inverted content) animates on the UIFocusAnimationCoordinator so
-//  it rides the system focus animation. Mirrors the focus pattern used by the
-//  below-fold cells (see BelowFoldCells.swift).
-//
-//  These buttons are only focusable while an ancestor (the chrome) is
-//  user-interaction-enabled — i.e. in `.expandedDetail` mode, not in
-//  carousel-stable — so the carousel's focusless-modal model is unaffected.
-//
+//  The detail action row's focusable rounded button. Callers add the content and name the
+//  subviews that invert on focus; Select fires `.primaryActionTriggered`.
 
 import UIKit
 
@@ -26,10 +11,7 @@ final class FocusableActionButton: UIControl {
     /// UILabel via textColor). Set by the builder after adding content.
     var invertOnFocus: [UIView] = []
 
-    /// Plain views whose backgroundColor inverts on focus — e.g. the Play
-    /// progress track, which is white at rest and would vanish on the white
-    /// focused fill. Focused → dark, resting → translucent white (matches
-    /// SwiftUI's track color).
+    /// Views whose background goes dark on focus, such as the Play progress track on the white fill.
     var invertBackgroundOnFocus: [UIView] = []
 
     /// Like `invertBackgroundOnFocus` but for the filled portion drawn on top of
@@ -40,11 +22,7 @@ final class FocusableActionButton: UIControl {
     /// Invoked on Select (`.primaryActionTriggered`).
     var onPrimaryAction: (() -> Void)?
 
-    /// Focus appearance. `.pill` (default) inverts to a white fill with black
-    /// content — the action-row look. `.glass` keeps the content white and uses
-    /// the app's glass convention (subtle white fill + 1px border + gentle
-    /// scale) — used for large soft targets like the bio panel, where a white
-    /// pill would be jarring. See PersonHeaderCell.
+    /// `.pill` inverts to white with black content; `.glass` keeps content white, for large targets like the bio panel.
     enum FocusStyle { case pill, glass }
     var focusStyle: FocusStyle = .pill
 
@@ -85,10 +63,8 @@ final class FocusableActionButton: UIControl {
 
     @objc private func primary() { fireOnce() }
 
-    // On tvOS a bare UIControl's `.primaryActionTriggered` is unreliable for the
-    // remote Select press (it's delivered to the FOCUSED view's press handlers).
-    // Handle it here too, debounced so primaryActionTriggered + pressesEnded
-    // can't double-fire. Mirrors AboutCardControl.
+    // A bare UIControl's primaryActionTriggered misses Select on tvOS, so presses fire
+    // too, debounced against double-firing.
     private var lastFireTime: CFTimeInterval = 0
     private func fireOnce() {
         let now = CACurrentMediaTime()
@@ -107,6 +83,65 @@ final class FocusableActionButton: UIControl {
     }
 
     override var canBecomeFocused: Bool { true }
+
+    /// The detail pages' pill: icon and title, white until focus inverts them.
+    static func pill(title: String, systemImage: String?) -> (button: FocusableActionButton, title: UILabel, icon: UIImageView) {
+        let pill = FocusableActionButton()
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.layer.cornerRadius = HeroPillButton.buttonHeight / 2
+        pill.setContentHuggingPriority(.required, for: .horizontal)
+        pill.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let icon = UIImageView(image: systemImage.flatMap { UIImage(systemName: $0) })
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.tintColor = .white
+        icon.contentMode = .scaleAspectFit
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = HeroPillButton.titleFont
+        label.textColor = .white
+        label.text = title
+        pill.addSubview(icon)
+        pill.addSubview(label)
+        NSLayoutConstraint.activate([
+            pill.heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
+            icon.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: HeroPillButton.sidePadding),
+            icon.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 24),
+            icon.heightAnchor.constraint(equalToConstant: 24),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: HeroPillButton.iconGap),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -HeroPillButton.sidePadding),
+            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+        ])
+        pill.invertOnFocus = [icon, label]
+        return (pill, label, icon)
+    }
+
+    /// The detail pages' round icon button.
+    static func circle(systemImage: String) -> FocusableActionButton {
+        let b = FocusableActionButton()
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.layer.cornerRadius = HeroPillButton.buttonHeight / 2
+        let icon = UIImageView(image: UIImage(systemName: systemImage))
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.tintColor = .white
+        icon.contentMode = .scaleAspectFit
+        b.addSubview(icon)
+        NSLayoutConstraint.activate([
+            b.widthAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
+            b.heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
+            icon.centerXAnchor.constraint(equalTo: b.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: b.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 30),
+            icon.heightAnchor.constraint(equalToConstant: 30),
+        ])
+        b.invertOnFocus = [icon]
+        return b
+    }
+
+    /// Swaps a `circle`'s glyph.
+    func setIcon(_ systemImage: String) {
+        (subviews.compactMap { $0 as? UIImageView }.first)?.image = UIImage(systemName: systemImage)
+    }
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         let focused = context.nextFocusedView === self

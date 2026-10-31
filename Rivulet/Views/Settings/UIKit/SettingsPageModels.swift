@@ -11,9 +11,9 @@
 //  the UIKit equivalent of SettingsView's per-page ViewBuilders.
 //
 
+import Combine
 import Foundation
 import UIKit
-import SwiftUI
 
 /// Small UserDefaults helpers that honor the SwiftUI `@AppStorage` default
 /// for a key (which is NOT written to UserDefaults until first change).
@@ -91,6 +91,8 @@ struct SettingsRowItem {
     /// unfocusable while that state is off. Evaluated live (not cached at build
     /// time) so flipping the row it depends on takes effect without a rebuild.
     var isEnabled: () -> Bool = { true }
+    /// Shows a spinner in place of the value while the row's change runs.
+    var isBusy: () -> Bool = { false }
     /// True = this "row" is really a group caption (see `header(_:)`).
     var isHeader = false
 
@@ -154,23 +156,27 @@ struct SettingsRowItem {
 @MainActor
 enum SettingsContent {
 
-    /// The run headers when both servers are listed (Home Rows, Sidebar
+    /// The run headers when several servers are listed (Home Rows, Sidebar
     /// Libraries). Two servers with one name would read as the same server
     /// twice, so then each also names its server type.
-    static func serverRunHeaders(plex: String, jellyfin: String) -> (plex: String, jellyfin: String) {
-        guard plex == jellyfin else { return (plex, jellyfin) }
-        return ("\(plex) (\(MediaProviderKind.plex.displayName))",
-                "\(jellyfin) (\(MediaProviderKind.jellyfin.displayName))")
+    static func serverRunHeaders(_ runs: [(name: String, kind: MediaProviderKind)]) -> [String] {
+        runs.map { run in
+            runs.filter { $0.name == run.name }.count > 1 ? "\(run.name) (\(run.kind.displayName))" : run.name
+        }
     }
 
-    private static var currentServerRunHeaders: (plex: String, jellyfin: String) {
-        serverRunHeaders(plex: PlexAuthManager.shared.savedServerName ?? "Plex",
-                         jellyfin: JellyfinDataStore.shared.account?.serverName ?? "Jellyfin")
+    /// Every server's run, the selected Plex server first: its name, kind and provider id
+    /// (nil for the selected Plex server, whose rows and libraries are PlexDataStore's).
+    private static var serverRuns: [(name: String, kind: MediaProviderKind, providerID: String?)] {
+        [(PlexAuthManager.shared.savedServerName ?? "Plex", .plex, nil)]
+            + ServerDataStore.shared.sources.map { source in
+                (source.name, source.providerID.hasPrefix("jellyfin:") ? .jellyfin : .plex, source.providerID)
+            }
     }
 
     /// Rows a restricted (managed) Plex profile does not get: other servers,
     /// sources, sign-out, and the parental controls themselves.
-    static let ownerOnlyRowIDs: Set<String> = ["cat_servers", "liveTVSources", "cat_contentFilter", "profilePickerOnLaunch"]
+    static let ownerOnlyRowIDs: Set<String> = ["cat_servers", "liveTVSources", "hdr_Filtering", "cat_contentFilter", "profilePickerOnLaunch"]
 
     static func rows(for page: SettingsPage) -> [SettingsRowItem] {
         let rows = allRows(for: page)
@@ -187,7 +193,7 @@ enum SettingsContent {
         case .music:       return music
         case .servers:     return servers
         case .plex:        return plex
-        case .plexServerPicker: return plexServerPicker
+        case .plexServerDetail: return plexServerDetail
         case .jellyfin:    return jellyfin
         case .libraries:   return libraries
         case .homeRows:    return homeRows
@@ -197,10 +203,14 @@ enum SettingsContent {
         case .liveTVFavorites: return liveTVFavorites
         case .addLiveTVSource:  return addLiveTVSource
         case .addXtream:        return addXtream
-        case .addOwnServer:     return addOwnServer
+        case .addDispatcharr:   return addDispatcharr
+        case .addTvheadend:     return addTvheadend
+        case .addThreadfin:     return addThreadfin
         case .addPlaylistURL:   return addPlaylistURL
         case .about:       return about
-        case .displaySizePicker:      return displaySizePicker
+        case .appIconPicker:          return appIconPicker
+        case .homeHeroPicker:         return homeHeroPicker
+        case .detailRatingPicker:     return detailRatingPicker
         case .autoplayCountdownPicker: return autoplayCountdownPicker
         case .skipIntervalPicker:     return skipIntervalPicker
         case .skipBackIntervalPicker: return skipBackIntervalPicker
@@ -213,16 +223,51 @@ enum SettingsContent {
         case .subtitleLanguagePicker: return subtitleLanguagePicker
         case .contentFilter:          return contentFilter
         case .contentFilterStrength:  return contentFilterStrength
+        case .contentFilterWords:     return contentFilterWords
         }
     }
 
     // MARK: Picker pages (checkmark option rows; select-and-pop)
 
-    private static var displaySizePicker: [SettingsRowItem] {
-        DisplaySize.allCases.map { opt in
-            SettingsRowItem(id: "ds_\(opt.rawValue)", title: opt.description, kind: .option(
-                isSelected: { SettingsStore.string("displaySize", default: DisplaySize.normal.rawValue) == opt.rawValue },
-                select: { SettingsStore.setString("displaySize", opt.rawValue) }))
+    private static var appIconPicker: [SettingsRowItem] {
+        AppIcon.allCases.map { icon in
+            SettingsRowItem(id: "ai_\(icon.rawValue)", title: icon.title, kind: .option(
+                isSelected: { AppIcon.current == icon },
+                select: { icon.apply() }))
+        }
+    }
+
+    private static let homeHeroOptions: [(id: String, title: String)] = [
+        ("off", "Off"), ("trending", "Trending"), ("continueWatching", "Continue Watching"),
+        ("recentlyAdded", "Recently Added"), ("watchlist", "Watchlist"),
+    ]
+
+    /// Off, or the hero on with what it shows: `showHomeHero` plus `homeHeroContent`.
+    private static var homeHeroPicker: [SettingsRowItem] {
+        homeHeroOptions.map { option in
+            SettingsRowItem(id: "hh_\(option.id)", title: option.title, kind: .option(
+                isSelected: { homeHeroChoice == option.id },
+                select: {
+                    SettingsStore.setBool("showHomeHero", option.id != "off")
+                    if option.id != "off" { SettingsStore.setString("homeHeroContent", option.id) }
+                }))
+        }
+    }
+
+    private static var homeHeroChoice: String {
+        guard SettingsStore.bool("showHomeHero", default: true) else { return "off" }
+        return PlexHomeViewController.heroContent.rawValue
+    }
+
+    private static var homeHeroTitle: String {
+        homeHeroOptions.first { $0.id == homeHeroChoice }?.title ?? "Trending"
+    }
+
+    private static var detailRatingPicker: [SettingsRowItem] {
+        MediaRating.Source.allCases.filter { $0 != .unknown }.map { source in
+            SettingsRowItem(id: "dr_\(source.rawValue)", title: source.name, kind: .option(
+                isSelected: { MediaRating.detailSource == source },
+                select: { UserDefaults.standard.set(source.rawValue, forKey: MediaRating.detailSourceKey) }))
         }
     }
 
@@ -252,12 +297,10 @@ enum SettingsContent {
 
     /// Forced Only is set only by a player pick, so it is listed only while it is current.
     private static var subtitleModePicker: [SettingsRowItem] {
-        let current = SubtitleMode(TrackIntentStore.effectiveSubtitleIntent)
-        let modes: [SubtitleMode] = [.off, .foreignAudio, .always] + (current == .forcedOnly ? [.forcedOnly] : [])
-        return modes.map { mode in
+        SubtitleMode.choices.map { mode in
             SettingsRowItem(id: "sm_\(mode)", title: mode.rawValue, kind: .option(
-                isSelected: { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent) == mode },
-                select: { setSubtitles(mode: mode) }))
+                isSelected: { SubtitleMode.current == mode },
+                select: { TrackIntentStore.setSubtitles(mode: mode) }))
         }
     }
 
@@ -272,9 +315,11 @@ enum SettingsContent {
     /// "" is Off; the rest are the layouts the engine renders heights into.
     private static var heightSpeakersPicker: [SettingsRowItem] {
         ["", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "9.1.6"].map { layout in
-            SettingsRowItem(id: "hs_\(layout.isEmpty ? "off" : layout)", title: layout.isEmpty ? "Off" : layout, kind: .option(
-                isSelected: { heightSpeakers == layout },
-                select: { SettingsStore.setString(AetherPlayer.heightSpeakersKey, layout) }))
+            SettingsRowItem(id: "hs_\(layout.isEmpty ? "off" : layout)", title: layout.isEmpty ? "Off" : layout,
+                            kind: .selectable(isSelected: { heightSpeakers == layout }, value: { nil }, handler: { vc in
+                SettingsStore.setString(AetherPlayer.heightSpeakersKey, layout)
+                (vc as? SettingsPageViewController)?.onPop?()
+            }))
         }
     }
 
@@ -289,69 +334,30 @@ enum SettingsContent {
     }
 
     private static var audioLanguagePicker: [SettingsRowItem] {
-        let languages = TrackLanguage.choices.sorted { TrackLanguage.displayName($0) < TrackLanguage.displayName($1) }
-        return ([TrackLanguage.original] + languages).map { code in
-            SettingsRowItem(id: "al_\(code)", title: audioLanguageName(code), kind: .option(
-                isSelected: { TrackLanguage.normalize(TrackIntentStore.effectiveAudioIntent.language) == code },
+        let languages = TrackLanguage.sortedChoices
+        // No stored intent follows the Plex account's audio language (#382).
+        let account = SettingsRowItem(id: "al_account", title: TrackLanguage.audioSettingName(nil), kind: .option(
+            isSelected: { TrackIntentStore.audioIntent == nil },
+            select: { TrackIntentStore.audioIntent = nil }))
+        return [account] + ([TrackLanguage.original] + languages).map { code in
+            SettingsRowItem(id: "al_\(code)", title: TrackLanguage.audioSettingName(code), kind: .option(
+                isSelected: { TrackIntentStore.audioIntent.map { TrackLanguage.normalize($0.language) } == code },
                 select: { TrackIntentStore.audioIntent = AudioIntent(language: code) }))
         }
     }
 
     private static var subtitleLanguagePicker: [SettingsRowItem] {
-        TrackLanguage.choices.sorted { TrackLanguage.displayName($0) < TrackLanguage.displayName($1) }.map { code in
+        TrackLanguage.sortedChoices.map { code in
             SettingsRowItem(id: "sl_\(code)", title: TrackLanguage.displayName(code), kind: .option(
-                isSelected: { TrackLanguage.normalize(subtitleLanguage) == code },
-                select: { setSubtitles(mode: SubtitleMode(TrackIntentStore.effectiveSubtitleIntent), language: code) }))
+                isSelected: { TrackLanguage.normalize(TrackIntentStore.subtitleLanguage) == code },
+                select: { TrackIntentStore.setSubtitles(language: code) }))
         }
     }
 
     // MARK: Audio and subtitles (read and written through TrackIntentStore)
 
-    private static func audioLanguageName(_ code: String) -> String {
-        if code == TrackLanguage.original { return "Original" }
-        // An untagged or unknown pick resolves to English (see resolveAudio).
-        return TrackLanguage.isKnown(code) ? TrackLanguage.displayName(code) : TrackLanguage.displayName(TrackLanguage.english)
-    }
-
-    private enum SubtitleMode: String {
-        case foreignAudio = "Foreign Audio", always = "Always", off = "Off", forcedOnly = "Forced Only"
-
-        init(_ intent: SubtitleIntent) {
-            switch intent {
-            case .off: self = .off
-            case .foreignAudio: self = .foreignAudio
-            case .track(_, let forced, _, _): self = forced ? .forcedOnly : .always
-            }
-        }
-    }
-
-    private static var subtitleLanguage: String {
-        TrackIntentStore.effectiveSubtitleIntent.language ?? TrackLanguage.device
-    }
-
     private static var heightSpeakers: String {
         SettingsStore.string(AetherPlayer.heightSpeakersKey, default: "")
-    }
-
-    private static var subtitleSDH: Bool {
-        switch TrackIntentStore.effectiveSubtitleIntent {
-        case .off: return false
-        case .track(_, _, let hi, _), .foreignAudio(_, let hi): return hi
-        }
-    }
-
-    private static func setSubtitles(mode: SubtitleMode, language: String? = nil, sdh: Bool? = nil) {
-        let language = language ?? subtitleLanguage
-        let sdh = sdh ?? subtitleSDH
-        switch mode {
-        case .off:
-            TrackIntentStore.subtitleIntent = .off
-        case .foreignAudio:
-            TrackIntentStore.subtitleIntent = .foreignAudio(language: language, hearingImpaired: sdh)
-        case .always, .forcedOnly:
-            TrackIntentStore.subtitleIntent = .track(language: language, forced: mode == .forcedOnly,
-                                                     hearingImpaired: sdh, codec: nil)
-        }
     }
 
     // MARK: Root
@@ -378,33 +384,26 @@ enum SettingsContent {
         var rows: [SettingsRowItem] = [
             // Leading block is unheaded, like an Apple TV Settings page's first
             // group: it sits directly under the page title.
-            SettingsRowItem(id: "libraries", title: "Sidebar Libraries", kind: .navigation(.libraries)),
-            SettingsRowItem(id: "displaySize", title: "Display Size",
-                            kind: .navigationValue(.displaySizePicker, value: {
-                                DisplaySize(rawValue: SettingsStore.string("displaySize", default: DisplaySize.normal.rawValue))?.description ?? ""
-                            })),
-            // Discover is a sidebar tab, not a Home row, so it sits in the
-            // unheaded block with the other whole-app placement rows.
-            toggle("showDiscoverTab", "Show Discover Tab", key: "showDiscoverTab", default: true),
-            // Nothing to place when there is no Discover tab, so this dims with
-            // it rather than vanishing (a toggle only re-dims the visible rows,
-            // it does not rebuild the list).
-            toggle("discoverAboveLibraries", "Discover Above Libraries", key: "discoverAboveLibraries", default: true,
-                   enabledWhen: { SettingsStore.bool("showDiscoverTab", default: true) }),
-            toggle("showWatchlistTab", "Show Watchlist Tab", key: "showWatchlistTab", default: true),
+            SettingsRowItem(id: "libraries", title: "Sidebar", kind: .navigation(.libraries)),
+            // App Icon row withheld on tvOS: App Store Connect rejects the alternate icons (ITMS-90471).
             // Profiles themselves are switched from the sidebar now, so this is
             // all that is left of the retired User Profiles page.
             SettingsRowItem(id: "profilePickerOnLaunch", title: "Profile Picker on Launch",
                             kind: .toggle(
                                 get: { PlexUserProfileManager.shared.showProfilePickerOnLaunch },
                                 set: { PlexUserProfileManager.shared.showProfilePickerOnLaunch = $0 })),
+            SettingsRowItem(id: "topShelfStyle", title: "Top Shelf",
+                            kind: .cycle(value: { TopShelfCache.shared.fullScreen ? "Full Screen" : "Posters" },
+                                         next: { TopShelfCache.shared.fullScreen.toggle() })),
+            toggle("skipPreview", "Skip Preview", key: "skipPreviewCarousel", default: false),
 
             // Titles drop whatever their caption already says ("Home Hero" under
             // HOME reads as "Home Home Hero"), the way Apple TV Settings puts a
             // bare "Siri" row under SIRI.
             .header("Home"),
             SettingsRowItem(id: "homeRows", title: "Rows", kind: .navigation(.homeRows)),
-            toggle("homeHero", "Hero", key: "showHomeHero", default: true),
+            SettingsRowItem(id: "homeHero", title: "Hero",
+                            kind: .navigationValue(.homeHeroPicker, value: { homeHeroTitle })),
             toggle("personalizedRecs", "Personalized Recommendations", key: "enablePersonalizedRecommendations", default: false)
         ]
         rows += [
@@ -413,8 +412,15 @@ enum SettingsContent {
             toggle("discoveryRows", "Discovery Rows", key: "showLibraryRecommendations", default: true),
             toggle("recentRows", "Recent Rows", key: "showLibraryRecentRows", default: true),
 
+            .header("Details"),
+            SettingsRowItem(id: "detailRating", title: "Rating",
+                            kind: .navigationValue(.detailRatingPicker, value: { MediaRating.detailSource.name })),
+
             .header("Live TV"),
-        ] + liveTVLookRows
+        ] + liveTVLookRows + [
+            .header("Extras"),
+            toggle("easterEggs", "Easter Eggs", key: EasterEggs.key, default: true)
+        ]
         return rows
     }
 
@@ -423,7 +429,6 @@ enum SettingsContent {
     /// keys in both places, and each page reads them when it opens.
     private static var liveTVLookRows: [SettingsRowItem] {
         [
-            toggle("liveTVAboveLibraries", "Above Libraries", key: "liveTVAboveLibraries", default: false),
             SettingsRowItem(id: "defaultLayout", title: "Default Layout",
                             kind: .cycle(value: { (LiveTVLayout(rawValue: SettingsStore.string("liveTVLayout", default: LiveTVLayout.fallback.rawValue)) ?? .fallback).description },
                                          next: { cycleLiveTVLayout() }))
@@ -433,46 +438,41 @@ enum SettingsContent {
     // MARK: Playback
 
     private static var playback: [SettingsRowItem] {
-        let subtitlesOn = { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent) != .off }
-        // Leading block unheaded, like Appearance; the rest grouped under
-        // headers whose titles the rows then drop ("Intro" under AUTO-SKIP).
+        let subtitlesOn = { SubtitleMode.current != .off }
+        // Grouped under headers whose titles the rows then drop ("Intro" under AUTO-SKIP).
         return [
-            SettingsRowItem(id: "cat_contentFilter", title: "Content Filtering",
-                            kind: .navigationValue(.contentFilter, value: {
-                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? "On" : "Off"
-                            })),
             .header("Audio & Subtitles"),
             SettingsRowItem(id: "audioLanguage", title: "Audio Language",
                             kind: .navigationValue(.audioLanguagePicker, value: {
-                                audioLanguageName(TrackLanguage.normalize(TrackIntentStore.effectiveAudioIntent.language))
+                                TrackLanguage.audioSettingName(TrackIntentStore.audioIntent.map { TrackLanguage.normalize($0.language) })
                             })),
             SettingsRowItem(id: "subtitleMode", title: "Subtitles",
-                            kind: .navigationValue(.subtitleModePicker, value: { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent).rawValue })),
+                            kind: .navigationValue(.subtitleModePicker, value: { SubtitleMode.current.rawValue })),
             SettingsRowItem(id: "subtitleLanguage", title: "Subtitle Language",
                             kind: .navigationValue(.subtitleLanguagePicker, value: {
-                                TrackLanguage.displayName(TrackLanguage.normalize(subtitleLanguage))
+                                TrackLanguage.displayName(TrackLanguage.normalize(TrackIntentStore.subtitleLanguage))
                             }), isEnabled: subtitlesOn),
             SettingsRowItem(id: "subtitleSDH", title: "SDH Subtitles",
-                            kind: .toggle(get: { subtitleSDH },
-                                          set: { setSubtitles(mode: SubtitleMode(TrackIntentStore.effectiveSubtitleIntent), sdh: $0) }),
+                            kind: .toggle(get: { TrackIntentStore.subtitleSDH },
+                                          set: { TrackIntentStore.setSubtitles(sdh: $0) }),
                             isEnabled: subtitlesOn),
-            SettingsRowItem(id: "heightSpeakers", title: "Height Speakers",
-                            kind: .navigationValue(.heightSpeakersPicker, value: { heightSpeakers.isEmpty ? "Off" : heightSpeakers })),
-            .header("Auto-Skip"),
-            toggle("autoSkipIntro", "Intro", key: "autoSkipIntro", default: false),
-            toggle("autoSkipCredits", "Credits", key: "autoSkipCredits", default: false),
-            toggle("autoSkipAds", "Ads", key: "autoSkipAds", default: false),
-            toggle("autoSkipRecap", "Recap", key: "autoSkipRecap", default: false),
-            toggle("useIntroDB", "Community Marker Database", key: "useIntroDB", default: false),
-            .header("Remote"),
-            SettingsRowItem(id: "skipLength", title: "Skip Forward",
-                            kind: .navigationValue(.skipIntervalPicker, value: {
-                                SkipInterval(rawValue: SettingsStore.int(SkipInterval.storageKey, default: SkipInterval.defaultValue.rawValue))?.description ?? ""
-                            })),
-            SettingsRowItem(id: "skipBackLength", title: "Skip Back",
-                            kind: .navigationValue(.skipBackIntervalPicker, value: {
-                                SkipInterval(rawValue: Int(InputConfig.tapSeekBackSeconds))?.description ?? ""
-                            })),
+            // Turning it on fetches the speech model that writes them; the value shows its download.
+            SettingsRowItem(id: "generatedSubtitles", title: "Generated Subtitles (English)", kind: .selectable(
+                isSelected: { false },
+                value: { generatedSubtitlesValue },
+                handler: { vc in
+                    let key = UniversalPlayerViewModel.generatedSubtitlesFallbackKey
+                    let on = !SettingsStore.bool(key, default: false)
+                    SettingsStore.setBool(key, on)
+                    if on { SpeechModelStore.shared.prepare() }
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                })),
+            .header("Resume"),
+            toggle("instantResume", "Instant Resume", key: "continueWatchingInstantResume", default: true),
+            // The prompt only has anything to interrupt while a Continue
+            // Watching tile plays on Select, so it dims with Instant Resume off.
+            toggle("promptResumeOrRestart", "Resume or Restart Prompt", key: "promptResumeOrRestart", default: false,
+                   enabledWhen: { SettingsStore.bool("continueWatchingInstantResume", default: true) }),
             .header("Streaming Quality"),
             SettingsRowItem(id: "homeStreamingQuality", title: "Home",
                             kind: .navigationValue(.homeQualityPicker, value: {
@@ -482,12 +482,21 @@ enum SettingsContent {
                             kind: .navigationValue(.awayQualityPicker, value: {
                                 StreamingQuality.setting(home: false).label
                             })),
-            .header("Resume"),
-            toggle("instantResume", "Instant Resume", key: "continueWatchingInstantResume", default: true),
-            // The prompt only has anything to interrupt while a Continue
-            // Watching tile plays on Select, so it dims with Instant Resume off.
-            toggle("promptResumeOrRestart", "Resume or Restart Prompt", key: "promptResumeOrRestart", default: false,
-                   enabledWhen: { SettingsStore.bool("continueWatchingInstantResume", default: true) }),
+            .header("Remote"),
+            SettingsRowItem(id: "skipLength", title: "Skip Forward",
+                            kind: .navigationValue(.skipIntervalPicker, value: {
+                                SkipInterval(rawValue: SettingsStore.int(SkipInterval.storageKey, default: SkipInterval.defaultValue.rawValue))?.description ?? ""
+                            })),
+            SettingsRowItem(id: "skipBackLength", title: "Skip Back",
+                            kind: .navigationValue(.skipBackIntervalPicker, value: {
+                                SkipInterval(rawValue: Int(InputConfig.tapSeekBackSeconds))?.description ?? ""
+                            })),
+            .header("Skip Buttons"),
+            skipModeRow("autoSkipIntro", "Intro", marker: "intro"),
+            skipModeRow("autoSkipCredits", "Credits", marker: "credits"),
+            skipModeRow("autoSkipAds", "Ads", marker: "commercial"),
+            skipModeRow("autoSkipRecap", "Recap", marker: "recap"),
+            toggle("useIntroDB", "Community Marker Database", key: "useIntroDB", default: false),
             .header("Autoplay"),
             SettingsRowItem(id: "autoplayCountdown", title: "Countdown",
                             kind: .navigationValue(.autoplayCountdownPicker, value: {
@@ -496,7 +505,22 @@ enum SettingsContent {
             SettingsRowItem(id: "autoplayLimit", title: "Limit",
                             kind: .navigationValue(.autoplayLimitPicker, value: { AutoplayLimit.current.description })),
             toggle("showPostVideoUpNext", "Up Next Panel", key: "showPostVideoUpNext", default: true),
+            .header("Home Theater"),
+            toggle("upscaleLowResolution", "Upscale SD and 720p", key: AetherPlayer.upscaleKey, default: false),
+            toggle("dolbyVisionFEL", "Dolby Vision FEL", key: AetherPlayer.dolbyVisionFELKey, default: false),
+            SettingsRowItem(id: "heightSpeakers", title: "Height Speakers",
+                            kind: .navigationValue(.heightSpeakersPicker, value: { heightSpeakers.isEmpty ? "Off" : heightSpeakers })),
+            .header("Filtering"),
+            SettingsRowItem(id: "cat_contentFilter", title: "Content Filtering",
+                            kind: .navigationValue(.contentFilter, value: {
+                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? "On" : "Off"
+                            })),
         ]
+    }
+
+    private static var generatedSubtitlesValue: String {
+        guard SettingsStore.bool(UniversalPlayerViewModel.generatedSubtitlesFallbackKey, default: false) else { return "Off" }
+        return SpeechModelStore.shared.statusText
     }
 
     // MARK: Content Filtering
@@ -506,21 +530,34 @@ enum SettingsContent {
     /// (see the source URL row).
     private static var contentFilter: [SettingsRowItem] {
         var rows: [SettingsRowItem] = [
-            toggle("cf_master", "Content Filter",
-                   key: ContentFilterManager.Keys.enabled, default: false)
+            // Turning the filter on fetches the speech model that times each muted word.
+            SettingsRowItem(id: "cf_master", title: "Content Filter", kind: .toggle(
+                get: { SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) },
+                set: { SettingsStore.setBool(ContentFilterManager.Keys.enabled, $0) },
+                didChange: { on, _ in if on { SpeechModelStore.shared.prepare() } }),
+                isBusy: {
+                    guard case .downloading = SpeechModelStore.shared.state else { return false }
+                    return SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false)
+                })
         ]
 
         // Language categories (auto-detected from subtitles)
-        rows.append(categoryToggle(.profanity, id: "cf_profanity"))
-        rows.append(SettingsRowItem(id: "cf_strength", title: "Profanity Strength",
+        rows.append(.header("Audio"))
+        rows.append(SettingsRowItem(id: "cf_profanity", title: "Profanity",
                                     kind: .navigationValue(.contentFilterStrength, value: {
-                                        strengthLabel(currentProfanityStrength())
+                                        profanityOn ? strengthLabel(currentProfanityStrength()) : "Off"
                                     })))
         rows.append(categoryToggle(.blasphemy, id: "cf_blasphemy"))
         rows.append(categoryToggle(.slur, id: "cf_slur"))
         rows.append(categoryToggle(.sexualLanguage, id: "cf_sexualLanguage"))
+        rows.append(SettingsRowItem(id: "cf_customWords", title: "Custom Words",
+                                    kind: .navigationValue(.contentFilterWords, value: {
+                                        let count = ContentFilterManager.customWords.count
+                                        return count == 0 ? "None" : "\(count)"
+                                    })))
 
         // Scene categories (require an imported filter list)
+        rows.append(.header("Visual"))
         rows.append(categoryToggle(.violence, id: "cf_violence"))
         rows.append(categoryToggle(.sexNudity, id: "cf_sexNudity"))
         rows.append(categoryToggle(.frightening, id: "cf_frightening"))
@@ -535,16 +572,54 @@ enum SettingsContent {
                                         suggestions: [],
                                         keyboardType: .URL,
                                         set: { SettingsStore.setString(ContentFilterManager.Keys.listSourceURL, $0) })))
+        // Everything below the master toggle dims until the filter is on.
+        for i in rows.indices.dropFirst() {
+            rows[i].isEnabled = { SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) }
+        }
         return rows
     }
 
+    /// The user's own words (#404): an Add row, then one row per word; selecting a word removes it.
+    private static var contentFilterWords: [SettingsRowItem] {
+        var rows = [SettingsRowItem(id: "cfw_add", title: "Add Word", kind: .textEntry(
+            value: { "" },
+            placeholder: "Word or Phrase",
+            hint: nil,
+            suggestions: [],
+            keyboardType: .default,
+            set: { ContentFilterManager.addCustomWord($0) }))]
+        rows += ContentFilterManager.customWords.map { word in
+            SettingsRowItem(id: "cfw_\(word)", title: word, kind: .action(destructive: false, handler: { vc in
+                presentConfirm(on: vc, title: "Remove \"\(word)\"?",
+                               message: "The filter will stop muting this word.",
+                               confirmTitle: "Remove", destructive: true) {
+                    ContentFilterManager.customWords.removeAll { $0 == word }
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }))
+        }
+        return rows
+    }
+
+    /// Off, then the strengths: picking one turns the profanity category on.
     private static var contentFilterStrength: [SettingsRowItem] {
-        FilterSeverity.allCases.map { severity in
+        let key = FilterCategory.profanity.enabledDefaultsKey
+        let off = SettingsRowItem(id: "cfs_off", title: "Off", kind: .option(
+            isSelected: { !profanityOn },
+            select: { SettingsStore.setBool(key, false) }))
+        return [off] + FilterSeverity.allCases.map { severity in
             SettingsRowItem(id: "cfs_\(severity.rawValue)", title: strengthLabel(severity),
                             kind: .option(
-                                isSelected: { currentProfanityStrength() == severity },
-                                select: { SettingsStore.setInt(ContentFilterManager.Keys.profanityStrength, severity.rawValue) }))
+                                isSelected: { profanityOn && currentProfanityStrength() == severity },
+                                select: {
+                                    SettingsStore.setBool(key, true)
+                                    SettingsStore.setInt(ContentFilterManager.Keys.profanityStrength, severity.rawValue)
+                                }))
         }
+    }
+
+    private static var profanityOn: Bool {
+        SettingsStore.bool(FilterCategory.profanity.enabledDefaultsKey, default: FilterCategory.profanity.defaultEnabled)
     }
 
     private static func currentProfanityStrength() -> FilterSeverity {
@@ -634,41 +709,18 @@ enum SettingsContent {
 
     // MARK: Music
 
-    /// Withdrawn: every row here was a no-op, and not merely unread. Each key
-    /// had no reader at all, and the implementation each one was supposed to
-    /// gate has no caller either:
-    ///   - Crossfade wrote `musicCrossfadeDuration` as a `CrossfadeOption`
-    ///     string, while `MusicAudioProcessor.crossfadeDuration` reads
-    ///     `music_crossfade_duration` as a `CrossfadeDuration` Int — different
-    ///     key AND different type — and nothing calls that getter, so music
-    ///     playback has no crossfade to configure.
-    ///   - Loudness Normalization gated `MusicAudioProcessor.adjustedVolume(for:)`,
-    ///     which has no callers.
-    ///   - Audio Quality Badges gated `AudioQualityBadge`, a view that was never
-    ///     instantiated and has since been deleted.
-    /// Restore the rows below once one of those is actually wired up, and fix
-    /// the crossfade key/type mismatch when you do.
+    /// Withdrawn: loudness, crossfade and quality-badge keys had no reader.
+    /// Add a row back only with its reader. `MusicAudioProcessor` reads
+    /// crossfade under a different key and type than the old row wrote.
     private static var music: [SettingsRowItem] {
         []
-//        [
-//            toggle("musicLoudness", "Loudness Normalization", key: "musicLoudnessNormalization", default: false),
-//            SettingsRowItem(id: "musicCrossfade", title: "Crossfade",
-//                            kind: .cycle(value: { CrossfadeOption(rawValue: SettingsStore.string("musicCrossfadeDuration", default: CrossfadeOption.off.rawValue))?.description ?? "" },
-//                                         next: {
-//                                             let all = CrossfadeOption.allCases
-//                                             let cur = CrossfadeOption(rawValue: SettingsStore.string("musicCrossfadeDuration", default: CrossfadeOption.off.rawValue)) ?? all.first!
-//                                             let i = all.firstIndex(of: cur) ?? 0
-//                                             SettingsStore.setString("musicCrossfadeDuration", all[(i + 1) % all.count].rawValue)
-//                                         })),
-//            toggle("musicQualityBadges", "Audio Quality Badges", key: "musicShowQualityBadges", default: true)
-//        ]
     }
 
     // MARK: Servers
 
     private static var servers: [SettingsRowItem] {
         [
-            SettingsRowItem(id: "plexServer", title: "Plex Server", kind: .navigation(.plex)),
+            SettingsRowItem(id: "plexServer", title: "Plex", kind: .navigation(.plex)),
             SettingsRowItem(
                 id: "jellyfinServer", title: "Jellyfin Server",
                 kind: .navigationAction(.jellyfin,
@@ -681,48 +733,44 @@ enum SettingsContent {
 
     private static var plex: [SettingsRowItem] {
         let auth = PlexAuthManager.shared
-        if auth.isAuthenticated {
-            var rows: [SettingsRowItem] = []
-            rows.append(SettingsRowItem(id: "plexServerPicker", title: "Server",
-                                        kind: .navigationValue(.plexServerPicker, value: {
-                PlexAuthManager.shared.savedServerName ?? ""
-            })))
-            rows.append(SettingsRowItem(id: "signOut", title: "Sign Out",
-                                        kind: .action(destructive: true, handler: { vc in
-                // Ask first. An accidental Select must not sign out.
-                presentConfirm(on: vc, title: "Sign Out of Plex?",
-                               message: "You can sign in again from this page.",
-                               confirmTitle: "Sign Out", destructive: true) {
-                    PlexAuthManager.shared.signOut()
-                    // Rebuild the page in place so it flips to "Connect to Plex"
-                    // immediately (Sign Out is an in-place action — unlike the
-                    // sign-in modal, nothing else triggers viewWillAppear here).
-                    (vc as? SettingsPageViewController)?.reloadRows()
-                }
-            })))
-            return rows
-        } else {
+        guard auth.isAuthenticated else {
             return [
                 SettingsRowItem(id: "connectPlex", title: "Connect to Plex",
                                 kind: .action(destructive: false, handler: { presenter in
-                    let auth = UIHostingController(rootView: PlexAuthView())
-                    auth.modalPresentationStyle = .fullScreen
-                    presenter.present(auth, animated: true)
+                    presenter.present(PlexSignInViewController { [weak presenter] in
+                        // Connect becomes the server list, which loads on its own.
+                        guard let page = presenter as? SettingsPageViewController else { return }
+                        page.reloadRows()
+                        loadPlexServers { [weak page] in page?.reloadRows() }
+                    }, animated: true)
                 }))
             ]
         }
+        return plexServerRows + [
+            SettingsRowItem(id: "signOut", title: "Sign Out",
+                            kind: .action(destructive: true, handler: { vc in
+                // Ask first. An accidental Select must not sign out.
+                presentConfirm(on: vc, title: "Sign Out of Plex?",
+                               message: "This signs out of every Plex server on your account.",
+                               confirmTitle: "Sign Out", destructive: true) {
+                    PlexAuthManager.shared.signOut()
+                    // Sign Out is in place, so nothing else rebuilds the page.
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }))
+        ]
     }
 
-    // MARK: Plex server picker
+    // MARK: Plex servers
 
     /// The servers on the account. The page loads them each time it opens.
     /// The value is nil until they arrive.
     private static var plexServers: [PlexDevice]?
     private static var plexServersFailed = false
-    /// The server of the current switch. The page ignores other selections until the switch completes.
-    private static var connectingPlexServerID: String?
+    /// The server whose page is open, stashed by its row's `prepare`.
+    private static var pendingPlexServer: PlexDevice?
 
-    private static var plexServerPicker: [SettingsRowItem] {
+    private static var plexServerRows: [SettingsRowItem] {
         // This row can get focus. The container sets focus only on push.
         // If no row can get focus, focus is lost when the servers arrive.
         guard let servers = plexServers, !servers.isEmpty else {
@@ -737,14 +785,139 @@ enum SettingsContent {
                                     kind: .action(destructive: false, handler: { _ in }))]
         }
         return servers.map { server in
-            SettingsRowItem(id: "plexServer_\(server.clientIdentifier)", title: server.name, kind: .selectable(
-                isSelected: { connectingPlexServerID == nil && PlexAuthManager.shared.isCurrentServer(server) },
-                value: {
-                    if connectingPlexServerID == server.clientIdentifier { return "Connecting…" }
-                    return server.owned == false ? server.sourceTitle : nil
-                },
-                handler: { vc in switchPlexServer(to: server, on: vc) }))
+            SettingsRowItem(id: "plexServer_\(server.clientIdentifier)", title: server.name,
+                            kind: .navigationAction(.plexServerDetail,
+                                                    value: { isPlexServerEnabled(server) ? (server.owned == false ? server.sourceTitle ?? "" : "") : "Off" },
+                                                    prepare: { pendingPlexServer = server }))
         }
+    }
+
+    private static var plexServerDetail: [SettingsRowItem] {
+        guard let server = pendingPlexServer else { return [] }
+        let auth = PlexAuthManager.shared
+        let url = auth.isCurrentServer(server) ? auth.selectedServerURL
+            : PlexExtraServers.shared.current.first { $0.machineID == server.machineIdentifier }?.url
+        let connection = url.flatMap { url in server.connections?.first { url.contains($0.address) || url == $0.uri } }
+        let liveTV = url.flatMap { url in LiveTVDataStore.shared.sources.first { $0.id == "plex:\(url)" } }
+        var rows: [SettingsRowItem] = [
+            SettingsRowItem(id: "plexServerEnabled", title: "Use This Server", kind: .selectable(
+                isSelected: { false },
+                value: { isPlexServerEnabled(server) ? "On" : "Off" },
+                handler: { vc in togglePlexServer(server, on: vc) }),
+                isBusy: { busyPlexServerID == server.clientIdentifier }),
+            info("plexServerStatus", "Status", server.presence == false ? "Offline" : "Online"),
+            info("plexServerOwner", "Owner", server.owned == false ? (server.sourceTitle ?? "Shared") : "You"),
+            info("plexServerVersion", "Version", server.productVersion)
+        ]
+        if let platform = server.platform {
+            rows.append(info("plexServerPlatform", "Platform", [platform, server.platformVersion].compactMap { $0 }.joined(separator: " ")))
+        }
+        if let connection {
+            let kind = connection.relay ? "Relay" : connection.local ? "Local" : "Remote"
+            rows.append(info("plexServerConnection", "Connection", connection.protocolType == "https" ? "\(kind), Secure" : kind))
+        }
+        let ds = LiveTVDataStore.shared
+        if let id = server.machineIdentifier, ds.plexMachineIDs.values.contains(id) {
+            rows.insert(plexLiveTVToggle(id: "plexServerLiveTV", machineID: id), at: 1)
+            if let liveTV { rows.append(info("plexServerChannels", "Channels", "\(liveTV.channelCount)")) }
+        } else {
+            rows.append(info("plexServerLiveTV", "Live TV", "No DVR"))
+        }
+        if let created = ISO8601DateFormatter().date(from: server.createdAt) {
+            rows.append(info("plexServerCreated", "On Plex Since", created.formatted(date: .abbreviated, time: .omitted)))
+        }
+        // The page needs one focusable row, or focus has nowhere to land.
+        rows.append(SettingsRowItem(id: "plexServerRefresh", title: "Refresh", kind: .action(destructive: false, handler: { vc in
+            loadPlexServers { [weak vc] in
+                if let fresh = plexServers?.first(where: { $0.clientIdentifier == server.clientIdentifier }) {
+                    pendingPlexServer = fresh
+                }
+                (vc as? SettingsPageViewController)?.reloadRows()
+            }
+        })))
+        return rows
+    }
+
+    /// Shows or hides a Plex server's DVR in Live TV (#406), from either settings page.
+    private static func plexLiveTVToggle(id: String, machineID: String) -> SettingsRowItem {
+        SettingsRowItem(id: id, title: "Show in Live TV", kind: .toggle(
+            get: { !LiveTVDataStore.shared.isPlexLiveTVHidden(machineID: machineID) },
+            set: { LiveTVDataStore.shared.setPlexLiveTVHidden(!$0, machineID: machineID) },
+            didChange: { _, vc in
+                Task {
+                    await LiveTVDataStore.shared.plexSourcesSynced()
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }))
+    }
+
+    /// The Jellyfin server's counterpart of `plexLiveTVToggle`.
+    static func jellyfinLiveTVToggle(id: String) -> SettingsRowItem {
+        var sync: Task<Void, Never>?
+        return SettingsRowItem(id: id, title: "Show in Live TV", kind: .toggle(
+            get: { !UserDefaults.standard.bool(forKey: JellyfinLiveTVProvider.hiddenKey) },
+            set: { sync = JellyfinLiveTVProvider.setHidden(!$0) },
+            didChange: { _, vc in
+                Task {
+                    await sync?.value
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }))
+    }
+
+    /// The server whose Use This Server change is still loading.
+    private static var busyPlexServerID: String?
+
+    private static func isPlexServerEnabled(_ server: PlexDevice) -> Bool {
+        server.machineIdentifier.map { PlexExtraServers.shared.isEnabled(machineID: $0) } ?? true
+    }
+
+    /// Turning off the selected server first moves the selected role to another
+    /// server that is on; the last server in use can only be signed out. The row
+    /// spins until the servers' content has reloaded.
+    private static func togglePlexServer(_ server: PlexDevice, on vc: UIViewController) {
+        guard busyPlexServerID == nil, let id = server.machineIdentifier else { return }
+        let turningOff = isPlexServerEnabled(server)
+        let others = (plexServers ?? []).filter { $0.clientIdentifier != server.clientIdentifier && isPlexServerEnabled($0) }
+        let isSelected = PlexAuthManager.shared.isCurrentServer(server)
+        if turningOff, isSelected, others.isEmpty {
+            vc.present(ConfirmationPopupViewController(
+                title: "Only Server in Use",
+                message: "Turn on another server first, or sign out of Plex.",
+                confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
+            return
+        }
+        busyPlexServerID = server.clientIdentifier
+        (vc as? SettingsPageViewController)?.reloadRows()
+        Task { @MainActor [weak vc] in
+            // Let the spinner draw before the reload's main-thread work.
+            try? await Task.sleep(for: .milliseconds(50))
+            var changed = true
+            if turningOff, isSelected {
+                changed = false
+                for other in others where await PlexDataStore.shared.switchServer(to: other) {
+                    changed = true
+                    break
+                }
+            }
+            if changed {
+                PlexExtraServers.shared.setEnabled(!turningOff, machineID: id)
+                for await loading in ServerDataStore.shared.$isLoading.values where !loading { break }
+            }
+            busyPlexServerID = nil
+            guard let page = vc as? SettingsPageViewController else { return }
+            page.reloadRows()
+            if !changed {
+                page.present(ConfirmationPopupViewController(
+                    title: "Couldn’t Turn Off",
+                    message: "No other server is reachable right now, so \(server.name) stays on.",
+                    confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
+            }
+        }
+    }
+
+    private static func info(_ id: String, _ title: String, _ value: String) -> SettingsRowItem {
+        SettingsRowItem(id: id, title: title, kind: .info(value: { value }))
     }
 
     private static func loadPlexServers(reload: @escaping () -> Void) {
@@ -762,24 +935,6 @@ enum SettingsContent {
         }
     }
 
-    private static func switchPlexServer(to server: PlexDevice, on vc: UIViewController) {
-        guard connectingPlexServerID == nil, !PlexAuthManager.shared.isCurrentServer(server) else { return }
-        let current = PlexAuthManager.shared.savedServerName ?? "your current server"
-        connectingPlexServerID = server.clientIdentifier
-        (vc as? SettingsPageViewController)?.reloadRows()
-        Task { @MainActor [weak vc] in
-            let switched = await PlexDataStore.shared.switchServer(to: server)
-            connectingPlexServerID = nil
-            guard let page = vc as? SettingsPageViewController else { return }
-            page.reloadRows()
-            guard !switched else { return }
-            page.present(ConfirmationPopupViewController(
-                title: "Couldn’t Connect",
-                message: "\(server.name) isn’t reachable right now. Rivulet is still using \(current).",
-                confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
-        }
-    }
-
     // MARK: Home Rows (local subtractive filter over the server's row set)
 
     /// Jellyfin's Home rows for the Home Rows page, titled the way Home titles
@@ -787,24 +942,16 @@ enum SettingsContent {
     /// sidebar order. Rows hidden here stay listed so they can be switched
     /// back on; rows of libraries hidden from the sidebar never draw on Home,
     /// so they are not offered.
-    static func jellyfinHomeRowEntries() -> [(id: String, title: String)] {
-        JellyfinDataStore.shared.homeRowsInSidebarOrder.compactMap { row in
-            row.hubIdentifier.map { ($0, row.title) }
+    static func serverHomeRowEntries(providerID: String) -> [(id: String, title: String)] {
+        ServerDataStore.shared.homeRowsInSidebarOrder.compactMap { row in
+            guard row.id.hasPrefix("\(providerID)|") else { return nil }
+            return row.hubIdentifier.map { ($0, row.title) }
         }
     }
 
-    /// One toggle per row Plex currently offers Home, in the order Home draws
-    /// them.
-    ///
-    /// Built from `PlexDataStore.homeItems`, the SAME projection Home renders,
-    /// rather than from a list assembled here. That is what keeps the page
-    /// honest: the titles are the server's own (so they are localized, and they
-    /// say "Recently Added in Movies-demo" exactly as the shelf does), and a row
-    /// can never be listed here that Home would not draw.
-    ///
-    /// Hidden rows still appear in this list — they are what you come here to
-    /// switch back on — so the list is the projection plus whatever is currently
-    /// filtered out of it.
+    /// One toggle per row Plex offers Home, in Home's order. Built from
+    /// `PlexDataStore.homeItems`, the projection Home renders, so titles match
+    /// the shelves; hidden rows are added back so they can be switched on.
     private static var homeRows: [SettingsRowItem] {
         let store = PlexDataStore.shared
         let visible = store.homeItems
@@ -832,10 +979,11 @@ enum SettingsContent {
                 return (id, row.title)
             }
             + hiddenRows
-        let jellyfinEntries = jellyfinHomeRowEntries()
+        let runs = serverRuns
+        let entriesByRun = runs.map { run in run.providerID.map(serverHomeRowEntries(providerID:)) ?? plexEntries }
 
         let pinRows = pinnedCollectionRows(store: store)
-        guard !plexEntries.isEmpty || !jellyfinEntries.isEmpty else {
+        guard entriesByRun.contains(where: { !$0.isEmpty }) else {
             // A pin can outlive every Plex row (its library taken off Home),
             // and this page is the only place left to unpin it.
             guard pinRows.isEmpty else { return pinRows }
@@ -851,14 +999,14 @@ enum SettingsContent {
                 (vc as? SettingsPageViewController)?.reloadRows()
             }))
         ]
-        // Both servers listed: each run under its server's name, as Sidebar
+        // Several servers listed: each run under its server's name, as Sidebar
         // Libraries does.
-        let labelsRuns = !plexEntries.isEmpty && !jellyfinEntries.isEmpty
+        let labelsRuns = entriesByRun.filter { !$0.isEmpty }.count > 1
         // De-dupe defensively: Continue Watching can be reported by both the
         // dedicated hub and the projection.
         var seen = Set<String>()
-        let headers = currentServerRunHeaders
-        for (header, entries) in [(headers.plex, plexEntries), (headers.jellyfin, jellyfinEntries)] {
+        let headers = serverRunHeaders(runs.map { ($0.name, $0.kind) })
+        for (header, entries) in zip(headers, entriesByRun) where !entries.isEmpty {
             if labelsRuns { rows.append(.header(header)) }
             for entry in entries where seen.insert(entry.id).inserted {
                 rows.append(SettingsRowItem(id: "homeRow_\(entry.id)", title: entry.title, kind: .toggle(
@@ -896,24 +1044,40 @@ enum SettingsContent {
         return rows
     }
 
-    // MARK: Libraries (sidebar visibility)
+    // MARK: Sidebar (order and visibility)
+
+    /// Every arrangeable sidebar row, hidden ones included, in the sidebar's order.
+    private static func sidebarSettingsRows() -> [ShellSidebarModel.Row] {
+        let rows = ShellSidebarModel.arrangeableRows(
+            libraries: SidebarLibrary.current(includeHidden: true),
+            liveTVSources: LiveTVDataStore.shared.sources,
+            combineLiveTV: SettingsStore.bool("combineLiveTVSources", default: true),
+            showDiscover: true, showWatchlist: true,
+            playlistServers: PlaylistServer.current(PlaylistAvailability.shared.providerIDs))
+        let byKey = Dictionary(rows.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        return SidebarArrangement.arrange(rows.map(\.key), order: LibrarySettingsManager.shared.libraryOrder)
+            .compactMap { byKey[$0] }
+    }
 
     private static var libraries: [SettingsRowItem] {
         let mgr = LibrarySettingsManager.shared
-        let libs = mgr.sortLibraries(PlexDataStore.shared.libraries.filter(\.hasBrowseSurface))
-        // Jellyfin's in the user's order, hidden ones included so they can
-        // come back; each server reorders within its own run.
-        let jellyfinStore = JellyfinDataStore.shared
-        let jellyfinLibs = mgr.sort(jellyfinStore.libraries)
-        guard !libs.isEmpty || !jellyfinLibs.isEmpty else {
-            return [SettingsRowItem(id: "noLibraries",
-                                    title: "Connect a server to manage libraries",
-                                    kind: .info(value: { "" }))]
-        }
-        let keys = libs.map { $0.key } + jellyfinLibs.map(\.settingsKey)
-        // Add All / Remove All live at the TOP of the list, above the per-library
-        // toggles, so the bulk actions are the first thing the user lands on.
-        var rows: [SettingsRowItem] = [
+        let entries = sidebarSettingsRows()
+        let libraryKeys = entries.map(\.key).filter { !SidebarArrangement.isAppRow($0) }
+        let playlistKeys = entries.map(\.key).filter { SidebarArrangement.server(ofKey: $0) != nil && SidebarArrangement.isAppRow($0) }
+        // Reset, then Add All / Remove All (libraries only), at the top.
+        var rows: [SettingsRowItem] = entries.isEmpty ? [] : [
+            SettingsRowItem(id: "resetSidebar", title: "Reset", kind: .action(destructive: true, handler: { vc in
+                presentConfirm(on: vc, title: "Reset the Sidebar?",
+                               message: "Every row comes back in the original order. Home follows the library order.",
+                               confirmTitle: "Reset", destructive: true) {
+                    LibrarySettingsManager.shared.resetSidebar()
+                    SettingsStore.setBool("showDiscoverTab", true)
+                    SettingsStore.setBool("showWatchlistTab", true)
+                    (vc as? SettingsPageViewController)?.reloadRows()
+                }
+            }))
+        ]
+        rows += libraryKeys.isEmpty ? [] : [
             SettingsRowItem(id: "addAllLibraries", title: "Add All",
                             kind: .action(destructive: false, handler: { vc in
                 LibrarySettingsManager.shared.showAllLibraries()
@@ -921,49 +1085,49 @@ enum SettingsContent {
             })),
             SettingsRowItem(id: "removeAllLibraries", title: "Remove All",
                             kind: .action(destructive: true, handler: { vc in
-                LibrarySettingsManager.shared.hideAllLibraries(keys)
+                LibrarySettingsManager.shared.hideAllLibraries(libraryKeys)
                 (vc as? SettingsPageViewController)?.reloadRows()
             }))
         ]
-        // Both servers listed: each run under its server's name. A header is
-        // not reorderable, so a move stops at it.
-        let labelsRuns = !libs.isEmpty && !jellyfinLibs.isEmpty
-        let headers = currentServerRunHeaders
-        if labelsRuns { rows.append(.header(headers.plex)) }
-        rows += libs.map { lib in
+        // With several servers each title names its server, since no header
+        // could stay true once they mix.
+        let namesServer = Set(entries.compactMap(\.serverName)).count > 1
+        rows += entries.map { entry in
+            let key = entry.key
+            var title = entry.item.title
+            if namesServer, let server = entry.serverName { title += " (\(server))" }
+            if let badge = entry.item.badge, entry.serverName == nil { title += " (\(badge))" }
+            let kind: SettingsRowItem.Kind
+            switch key {
+            case SidebarArrangement.discover:
+                kind = .toggle(get: { SettingsStore.bool("showDiscoverTab", default: true) },
+                               set: { SettingsStore.setBool("showDiscoverTab", $0) })
+            case SidebarArrangement.watchlist:
+                kind = .toggle(get: { SettingsStore.bool("showWatchlistTab", default: true) },
+                               set: { SettingsStore.setBool("showWatchlistTab", $0) })
+            case _ where SidebarArrangement.isLiveTV(key):
+                // Live TV leaves the sidebar only with its sources: no toggle, nothing
+                // to open, but focusable so it can be held and moved.
+                kind = .action(destructive: false, handler: { _ in })
+            case _ where SidebarArrangement.isAppRow(key):
+                kind = .toggle(get: { LibrarySettingsManager.shared.isPlaylistsRowVisible(key) },
+                               set: { LibrarySettingsManager.shared.setPlaylistsRow(key, visible: $0, allKeys: playlistKeys) })
+            default:
+                kind = .toggle(get: { LibrarySettingsManager.shared.isLibraryVisible(key) },
+                               set: { _ in LibrarySettingsManager.shared.toggleVisibility(for: key) })
+            }
             // Hold Select to grab + reorder (Apple-Home style). The page VC
-            // animates the slot change; this just persists the new order.
-            SettingsRowItem(id: "lib_\(lib.key)", title: lib.title, kind: .toggle(
-                get: { LibrarySettingsManager.shared.isLibraryVisible(lib.key) },
-                set: { _ in LibrarySettingsManager.shared.toggleVisibility(for: lib.key) }),
-                onReorder: { up in moveMediaLibrary(key: lib.key, up: up) }, reorderGroup: "plex")
+            // animates the slot change; this persists it, over the list as it is now.
+            return SettingsRowItem(id: SidebarArrangement.isAppRow(key) ? "sb_\(key)" : "lib_\(key)", title: title, kind: kind,
+                                   onReorder: { up in
+                                       mgr.moveSidebarRow(key: key, up: up, visible: sidebarSettingsRows().map(\.key))
+                                   }, reorderGroup: "sidebar")
         }
-        if labelsRuns { rows.append(.header(headers.jellyfin)) }
-        rows += jellyfinLibs.map { lib in
-            SettingsRowItem(id: "lib_\(lib.settingsKey)", title: lib.title, kind: .toggle(
-                get: { LibrarySettingsManager.shared.isLibraryVisible(lib.settingsKey) },
-                set: { _ in LibrarySettingsManager.shared.toggleVisibility(for: lib.settingsKey) }),
-                // Order re-read per move: the page is not rebuilt between moves.
-                onReorder: { up in
-                    let mgr = LibrarySettingsManager.shared
-                    mgr.moveLibrary(key: lib.settingsKey, up: up,
-                                    among: mgr.sort(JellyfinDataStore.shared.libraries).map(\.settingsKey))
-                },
-                reorderGroup: "jellyfin")
+        guard !rows.isEmpty else {
+            return [SettingsRowItem(id: "noLibraries", title: "Connect a server to manage the sidebar",
+                                    kind: .info(value: { "" }))]
         }
         return rows + pinnedCollectionRows(store: PlexDataStore.shared, in: .library)
-    }
-
-    /// Move a media library one slot up/down in the sidebar order. Reorders by
-    /// KEY (not the index-based `moveLibrary`, whose indices are into the raw
-    /// `libraryOrder` and don't line up with the displayed list), then rewrites
-    /// `libraryOrder` as [new media order] + [any non-media ordered keys], so
-    /// every shown library is explicitly ordered and nothing else is dropped.
-    private static func moveMediaLibrary(key: String, up: Bool) {
-        let mgr = LibrarySettingsManager.shared
-        let mediaLibs = mgr.sortLibraries(
-            PlexDataStore.shared.libraries.filter(\.hasBrowseSurface))
-        mgr.moveLibrary(key: key, up: up, among: mediaLibs.map { $0.key })
     }
 
     // MARK: Cache & Storage
@@ -988,6 +1152,7 @@ enum SettingsContent {
                                confirmTitle: "Clear Cache", destructive: true) {
                     Task {
                         await ImageCacheManager.shared.clearAll()
+                        ContinueWatchingCardCompositor.clearDisk()
                         await CacheManager.shared.clearAllCache()
                         await reloadFromServer()
                     }
@@ -1024,10 +1189,12 @@ enum SettingsContent {
 
     private static var iptv: [SettingsRowItem] {
         let ds = LiveTVDataStore.shared
-        var rows: [SettingsRowItem] = ds.sources.map { source in
+        let hiddenSources = ds.hiddenPlexSources + [JellyfinLiveTVProvider.hiddenSource].compactMap { $0 }
+        let hidden = Set(hiddenSources.map(\.id))
+        var rows: [SettingsRowItem] = (ds.sources + hiddenSources).sorted { $0.displayName < $1.displayName }.map { source in
             SettingsRowItem(id: "src_\(source.id)", title: source.displayName,
                             kind: .navigationAction(.liveTVSourceDetail,
-                                                    value: { source.isConnected ? "\(source.channelCount) ch" : "Offline" },
+                                                    value: { hidden.contains(source.id) ? "Off" : source.isConnected ? "\(source.channelCount) ch" : "Offline" },
                                                     prepare: { pendingSourceDetail = source }))
         }
         rows.append(SettingsRowItem(id: "addLiveTVSource", title: "Add Live TV Source",
@@ -1042,7 +1209,18 @@ enum SettingsContent {
         guard let pending = pendingSourceDetail else { return [] }
         // Read live: the snapshot taken when the page opened goes stale on a refresh.
         let source = LiveTVDataStore.shared.sources.first { $0.id == pending.id } ?? pending
-        var rows: [SettingsRowItem] = [
+        let machineID = LiveTVDataStore.shared.plexMachineIDs[source.id]
+        let plexToggle = machineID.map { plexLiveTVToggle(id: "src_showInLiveTV", machineID: $0) }
+        // A hidden server has nothing to show but the way back.
+        if let plexToggle, let machineID, LiveTVDataStore.shared.isPlexLiveTVHidden(machineID: machineID) {
+            return [plexToggle]
+        }
+        if source.sourceType == .jellyfin {
+            guard JellyfinLiveTVProvider.hiddenSource == nil else { return [jellyfinLiveTVToggle(id: "src_showInLiveTV")] }
+        }
+        var rows: [SettingsRowItem] = plexToggle.map { [$0] }
+            ?? (source.sourceType == .jellyfin ? [jellyfinLiveTVToggle(id: "src_showInLiveTV")] : [])
+        rows += [
             SettingsRowItem(id: "src_status", title: "Status",
                             kind: .info(value: { source.isConnected ? "Connected" : "Disconnected" })),
             SettingsRowItem(id: "src_channels", title: "Channels",
@@ -1099,7 +1277,7 @@ enum SettingsContent {
             // failure text must not survive leaving the flow.
             resetAddSourceFlow()
             reload()
-        case .plexServerPicker:
+        case .plex where PlexAuthManager.shared.isAuthenticated:
             loadPlexServers(reload: reload)
         case .liveTVFavorites where LiveTVDataStore.shared.channels.isEmpty:
             // Settings can open before Live TV has loaded its channels.
@@ -1137,7 +1315,25 @@ enum SettingsContent {
             // second switch flipped first.
             SettingsRowItem(id: "inputTest", title: "Run Input Test", kind: .action(destructive: false, handler: { vc in
                 vc.present(InputTestViewController(), animated: true)
-            }))
+            })),
+            SettingsRowItem(id: "sendDiagnostics", title: "Send Diagnostics", kind: .action(destructive: false, handler: { vc in
+                guard !DiagnosticsReport.isSending else { return }
+                let page = vc as? SettingsPageViewController
+                Task { @MainActor in
+                    let code = await DiagnosticsReport.send(window: vc.view.window, onStart: { page?.reloadRows() })
+                    page?.reloadRows()
+                    let popup = code.map {
+                        ConfirmationPopupViewController(
+                            title: "Diagnostics Sent",
+                            message: "Your code is \($0). Include it in your GitHub issue or message so the report can be found.",
+                            confirmTitle: "OK", cancelTitle: nil, onConfirm: {})
+                    } ?? ConfirmationPopupViewController(
+                        title: "Couldn't Send Diagnostics",
+                        message: "Diagnostics are not available in this build.",
+                        confirmTitle: "OK", cancelTitle: nil, onConfirm: {})
+                    vc.present(popup, animated: true)
+                }
+            }), isBusy: { DiagnosticsReport.isSending })
         ]
     }
 
@@ -1179,6 +1375,17 @@ enum SettingsContent {
 
     /// `enabledWhen` marks the row as depending on another setting: while it
     /// returns false the row renders dimmed and cannot be focused or toggled.
+    /// Cycles one marker kind through Button, Automatic and Off (#381).
+    private static func skipModeRow(_ id: String, _ title: String, marker: String) -> SettingsRowItem {
+        SettingsRowItem(id: id, title: title, kind: .cycle(
+            value: { MarkerSkipMode.current(for: marker).label },
+            next: {
+                let all = MarkerSkipMode.allCases
+                let i = all.firstIndex(of: MarkerSkipMode.current(for: marker)) ?? 0
+                MarkerSkipMode.set(all[(i + 1) % all.count], for: marker)
+            }))
+    }
+
     private static func toggle(_ id: String, _ title: String, key: String, default def: Bool,
                                enabledWhen: (() -> Bool)? = nil) -> SettingsRowItem {
         SettingsRowItem(id: id, title: title, kind: .toggle(

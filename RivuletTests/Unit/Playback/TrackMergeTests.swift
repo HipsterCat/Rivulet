@@ -147,6 +147,17 @@ final class TrackMergeTests: XCTestCase {
         XCTAssertTrue(TrackCommentary.isCommentaryOrDescription(merged[2]), "Plex extendedDisplayTitle")
     }
 
+    /// An audio-description track titled only by language is skipped and labelled.
+    func testAudioDescriptionFlagExcludesAndLabels() {
+        let main = MediaTrack(id: 1, name: "English", languageCode: "eng", codec: "eac3", channels: 6)
+        let described = MediaTrack(id: 2, name: "English", languageCode: "eng", codec: "eac3",
+                                   isDefault: true, isAudioDescription: true, channels: 6)
+        XCTAssertTrue(TrackCommentary.isCommentaryOrDescription(described))
+        XCTAssertEqual(described.audioRole, "Audio Description")
+        XCTAssertEqual(TrackIntentResolver.resolveAudio(intent: AudioIntent(language: "eng"),
+                                                        in: [described, main])?.id, 1)
+    }
+
     /// End to end: auto-selection must not land on the commentary track when it
     /// shares codec and channel count with the main mix.
     func testAutoSelectAvoidsCommentaryAfterMerge() {
@@ -168,14 +179,9 @@ final class TrackMergeTests: XCTestCase {
 
     // MARK: - Invariant 3: streams only one side knows about don't shift anything
 
-    /// THE BUG THE ORDINAL APPROACH WOULD HAVE HAD.
-    ///
-    /// Plex emits EIA-608 closed captions baked into the video stream as their
-    /// own `Part.Stream` entry (`embeddedInVideo`, which is why `PlexStream._id`
-    /// is optional). FFmpeg surfaces no separate AVStream for them, so the engine
-    /// never reports one. Counting ordinals would shift every real subtitle by
-    /// one and mislabel the entire list. Joining on stream index just doesn't
-    /// match the phantom.
+    /// Plex lists baked-in EIA-608 captions as their own stream, which the engine
+    /// never reports. Joining on stream index ignores that phantom; ordinals
+    /// would shift every subtitle by one.
     func testPlexEmbeddedCCPseudoStreamDoesNotShiftTheMerge() {
         // Container: video=0, audio=1, subs at 2/3/4.
         // Plex ALSO lists a baked-in CC stream, which has no container index of

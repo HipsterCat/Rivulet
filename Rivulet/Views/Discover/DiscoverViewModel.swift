@@ -5,11 +5,8 @@
 //  DiscoverViewModel.swift
 //  Rivulet
 //
-//  View model backing the Discover surface. Fetches the TMDB curated
-//  sections, the hero carousel items, and the personalized "For You" row,
-//  and resolves in-library matches. Consumed by the UIKit Discover page
-//  (`PlexHomeViewController` in `.discover` mode); the retired SwiftUI
-//  `DiscoverView` that originally owned this model has been removed.
+//  View model for Discover (`PlexHomeViewController` in `.discover` mode):
+//  TMDB sections, hero items and the "For You" row, with in-library matches.
 //
 
 import SwiftUI
@@ -79,7 +76,10 @@ final class DiscoverViewModel: ObservableObject {
     }
 
     func libraryMatch(for item: TMDBListItem) async -> PlexMetadata? {
-        await libraryIndex.lookup(tmdbId: item.id, type: item.mediaType)
+        guard let entry = await libraryIndex.lookup(tmdbId: item.id, type: item.mediaType),
+              let serverURL = PlexAuthManager.shared.selectedServerURL,
+              let token = PlexAuthManager.shared.selectedServerToken else { return nil }
+        return await LibraryGUIDIndex.items(for: [entry], serverURL: serverURL, authToken: token)[entry.ratingKey]
     }
 
     /// Re-derive the in-library TMDB id set (call when LibraryGUIDIndex

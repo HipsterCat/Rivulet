@@ -1,29 +1,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  InfoPopupViewController.swift
-//  Rivulet
-//
-//  A single, reusable detail popup: a centered frosted card that sizes itself to
-//  whatever content view it's given (fixed width, height hugs the content). Used
-//  for the About description, the Common Sense advisory, and (future) episode
-//  info — build the content with `InfoPopupContent`, hand it here.
-//
-//  tvOS focus: a presented modal with no focusable content never receives the
-//  Menu press (the system dismisses one layer up). The card is focusable and we
-//  own Menu + Select with press-type tap recognizers.
-//
+//  The reusable frosted popup card, fixed width and hugging content built by `InfoPopupContent`.
+//  The card is focusable, or Menu never reaches the modal; press recognizers own Menu and Select.
 
 import UIKit
 
-/// Card height + scroll insets for a measured content height. Pure so the sizing
-/// can be tested without a device (see InfoPopupCardLayoutTests).
-///
-/// The insets are breathing room for content scrolling in and out of the card's
-/// edges, so they belong ONLY to the overflowing case. Applying the top inset
-/// unconditionally made short content scrollable by 8pt and clipped its last
-/// line — the card fit the content exactly, then the inset pushed it down.
+/// Card height and scroll insets for a measured content height (InfoPopupCardLayoutTests).
+/// Insets apply only when content overflows; on short content they clip the last line.
 struct InfoPopupCardLayout {
     let cardHeight: CGFloat
     let scrolls: Bool
@@ -58,6 +42,10 @@ struct InfoPopupCardLayout {
 
 final class InfoPopupViewController: UIViewController {
 
+    /// The description and person popups are 896 x 460, the info popup 820 wide (measured on device, tvOS 27).
+    static let descriptionSize = CGSize(width: 896, height: 460)
+    static let infoWidth: CGFloat = 820
+
     /// Focusable card so the modal owns the remote.
     private final class FocusableCard: UIView {
         override var canBecomeFocused: Bool { true }
@@ -76,12 +64,8 @@ final class InfoPopupViewController: UIViewController {
     /// intrinsic height capped at ~85% screen, so tall content overflows + scrolls.
     private var cardHeight: NSLayoutConstraint!
 
-    /// `content` supplies its own subviews; this VC frames + sizes the card to it.
-    /// `scrollable`: cap the card height to ~85% of the screen and scroll tall
-    /// content with Up/Down (for long structured popups like the full Info popup).
-    /// `height`: force a fixed card height (clamped to the screen) instead of
-    /// measuring the content — use when the content is long and the auto
-    /// measurement leaves the card too small. Implies a scrolling card.
+    /// `scrollable` caps the card at about 85% of the screen and scrolls with Up/Down.
+    /// `height` fixes the card height, for long content the measurement under-sizes; it implies scrolling.
     init(content: UIView, width: CGFloat = 760, height: CGFloat? = nil, scrollable: Bool = false) {
         self.content = content
         self.cardWidth = width
@@ -139,10 +123,8 @@ final class InfoPopupViewController: UIViewController {
             scroll.contentInset = .zero
             blur.contentView.addSubview(scroll)
             scroll.addSubview(content)
-            // Card height is set in viewDidLayoutSubviews to the content's
-            // INTRINSIC height (capped). Crucially we do NOT tie the card to the
-            // content's height here — doing so squished the content down to the
-            // capped card height, so it never overflowed and never scrolled.
+            // Sized in viewDidLayoutSubviews. Tying it to the content here squashes the
+            // content to the cap, so it never scrolls.
             cardHeight = card.heightAnchor.constraint(equalToConstant: 320)
             constraints += [
                 cardHeight,
@@ -173,10 +155,7 @@ final class InfoPopupViewController: UIViewController {
             view.addGestureRecognizer(tap)
         }
 
-        // Up/Down scroll the tall content, whether the input arrives as an
-        // arrow press or a touch-surface swipe (the card is the modal's only
-        // focus target, so the swipes steal nothing from the focus engine).
-        // Menu/Select still dismiss via the gesture recognizers above.
+        // Arrow presses and swipes both scroll; the card is the only focus target, so swipes steal nothing.
         if scrollable {
             directionalInput = DirectionalInputBinding(
                 view: view,
@@ -210,10 +189,8 @@ final class InfoPopupViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         guard scrollable else { return }
-        // 1. Multiline labels in a scroll view compute their intrinsic height
-        // before the final width is known, clipping the last line. Pin each
-        // multiline label's preferredMaxLayoutWidth to its laid-out width so the
-        // height recomputes. Gated on a real change → converges (no loop).
+        // 1. Multiline labels measure before their final width and clip the last line, so pin
+        // preferredMaxLayoutWidth to the laid-out width. Only on change, so it converges.
         var changed = false
         func fix(_ v: UIView) {
             if let l = v as? UILabel, l.numberOfLines != 1, l.bounds.width > 1,
@@ -232,11 +209,8 @@ final class InfoPopupViewController: UIViewController {
             apply(InfoPopupCardLayout.make(fixedHeight: h, screenHeight: view.bounds.height))
             return
         }
-        // 2. Card height: measure the content RELIABLY. `scroll.contentSize` is
-        // not trustworthy mid-layout for Auto-Layout content (it under-reports →
-        // the card stayed tiny); measure the content view directly instead. The
-        // preferredMaxLayoutWidth fix pass above guarantees multiline labels wrap
-        // before this. Cap at 85% of the screen; taller content overflows + scrolls.
+        // 2. Measure the content view, not `scroll.contentSize`, which under-reports mid-layout.
+        // Capped at 85% of the screen.
         let pad = PreviewCarouselGeometry.expandedChromeInset
         let innerWidth = cardWidth - 2 * pad
         let contentH = content.systemLayoutSizeFitting(
@@ -276,7 +250,7 @@ enum InfoPopupContent {
     /// Title + genre line + full body (the About "description" popup).
     static func description(title: String, subtitle: String?, body: String?) -> UIView {
         let stack = verticalStack(spacing: 10)
-        stack.addArrangedSubview(label(title, size: 30, weight: .semibold, color: .white, lines: 2))
+        stack.addArrangedSubview(label(title, size: 31, weight: .bold, color: .white, lines: 2))
         if let subtitle, !subtitle.isEmpty {
             let s = label(subtitle, size: 20, weight: .medium, color: .white.withAlphaComponent(0.6), lines: 1)
             stack.addArrangedSubview(s)
@@ -284,6 +258,26 @@ enum InfoPopupContent {
         }
         if let body, !body.isEmpty {
             stack.addArrangedSubview(label(body, size: 24, weight: .regular, color: .white.withAlphaComponent(0.9), lines: 0))
+        }
+        return stack
+    }
+
+    /// Every review score, one row each: score, then source and who it's from.
+    static func ratings(_ ratings: [MediaRating]) -> UIView {
+        let stack = verticalStack(spacing: 22)
+        stack.addArrangedSubview(label("Ratings", size: 30, weight: .semibold, color: .white, lines: 1))
+        for rating in ratings {
+            let score = label(rating.badgeText + (rating.scale ?? ""), size: 30, weight: .bold, color: .white, lines: 1)
+            score.widthAnchor.constraint(equalToConstant: 170).isActive = true
+            let text = verticalStack(spacing: 2)
+            text.addArrangedSubview(label(rating.name, size: 24, weight: .semibold, color: .white, lines: 1))
+            text.addArrangedSubview(label(rating.detailText, size: 20, weight: .medium,
+                                          color: .white.withAlphaComponent(0.6), lines: 1))
+            let row = UIStackView(arrangedSubviews: [score, text])
+            row.axis = .horizontal
+            row.alignment = .center
+            row.spacing = 20
+            stack.addArrangedSubview(row)
         }
         return stack
     }
@@ -326,8 +320,7 @@ enum InfoPopupContent {
     /// sections stacked vertically. Present with `scrollable: true`.
     static func fullInfo(detail: MediaItemDetail) -> UIView {
         let stack = verticalStack(spacing: 16)
-        // Title matches the section headers (InfoColumnView header = 40pt bold).
-        stack.addArrangedSubview(label(detail.item.title, size: 40, weight: .bold, color: .white, lines: 2))
+        stack.addArrangedSubview(label(detail.item.title, size: 31, weight: .bold, color: .white, lines: 2))
         if let genre = detail.genres.first, !genre.isEmpty {
             stack.addArrangedSubview(label(genre, size: 21, weight: .semibold, color: .white.withAlphaComponent(0.6), lines: 1))
         }
@@ -346,6 +339,11 @@ enum InfoPopupContent {
             stack.setCustomSpacing(22, after: placeholder)
         }
         stack.addArrangedSubview(metaRow(detail))
+        if !detail.ratings.isEmpty {
+            let meta = stack.arrangedSubviews.last!
+            stack.setCustomSpacing(30, after: meta)
+            stack.addArrangedSubview(RatingsGridView.row(detail.ratings))
+        }
 
         let source = detail.primarySource
         let isContainer = detail.item.kind == .season || detail.item.kind == .show
@@ -398,7 +396,7 @@ enum InfoPopupContent {
         guard !rows.isEmpty else { return }
         if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(30, after: last) }
         let col = InfoColumnView()
-        col.configure(title: title, rows: rows)
+        col.configure(title: title, rows: rows, style: .popup)
         stack.addArrangedSubview(col)
     }
 
@@ -517,11 +515,8 @@ enum InfoPopupContent {
         return l
     }
 
-    /// Changelog ("What's New"): title + version + bullet features + a centered
-    /// "Done" pill. The popup card is the focus target and Select/Menu dismiss it,
-    /// so the pill is the explicit press-Select affordance (it is not separately
-    /// focusable). Present content-sized (no forced height) so it hugs the
-    /// features with the pill at the true bottom.
+    /// What's New: title, version, bullets and a Done pill that only shows Select (the card
+    /// holds focus). Present content-sized.
     static func changelog(version: String, features: [String]) -> UIView {
         let stack = verticalStack(spacing: 8)
         stack.addArrangedSubview(label("What's New", size: 44, weight: .bold, color: .white, lines: 1))
@@ -615,10 +610,8 @@ enum InfoPopupContent {
         return row
     }
 
-    /// Licenses & Legal: Rivulet's own posture + TMDB attribution logo, then
-    /// every bundled third-party dependency (name + summary + full verbatim
-    /// license text). Present with `scrollable: true` — the card caps at ~85%
-    /// of the screen and Up/Down pages through the (long) license text.
+    /// Licenses: Rivulet's own, the TMDB attribution, then every bundled dependency's full
+    /// license text. Present with `scrollable: true`.
     static func acknowledgements() -> UIView {
         let stack = verticalStack(spacing: 12)
         stack.addArrangedSubview(label("Licenses & Legal", size: 40, weight: .bold, color: .white, lines: 1))

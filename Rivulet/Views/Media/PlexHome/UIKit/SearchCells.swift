@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  SearchCells.swift
-//  Rivulet
-//
-//  Full-width cells for the UIKit search surface (PlexHomeViewController
-//  in `.search` mode):
-//
-//   - SearchRecentsCell: the empty-query state — a left-aligned "Recently
-//     Searched" row of the items you last opened from search (#292).
-//   - SearchStateCell: inline searching / error / no-results states.
-//     Port of PlexSearchView.loadingView / errorView / noResultsView.
-//
-//  Both cells are non-focusable containers (canFocusItemAt false in the
-//  controller); their interactive content (recent cards, Try Again) are
-//  FocusableActionButtons, which the engine focuses directly.
-//
-//  The section that hosts the recents cell is still called `.searchPrompt`
-//  (24 references). It no longer renders a prompt: the centred magnifier and
-//  "Search Your Libraries" went with the Apple TV layout, so an empty-query
-//  screen with no recents yet is deliberately blank.
-//
+// Full-width cells for `.search` mode: SearchRecentsCell (the empty-query "Recently Searched" row,
+// #292) and SearchStateCell (searching, error, no results). Both are unfocusable containers; their
+// FocusableActionButtons take focus. `.searchPrompt` hosts the recents and is blank with none.
 
 import UIKit
 
@@ -36,7 +18,7 @@ final class SearchRecentsCell: UICollectionViewCell {
     /// The Apple TV app's recent-search card. Its corner radius is our own.
     private enum Metrics {
         static let cardWidth: CGFloat = MediaRowMetrics.gridWidth(columns: 3)
-        static let cardHeight: CGFloat = 160
+        static let cardHeight: CGFloat = 170   // card 560x170, measured on device (tvOS 27)
         static let cardSpacing: CGFloat = MediaRowMetrics.tileGap
         /// Poster inset inside the card. The poster is the card's full height
         /// minus this top and bottom, at the 2:3 poster ratio.
@@ -44,17 +26,14 @@ final class SearchRecentsCell: UICollectionViewCell {
         static let posterHeight: CGFloat = cardHeight - posterInset * 2
         static let posterWidth: CGFloat = (cardHeight - posterInset * 2) * 2 / 3
         static let posterToText: CGFloat = 20
-        static let cardRadius: CGFloat = 20
-        static let posterRadius: CGFloat = 6
-        /// Gap below the keyboard's separator line.
-        ///
-        /// The search controller already sizes the results view to the area
-        /// below its chrome, leaving ~43pt of its own, so this is the remainder
-        /// needed to match the Apple TV app's ~57pt. It is the ONLY top spacing
-        /// now: the page's `contentInset.top` is 0 in search mode, because 48
-        /// there plus 48 here stacked into a 139pt gap.
+        static let cardRadius: CGFloat = 28
+        static let posterRadius: CGFloat = 9
+        /// Gap below the keyboard's separator: the search controller leaves ~43pt, this adds the rest of
+        /// the Apple TV app's ~57pt. The only top spacing; `contentInset.top` is 0 in search mode.
         static let topPadding: CGFloat = 17
-        static let headerToRow: CGFloat = 16
+        static let headerFont = UIFont.systemFont(ofSize: 31, weight: .semibold)
+        /// Header baseline to card top is 21.5, measured on device (tvOS 27).
+        static let headerToRow: CGFloat = 21.5 + headerFont.descender
     }
 
     private let headerLabel = UILabel()
@@ -85,8 +64,8 @@ final class SearchRecentsCell: UICollectionViewCell {
         // Matches the shelf row headers (ShelfRowCell) so Search reads as the
         // same page as Home, not a separate design.
         headerLabel.text = "Recently Searched"
-        headerLabel.font = .systemFont(ofSize: 32, weight: .semibold)
-        headerLabel.textColor = .secondaryLabel
+        headerLabel.font = Metrics.headerFont
+        headerLabel.textColor = UIColor.white.withAlphaComponent(0.5)
         headerLabel.translatesAutoresizingMaskIntoConstraints = false
 
         cardStack.axis = .horizontal
@@ -177,13 +156,8 @@ final class SearchRecentsCell: UICollectionViewCell {
         cardScroll.layoutIfNeeded()
     }
 
-    /// One Recently Searched card: poster, title, "Movie · 1977".
-    ///
-    /// `.glass` focus rather than the pill inversion the recents pills used:
-    /// a card carries artwork, and a white fill with inverted text under a
-    /// full-colour poster reads as a rendering bug.
-    ///
-    /// Returns the poster view so the caller can fill it asynchronously.
+    /// One Recently Searched card: poster, title, "Movie · 1977". `.glass` focus, since a white
+    /// inversion under a colour poster reads as a bug. Returns the poster view to fill async.
     private static func makeCard(for item: MediaItem) -> (FocusableActionButton, UIImageView) {
         let button = FocusableActionButton()
         button.focusStyle = .glass
@@ -207,7 +181,7 @@ final class SearchRecentsCell: UICollectionViewCell {
         let subtitle = UILabel()
         subtitle.text = subtitleText(for: item)
         subtitle.font = .preferredFont(forTextStyle: .caption1)
-        subtitle.textColor = UIColor.white.withAlphaComponent(0.6)
+        subtitle.textColor = UIColor.white.withAlphaComponent(0.5)
         subtitle.numberOfLines = 2
         subtitle.lineBreakMode = .byTruncatingTail
 
@@ -252,6 +226,7 @@ final class SearchRecentsCell: UICollectionViewCell {
         case .season: parts.append("Season")
         case .episode: parts.append("Episode")
         case .collection: parts.append("Collection")
+        case .playlist: parts.append("Playlist")
         case .person, .unknown: break
         }
         if let year = item.year { parts.append(String(year)) }
@@ -303,7 +278,7 @@ final class SearchStateCell: UICollectionViewCell {
         iconView.tintColor = .secondaryLabel
         iconView.contentMode = .scaleAspectFit
 
-        titleLabel.font = .systemFont(ofSize: 38, weight: .medium)
+        titleLabel.font = .systemFont(ofSize: 48, weight: .bold)
         titleLabel.textColor = .label
         titleLabel.textAlignment = .center
 

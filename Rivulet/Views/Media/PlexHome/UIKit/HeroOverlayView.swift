@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  HeroOverlayView.swift
-//  Rivulet
-//
-//  Native UIKit hero overlay. Replaces the previous SwiftUI-hosted
-//  `HeroOverlayCell` so the entire UIKit Home is one focus model.
-//
-//  Composition (bottom-up):
-//    - HeroSlideView   — logo / metadata / tagline for the current slide
-//    - HeroButtonRowView — Play / Watchlist / Info / Next
-//    - paging dots     — pinned to the bottom of the overlay
-//
-//  Paging is the Apple TV app's: the old metadata leaves with its page, the
-//  new one fades in over the last 0.42 s of the 1 s slide, and the hero
-//  advances by itself every 5 s while it has focus or the page is at the top.
-//
-//  The view does NOT manage the backdrop image. The collection-view
-//  controller hosts `HeroBackdropView` as a sibling and updates it
-//  whenever this view emits `onIndexChanged`.
-//
+// Home hero overlay: HeroSlideView, HeroButtonRowView and paging dots. Paging is the Apple TV app's:
+// new metadata fades in over the last 0.42 s of a 1 s slide, auto-advancing every 5 s while focused
+// or at the top. The backdrop is a sibling `HeroBackdropView`, driven by `onIndexChanged`.
 
 import UIKit
 import Combine
@@ -155,18 +138,21 @@ final class HeroOverlayView: UIView {
     // MARK: - Scroll
 
     /// Apple's showcase transition: as the page scrolls from the hero (`p` 1)
-    /// to the shelves (`p` 0), the text rises 120 pt faster than the content.
+    /// to the shelves (`p` 0), the text and dots rise faster than the content.
     func applyShowcase(_ p: CGFloat) {
         let lift = CGAffineTransform(translationX: 0, y: -(1 - p) * Self.showcaseTextLift)
         slideView.transform = lift
         buttonRow.transform = lift
+        pagingDotsBackground.transform = lift
         mediaItemOverlay?.applyShowcase(p)
         let wasAtTop = showcasePercentage == 1
         showcasePercentage = p
         if wasAtTop != (p == 1) { updateAutoAdvanceTimer() }
     }
 
-    static let showcaseTextLift: CGFloat = 120
+    /// Apple lifts 120 from a stack resting ~30 pt lower than ours; 80 puts the
+    /// buttons where Apple's sit on the first shelf (y ~120).
+    static let showcaseTextLift: CGFloat = 80
 
     // MARK: - Auto-advance
 
@@ -174,8 +160,9 @@ final class HeroOverlayView: UIView {
     private var showcasePercentage: CGFloat = 1
     private var autoAdvanceTimer: Timer?
 
-    /// Apple's `advanceToNextPageDelayDurationImageOnly` on the home hero.
-    static let autoAdvanceInterval: TimeInterval = 5
+    /// Longer than Apple's image-only 5 s: Apple's hero usually plays a trailer
+    /// first, and ours is image-only, so 5 s read as rushed.
+    static let autoAdvanceInterval: TimeInterval = 8
 
     private var pageCount: Int {
         if let mediaItemOverlay, !mediaItemOverlay.isHidden { return mediaItemOverlay.pageCount }
@@ -457,14 +444,10 @@ final class HeroOverlayView: UIView {
         return nil
     }
 
-    // MARK: - MediaItem path (additive, for MediaLibraryViewController)
+    // MARK: - MediaItem path
 
-    /// Installs the MediaItem overlay and wires its callbacks. The PlexMetadata
-    /// path (configure(items:serverURL:authToken:initialIndex:)) is UNTOUCHED.
-    ///
-    /// The overlay is a simple self-contained UIView (MediaItemHeroOverlayView)
-    /// added as a subview pinned to self's edges. It is created lazily on first
-    /// call and reused thereafter.
+    /// Installs the MediaItem overlay (a lazily created `MediaItemHeroOverlayView` pinned to our
+    /// edges) and wires its callbacks.
     func configure(
         mediaItems: [MediaItem],
         initialIndex: Int,
@@ -520,22 +503,8 @@ final class HeroOverlayView: UIView {
 
 // MARK: - MediaItemHeroOverlayView
 
-/// Minimal hero overlay for MediaItem data. Matches the visual structure of
-/// HeroOverlayView: title/logo + metadata row + tagline, Play/Info/Next
-/// buttons, paging dots. Watchlist is a no-op stub (Task 12 wires actions).
-///
-/// Simplifications vs. the full PlexMetadata hero:
-///   - No watchlist toggle (button hidden; Task 12).
-///   - No HeroPlaySession on-demand resolution (calls onPlay immediately).
-///   - No TMDB logo upgrade (uses item.artwork.logo as-is).
-///   - No delayed metadata-swap work item (metadata updates are instant).
-///   - Logo loaded via ImageCacheManager.shared.image(for:) (not imageFullSize).
-///
-/// Preserved from the PlexMetadata hero:
-///   - 100ms slide-swap delay so art beat aligns with the backdrop crossfade.
-///   - Paging dots, advance (Next) button.
-///   - Focus forwarding to the Play button.
-///   - Identical button layout/spacing (HeroButtonRowView reused directly).
+/// Hero overlay for MediaItem data, laid out like HeroOverlayView with the same HeroButtonRowView.
+/// Play calls `onPlay` directly, without HeroPlaySession resolution.
 @MainActor
 final class MediaItemHeroOverlayView: UIView {
 
@@ -673,6 +642,7 @@ final class MediaItemHeroOverlayView: UIView {
         let lift = CGAffineTransform(translationX: 0, y: -(1 - p) * HeroOverlayView.showcaseTextLift)
         slideView.transform = lift
         buttonRow.transform = lift
+        pagingDotsBackground.transform = lift
     }
 
     /// Per-item primary action (Discover): library-matched items get the
@@ -765,8 +735,8 @@ final class MediaItemHeroOverlayView: UIView {
 
     private func prefetchNextBackdrop() {
         guard items.count > 1 else { return }
-        let next = items[(currentIndex + 1) % items.count]
-        if let url = next.artwork.backdrop ?? next.artwork.thumbnail ?? next.artwork.poster {
+        let next = items[(currentIndex + 1) % items.count].heroBackdropRequest()
+        if let url = next.backdropURL ?? next.thumbnailURL {
             Task { await ImageCacheManager.shared.prefetch(urls: [url], quality: .full) }
         }
     }
@@ -929,14 +899,18 @@ private final class MediaItemSlideView: UIView {
         // Tagline: overview first sentence.
         taglineLabel.text = tagline(for: item)
 
+        // An episode's slide is its show's: the show's logo and name.
+        let title = item.kind == .episode ? (item.seriesTitle ?? item.title) : item.title
+        let logo = item.grandparentArtwork?.logo ?? item.artwork.logo
+
         // Logo / fallback title. TMDB-mapped items carry no logo URL in
         // their artwork (the list endpoints don't include images) — resolve
         // one from the TMDB images API via the shared cache, then load.
-        if item.artwork.logo == nil, let tmdbID = item.tmdbID {
+        if logo == nil, let tmdbID = item.tmdbID {
             // Prepare the fallback (hidden behind the caller's alpha hold)
             // but don't signal ready until the resolve completes — the hero
             // fades the whole slide in only once the logo outcome is known.
-            loadLogo(from: nil, fallbackTitle: item.title)
+            loadLogo(from: nil, fallbackTitle: title)
             let itemID = item.ref.itemID
             currentResolveItemID = itemID
             let type: TMDBMediaType = item.kind == .movie ? .movie : .tv
@@ -947,7 +921,7 @@ private final class MediaItemSlideView: UIView {
                 await MainActor.run {
                     guard self.currentResolveItemID == itemID else { return }
                     if let url {
-                        self.loadLogo(from: url, fallbackTitle: item.title, onReady: onReady)
+                        self.loadLogo(from: url, fallbackTitle: title, onReady: onReady)
                     } else {
                         onReady?()  // no logo exists — fallback title is final
                     }
@@ -956,7 +930,7 @@ private final class MediaItemSlideView: UIView {
         } else {
             logoResolveTask?.cancel()
             currentResolveItemID = nil
-            loadLogo(from: item.artwork.logo, fallbackTitle: item.title, onReady: onReady)
+            loadLogo(from: logo, fallbackTitle: title, onReady: onReady)
         }
     }
 
@@ -1012,10 +986,15 @@ private final class MediaItemSlideView: UIView {
 
     /// Same labels as the Plex hero (`HeroSlideView`): a season or episode
     /// slide is the show's, so it reads "TV Show", without the episode's year.
+    /// An episode adds which one it is.
     private func metaLine(for item: MediaItem) -> String? {
         var parts: [String] = []
         if let kindLabel = typeLabel(for: item.kind) { parts.append(kindLabel) }
         if item.kind != .season, item.kind != .episode, let year = item.year { parts.append(String(year)) }
+        if item.kind == .episode {
+            if let s = item.seasonNumber, let e = item.episodeNumber { parts.append("S\(s), E\(e)") }
+            if item.seriesTitle != nil { parts.append(item.title) }
+        }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 

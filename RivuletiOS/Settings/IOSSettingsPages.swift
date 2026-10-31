@@ -5,18 +5,49 @@ import SwiftUI
 
 /// Account > Home.
 struct IOSHomeSettingsView: View {
-    /// Same key as the tvOS Home > Hero setting.
+    /// Same keys as the tvOS Home > Hero setting.
     @AppStorage("showHomeHero") private var showHero = true
+    @AppStorage(heroContentKey) private var heroContent = "trending"
+
+    static let heroContentKey = "homeHeroContent"
+    private static let heroChoices = [("off", "Off"), ("trending", "Trending"), ("continueWatching", "Continue Watching"),
+                                      ("recentlyAdded", "Recently Added"), ("watchlist", "Watchlist")]
 
     var body: some View {
         Form {
             Section {
-                Toggle("Hero", isOn: $showHero)
+                Picker("Hero", selection: Binding(
+                    get: { showHero ? heroContent : "off" },
+                    set: { choice in
+                        showHero = choice != "off"
+                        if choice != "off" { heroContent = choice }
+                    }
+                )) {
+                    ForEach(Self.heroChoices, id: \.0) { Text($0.1).tag($0.0) }
+                }
             } footer: {
-                Text("Shows featured titles at the top of Home.")
+                Text("What the top of Home features. Trending shows what's popular this week that's in your library. A list with nothing in it shows Trending.")
             }
         }
         .navigationTitle("Home")
+    }
+}
+
+/// Account > Library.
+struct IOSLibrarySettingsView: View {
+    @AppStorage(IOSLibrarySettingsView.showPlaylistsKey) private var showPlaylists = true
+
+    static let showPlaylistsKey = "iosShowPlaylists"
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Playlists", isOn: $showPlaylists)
+            } footer: {
+                Text("Lists each server's video playlists under Library.")
+            }
+        }
+        .navigationTitle("Library")
     }
 }
 
@@ -24,17 +55,27 @@ struct IOSHomeSettingsView: View {
 struct IOSPlaybackSettingsView: View {
     @AppStorage("playerSkipBackwardSeconds") private var skipBackwardSeconds = 10
     @AppStorage("playerSkipForwardSeconds") private var skipForwardSeconds = 30
+    /// Observed so the skip pickers redraw; read and written through `MarkerSkipMode`.
     @AppStorage("autoSkipIntro") private var autoSkipIntro = false
     @AppStorage("autoSkipRecap") private var autoSkipRecap = false
     @AppStorage("autoSkipCredits") private var autoSkipCredits = false
     @AppStorage("autoSkipAds") private var autoSkipAds = false
+    @AppStorage("showSkipIntro") private var showSkipIntro = true
+    @AppStorage("showSkipRecap") private var showSkipRecap = true
+    @AppStorage("showSkipCredits") private var showSkipCredits = true
+    @AppStorage("showSkipAds") private var showSkipAds = true
     @AppStorage("useIntroDB") private var useIntroDB = false
     /// Same keys as the tvOS Home and Away Streaming Quality settings.
     @AppStorage(StreamingQuality.homeKey) private var homeQuality = StreamingQuality.homeDefault
     @AppStorage(StreamingQuality.awayKey) private var awayQuality = StreamingQuality.awayDefault
+    @AppStorage(AetherPlayer.upscaleKey) private var upscales = false
+    /// Bumped on every track-intent write: `TrackIntentStore` is not observable.
+    @State private var trackRevision = 0
 
     var body: some View {
         Form {
+            audioAndSubtitles
+
             Section {
                 Picker("Home", selection: $homeQuality) { qualityOptions }
                 Picker("Away", selection: $awayQuality) { qualityOptions }
@@ -58,14 +99,20 @@ struct IOSPlaybackSettingsView: View {
             }
 
             Section {
-                Toggle("Intros", isOn: $autoSkipIntro)
-                Toggle("Recaps", isOn: $autoSkipRecap)
-                Toggle("Credits", isOn: $autoSkipCredits)
-                Toggle("Commercials", isOn: $autoSkipAds)
+                skipPicker("Intros", marker: "intro")
+                skipPicker("Recaps", marker: "recap")
+                skipPicker("Credits", marker: "credits")
+                skipPicker("Commercials", marker: "commercial")
             } header: {
-                Text("Skip Automatically")
+                Text("Skip Markers")
             } footer: {
-                Text("A skip button still appears for every marker during playback.")
+                Text("Button shows a skip button, Automatic skips on its own, and Off shows nothing.")
+            }
+
+            Section {
+                Toggle("Upscale SD and 720p", isOn: $upscales)
+            } footer: {
+                Text("Sharpens video smaller than your screen with Apple's machine learning upscaler. Uses more power, and stops on its own if the device can't keep up. HDR and Dolby Vision play as before.")
             }
 
             Section {
@@ -77,8 +124,57 @@ struct IOSPlaybackSettingsView: View {
         .navigationTitle("Playback")
     }
 
+    /// Same intents as the tvOS Audio & Subtitles settings, saved per Plex profile.
+    private var audioAndSubtitles: some View {
+        let _ = trackRevision
+        let subtitlesOn = SubtitleMode.current != .off
+        return Section {
+            Picker("Audio Language", selection: trackBinding(
+                get: { TrackIntentStore.audioIntent.map { TrackLanguage.normalize($0.language) } ?? "" },
+                set: { TrackIntentStore.audioIntent = $0.isEmpty ? nil : AudioIntent(language: $0) }
+            )) {
+                Text(TrackLanguage.audioSettingName(nil)).tag("")
+                ForEach([TrackLanguage.original] + TrackLanguage.sortedChoices, id: \.self) {
+                    Text(TrackLanguage.audioSettingName($0)).tag($0)
+                }
+            }
+            Picker("Subtitles", selection: trackBinding(get: { SubtitleMode.current },
+                                                        set: { TrackIntentStore.setSubtitles(mode: $0) })) {
+                ForEach(SubtitleMode.choices, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            Picker("Subtitle Language", selection: trackBinding(
+                get: { TrackLanguage.normalize(TrackIntentStore.subtitleLanguage) },
+                set: { TrackIntentStore.setSubtitles(language: $0) }
+            )) {
+                ForEach(TrackLanguage.sortedChoices, id: \.self) { Text(TrackLanguage.displayName($0)).tag($0) }
+            }
+            .disabled(!subtitlesOn)
+            Toggle("SDH Subtitles", isOn: trackBinding(get: { TrackIntentStore.subtitleSDH },
+                                                       set: { TrackIntentStore.setSubtitles(sdh: $0) }))
+                .disabled(!subtitlesOn)
+        } header: {
+            Text("Audio & Subtitles")
+        } footer: {
+            Text("Foreign Audio shows subtitles when a title's audio is in another language, and only forced subtitles otherwise. Saved for each Plex profile.")
+        }
+        .onAppear { trackRevision += 1 }
+    }
+
+    private func trackBinding<Value>(get: @escaping () -> Value, set: @escaping (Value) -> Void) -> Binding<Value> {
+        Binding(get: get, set: { set($0); trackRevision += 1 })
+    }
+
     private var qualityOptions: some View {
         ForEach(StreamingQuality.allChoices, id: \.self) { Text($0.label).tag($0) }
+    }
+
+    private func skipPicker(_ title: String, marker: String) -> some View {
+        Picker(title, selection: Binding(
+            get: { MarkerSkipMode.current(for: marker) },
+            set: { MarkerSkipMode.set($0, for: marker) }
+        )) {
+            ForEach(MarkerSkipMode.allCases, id: \.self) { Text($0.label).tag($0) }
+        }
     }
 }
 

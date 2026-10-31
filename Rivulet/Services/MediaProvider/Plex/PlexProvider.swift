@@ -24,12 +24,15 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     let networkManager: PlexNetworkManager
     let dataStore: PlexDataStore
     let watchlistAPI: PlexWatchlistAPI
+    /// The Plex profile an extra server's library settings belong to; nil for the selected server.
+    nonisolated let accountID: String?
 
     init(
         machineIdentifier: String,
         displayName: String,
         serverURL: String,
         authToken: String,
+        accountID: String? = nil,
         networkManager: PlexNetworkManager = .shared,
         dataStore: PlexDataStore = .shared,
         watchlistAPI: PlexWatchlistAPI = PlexWatchlistAPI()
@@ -38,6 +41,7 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
         self.displayName = displayName
         self.serverURL = serverURL
         self.authToken = authToken
+        self.accountID = accountID
         self.networkManager = networkManager
         self.dataStore = dataStore
         self.watchlistAPI = watchlistAPI
@@ -61,7 +65,8 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
                 sectionId: library.id,
                 start: page.offset,
                 size: page.limit,
-                sort: plexSortString(for: sort)
+                sort: plexSortString(for: sort),
+                followCollectionMode: true
             )
             let mapped = result.items.map {
                 PlexMediaMapper.item($0, providerID: id, serverURL: serverURL, authToken: authToken)
@@ -85,16 +90,26 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     }
 
     func search(_ query: String) async throws -> [MediaItem] {
-        // PlexNetworkManager doesn't expose a dedicated search method as of Wave 1.
-        // Plex search routes through /hubs/search via custom request shapes;
-        // wiring it here without a network-layer helper would duplicate that
-        // logic. Throwing rather than returning empty so callers can
-        // distinguish "search not implemented" from "no results."
-        // Post-Wave-1 task adds a search method to PlexNetworkManager and
-        // wires it through.
-        throw MediaProviderError.backendSpecific(
-            underlying: "Plex search not implemented in Wave 1"
-        )
+        try await search(query, sections: nil)
+    }
+
+    func search(_ query: String, inLibraries libraryIDs: [String]) async throws -> [MediaItem] {
+        try await search(query, sections: Set(libraryIDs))
+    }
+
+    /// Titles only (movies, shows, seasons, episodes), as Home's own Plex search shows.
+    private func search(_ query: String, sections: Set<String>?) async throws -> [MediaItem] {
+        try await plexCall {
+            let results = try await networkManager.search(
+                serverURL: serverURL, authToken: authToken, query: query, start: 0, size: 80)
+            return results
+                .filter { ["movie", "show", "season", "episode"].contains($0.type ?? "") }
+                .filter { meta in
+                    guard let sections else { return true }
+                    return meta.librarySectionID.map { sections.contains(String($0)) } ?? false
+                }
+                .map { PlexMediaMapper.item($0, providerID: id, serverURL: serverURL, authToken: authToken) }
+        }
     }
 
     func fullDetail(for itemRef: MediaItemRef) async throws -> MediaItemDetail {
@@ -245,10 +260,18 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
             )
             let metadata = hub?.Metadata ?? []
             return metadata.map {
-                PlexMediaMapper.item($0, providerID: id,
-                                    serverURL: serverURL, authToken: authToken)
+                var item = PlexMediaMapper.item($0, providerID: id, serverURL: serverURL, authToken: authToken)
+                item.identity = ContinueWatchingMerge.plexKeys($0)
+                return item
             }
         }
+    }
+
+    func showIdentityKeys(for showIDs: [String]) async -> [String: [String]] {
+        let shows = (try? await networkManager.getGuids(serverURL: serverURL, authToken: authToken, ratingKeys: showIDs)) ?? []
+        return Dictionary(shows.compactMap { show in
+            show.ratingKey.map { ($0, ContinueWatchingMerge.plexShowKeys(show)) }
+        }, uniquingKeysWith: { first, _ in first })
     }
 
     func recentlyAdded(limit: Int) async throws -> [MediaItem] {
@@ -287,6 +310,13 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
                                    serverURL: serverURL, authToken: authToken)
             }
         }
+    }
+
+    /// The library's own Recently Added hub, re-keyed to the id Home looks up.
+    func recentlyAddedHub(in library: MediaLibrary) async throws -> MediaHub? {
+        guard let hub = try await hubs(in: library).first(where: { $0.id.lowercased().contains("recentlyadded") }),
+              !hub.items.isEmpty else { return nil }
+        return MediaHub(id: "\(library.id).recentlyAdded", providerID: id, title: hub.title, style: hub.style, items: hub.items)
     }
 
     // MARK: - Playback
@@ -385,7 +415,7 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     }
 
     func updateProgress(_ itemRef: MediaItemRef, position: TimeInterval) async throws {
-        try await plexCall {
+        _ = try await plexCall {
             try await networkManager.reportProgress(
                 serverURL: serverURL, authToken: authToken,
                 ratingKey: itemRef.itemID, timeMs: Int(position * 1000), state: "playing"
@@ -437,11 +467,8 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
         )) ?? meta
     }
 
-    /// Every external guid Plex holds for the item, tmdb first (it's what the
-    /// watchlist cache is keyed on elsewhere). NOT tmdb-only: a show scraped by
-    /// the TheTVDB agent frequently carries no tmdb guid at all, and demanding
-    /// one meant adding it silently did nothing (issue #269). Plex Discover
-    /// matches imdb and tvdb guids just as well.
+    /// Every external guid Plex holds for the item, tmdb first. Not tmdb-only: a TheTVDB-agent
+    /// show often has none, and Discover matches imdb and tvdb guids too (#269).
     func watchlistGUIDs(_ ref: MediaItemRef) async -> [String] {
         if ref.providerID == TMDBMediaMapper.providerID,
            let (tmdbId, _) = TMDBMediaMapper.decodeItemID(ref.itemID) {
@@ -505,6 +532,99 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
         await service.remove(guid: guid)
         guard await MainActor.run(body: { !guids.contains(where: service.contains) }) else {
             throw MediaProviderError.backendSpecific(underlying: "Plex rejected the watchlist remove")
+        }
+    }
+
+    // MARK: - Playlists
+
+    var supportsPlaylists: Bool { true }
+
+    /// Asked of the server once: the provider id can be a URL hash when the server list had not loaded.
+    private let machineID = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    private func serverMachineID() async throws -> String {
+        if let known = machineID.withLock({ $0 }) { return known }
+        let fetched = try await networkManager.getMachineIdentifier(serverURL: serverURL, authToken: authToken)
+        machineID.withLock { $0 = fetched }
+        return fetched
+    }
+
+    func videoPlaylists() async throws -> [MediaPlaylist] {
+        try await plexCall {
+            try await networkManager.getPlaylists(serverURL: serverURL, authToken: authToken, type: "video")
+                .map { PlexMediaMapper.playlist($0, providerID: id, serverURL: serverURL, authToken: authToken) }
+                .sorted { $0.item.title.localizedCaseInsensitiveCompare($1.item.title) == .orderedAscending }
+        }
+    }
+
+    func playlistEntries(_ playlist: MediaItemRef) async throws -> PlaylistContents {
+        try await plexCall {
+            let result = try await networkManager.getAllPlaylistItems(
+                serverURL: serverURL, authToken: authToken, ratingKey: playlist.itemID)
+            // Smart playlist items carry no playlistItemID; their ratingKey is unique in the list.
+            let entries = result.items.compactMap { meta in
+                (meta.playlistItemID.map(String.init) ?? meta.ratingKey).map {
+                    PlaylistEntry(entryID: $0,
+                                  item: PlexMediaMapper.item(meta, providerID: id, serverURL: serverURL, authToken: authToken))
+                }
+            }
+            return PlaylistContents(entries: entries, isSmart: result.isSmart)
+        }
+    }
+
+    func createPlaylist(title: String, seededWith items: [MediaItemRef]) async throws -> MediaPlaylist {
+        try await plexCall {
+            let uri = PlexNetworkManager.libraryURI(machineIdentifier: try await serverMachineID(),
+                                                    ratingKeys: items.map(\.itemID))
+            let created = try await networkManager.createPlaylist(
+                serverURL: serverURL, authToken: authToken, type: "video", title: title, uri: uri
+            )
+            return PlexMediaMapper.playlist(created, providerID: id, serverURL: serverURL, authToken: authToken)
+        }
+    }
+
+    func addToPlaylist(_ playlist: MediaItemRef, items: [MediaItemRef]) async throws {
+        guard !items.isEmpty else { return }
+        try await plexCall {
+            try await networkManager.addToPlaylist(
+                serverURL: serverURL, authToken: authToken, playlistRatingKey: playlist.itemID,
+                machineIdentifier: try await serverMachineID(), ratingKeys: items.map(\.itemID)
+            )
+        }
+    }
+
+    func removeFromPlaylist(_ playlist: MediaItemRef, entryID: String) async throws {
+        try await plexCall {
+            try await networkManager.removePlaylistItem(
+                serverURL: serverURL, authToken: authToken,
+                playlistRatingKey: playlist.itemID, playlistItemID: entryID
+            )
+        }
+    }
+
+    func movePlaylistEntry(_ playlist: MediaItemRef, entryID: String, toIndex: Int, in entries: [PlaylistEntry]) async throws {
+        let after = PlexNetworkManager.moveAfter(entryID: entryID, toIndex: toIndex, in: entries.map(\.entryID))
+        try await plexCall {
+            try await networkManager.movePlaylistItem(
+                serverURL: serverURL, authToken: authToken, playlistRatingKey: playlist.itemID,
+                playlistItemID: entryID, after: after
+            )
+        }
+    }
+
+    func renamePlaylist(_ playlist: MediaItemRef, title: String) async throws {
+        try await plexCall {
+            try await networkManager.renamePlaylist(
+                serverURL: serverURL, authToken: authToken, playlistRatingKey: playlist.itemID, title: title
+            )
+        }
+    }
+
+    func deletePlaylist(_ playlist: MediaItemRef) async throws {
+        try await plexCall {
+            try await networkManager.deletePlaylist(
+                serverURL: serverURL, authToken: authToken, playlistRatingKey: playlist.itemID
+            )
         }
     }
 

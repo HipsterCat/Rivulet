@@ -51,14 +51,9 @@ final class RemoteInputHandler: ObservableObject {
 
     var onAction: ((PlaybackInputAction, PlaybackInputSource) -> Void)?
 
-    // The host's own responder chain handles every input tvOS ALSO delivers as
-    // a `UIPress`: clickpad clicks (arrow and select presses), a game
-    // controller's d-pad and B, a keyboard's arrows and Escape. Acting on the
-    // GameController copy too made one click land zero, one or two skips, so
-    // this handler acts only on what has no UIPress: clickpad rotation,
-    // shoulder buttons, X, a gamepad's A and the keyboard's Space / Return / I.
-    // A and Return still double as Select presses (so they toggle playback here
-    // and the controls in the host), as they always have.
+    // Acts only on input with no `UIPress` copy (clickpad rotation, shoulders,
+    // X, A, Space / Return / I); the host's responder chain handles the rest,
+    // and acting on both made one click skip zero, one or two times.
 
     /// The monitoring handler, so the VOD container can ask where the finger
     /// rested before a click without owning GameController itself (its
@@ -240,14 +235,8 @@ final class RemoteInputHandler: ObservableObject {
                 // visible as a click that arrived.
                 InputProbe.gamepad("micro buttonA \(pressed ? "down" : "up")")
 
-                // Physical state first, before any gate. The gates below used
-                // to return before this, and they are not symmetric in time: an
-                // Up/Down click that raises the rail passes the gate on the way
-                // down and hits it on the way up. That stranded `isButtonDown`
-                // true, which froze the tracked touch position (clickpad
-                // rotation went dead) until some later click happened to
-                // release ungated, and that click then skipped in whatever
-                // direction was frozen, not the one the user clicked.
+                // Physical state first, before any gate: a gate can pass the
+                // down and block the up, stranding `isButtonDown` true.
                 self.isButtonDown = pressed
                 if pressed { Self.lastClickpadDownAt = CACurrentMediaTime() }
                 // The click itself is the host's: it arrives as an arrow or
@@ -491,15 +480,8 @@ private final class UniversalPlaybackInputTarget: PlaybackInputTarget {
         case .seekRelative(let seconds):
             guard vm.postVideoState == .hidden else { return }
             if vm.isScrubbing && vm.scrubSpeed != 0 && source != .mpRemoteCommand {
-                // Active shuttle: a plain click bumps/steps-down the
-                // multiplier via ShuttleGrammar, same grammar as a
-                // long-press nudge. See F1 in final-branch-review.md —
-                // clicks must be able to reach the bump, not just holds.
-                // Excluded for .mpRemoteCommand: MPRemoteCommand skipForward/
-                // skipBackward also emit .seekRelative(±N) (NowPlayingService),
-                // and an external skip arriving mid-shuttle should keep its
-                // nudge-by-N magnitude rather than bump the multiplier. See R1
-                // in final-branch-review.md.
+                // Active shuttle: a click bumps the multiplier, as a hold does.
+                // Not for MPRemoteCommand skips, which keep their nudge-by-N.
                 let wasScrubbing = vm.isScrubbing
                 let speedBefore = vm.scrubSpeed
                 vm.scrubInDirection(forward: seconds > 0)
@@ -520,14 +502,8 @@ private final class UniversalPlaybackInputTarget: PlaybackInputTarget {
             } else {
                 Task { await vm.seekRelative(by: seconds) }
             }
-            // REFRESH the auto-hide timer when the chrome is already up; do not
-            // SUMMON it. A single click with the rail closed is a skip, not a
-            // request for chrome. This ran unconditionally, so every skip from a
-            // hidden-chrome state raised the rail, and raising it flips
-            // `controlsFocusActive`, which disarms the container's own Left/Right
-            // recognizers — so the click after a skip did nothing. That is the
-            // "sometimes it skips, sometimes it opens the rail, sometimes
-            // nothing happens" sequence, and it is one bug, not three.
+            // Refresh the auto-hide timer when the chrome is up; a skip never
+            // summons it, or the next click lands on the rail instead of skipping.
             if vm.showControls { vm.showControlsTemporarily() }
 
         case .seekAbsolute(let time):
@@ -628,8 +604,7 @@ private final class UniversalPlaybackInputTarget: PlaybackInputTarget {
                 onResetRemoteInput?()
             } else if vm.showPausedPoster {
                 // Back with the ambient pause backdrop up returns to the
-                // paused frame — it does not exit the player. The timer does
-                // not re-arm until the next pause, so the frame stays clean.
+                // paused frame — it does not exit the player.
                 vm.hidePausedPoster()
             } else if vm.controlsFocusActive || vm.showControls {
                 // Back from the transport buttons (or from any visible chrome)
@@ -738,7 +713,6 @@ struct UniversalPlayerView: View {
         }
         .animation(.easeInOut(duration: 1.0), value: viewModel.playbackState)
         .animation(.easeInOut(duration: 0.25), value: viewModel.showControls)
-        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: viewModel.seekIndicator)
         .animation(.easeInOut(duration: 0.5), value: viewModel.pausePresentation)
         // No press handling in this view at all: no .onPlayPauseCommand,
         // .onExitCommand, .onMoveCommand or .onTapGesture. Every press is
@@ -793,6 +767,7 @@ struct UniversalPlayerView: View {
             hasStartedPlayback = true
             // Notify that playback is starting (pauses hub polling)
             NotificationCenter.default.post(name: .plexPlaybackStarted, object: nil)
+            LiveTVDataStore.shared.beginPlaybackGuideHold()
             // Activate audio session BEFORE playback starts
             NowPlayingService.shared.attach(to: viewModel, inputCoordinator: inputCoordinator)
             await viewModel.startPlayback()
@@ -803,6 +778,8 @@ struct UniversalPlayerView: View {
             AppHangContext.setScreen("browse")
             // Notify that playback is stopping (resumes hub polling)
             NotificationCenter.default.post(name: .plexPlaybackStopped, object: nil)
+            // Only a player whose .task ran holds the guide.
+            if hasStartedPlayback { LiveTVDataStore.shared.endPlaybackGuideHold() }
             // Stop playback first, then detach from Now Playing
             // (audio session must remain active until player stops)
             viewModel.stopPlayback()
@@ -854,17 +831,6 @@ struct UniversalPlayerView: View {
                             )
                         )
                 }
-            }
-
-            // Mid-playback buffering has no centered indicator: the quiet
-            // top-left "Loading" cue in PlayerContainerViewController covers
-            // it in the same slot the Paused indicator uses.
-
-            // Seek Indicator (10s skip) with the chrome hidden; with it up,
-            // the progress bar shows AVKit's glyph beside the time instead.
-            if let indicator = viewModel.seekIndicator, !viewModel.showControls {
-                seekIndicatorView(indicator)
-                    .transition(.scale.combined(with: .opacity))
             }
 
             // Compatibility Notice (e.g., DV fallback)
@@ -996,24 +962,6 @@ struct UniversalPlayerView: View {
         }
     }
 
-    // MARK: - Seek Indicator View
-
-    private func seekIndicatorView(_ indicator: SeekIndicator) -> some View {
-        Image(systemName: indicator.systemImage)
-            .font(.system(size: 48, weight: .medium))
-            .foregroundStyle(.white)
-            .frame(width: 88, height: 88)
-            .background(
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(.black.opacity(0.6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .strokeBorder(.white.opacity(0.15), lineWidth: 1)
-                    )
-            )
-            .shadow(color: .black.opacity(0.4), radius: 12, x: 0, y: 4)
-    }
-
     // MARK: - Compatibility Notice
 
     private func compatibilityNoticeView(_ message: String) -> some View {
@@ -1058,6 +1006,8 @@ struct UniversalPlayerView: View {
             return "link.badge.plus"
         case .unknown:
             return "exclamationmark.triangle.fill"
+        case .serverTerminated:
+            return "stop.circle.fill"
         case .engineFailure(let kind, _):
             // Reuse the one engine-kind taxonomy instead of opening a third
             // switch over the same strings. "Is this a network thing or a
@@ -1093,6 +1043,8 @@ struct UniversalPlayerView: View {
             return "Invalid Stream"
         case .unknown:
             return "Playback Error"
+        case .serverTerminated:
+            return "Playback Stopped"
         case .engineFailure(let kind, _):
             switch DirectPlayFailureKind(engineKind: kind) {
             case .network: return "Connection Problem"
@@ -1103,32 +1055,8 @@ struct UniversalPlayerView: View {
     }
 }
 
-// MARK: - Convenience Initializer
-
-extension UniversalPlayerView {
-    /// Creates a player view using the shared auth manager for credentials
-    init(metadata: PlexMetadata, startOffset: TimeInterval? = nil) {
-        let authManager = PlexAuthManager.shared
-        self.init(
-            metadata: metadata,
-            serverURL: authManager.selectedServerURL ?? "",
-            authToken: authManager.selectedServerToken ?? "",
-            startOffset: startOffset
-        )
-    }
-}
-
-/// Player error overlay with explicit default focus.
-///
-/// Lifted out of `UniversalPlayerView.errorView` so it can carry its own
-/// `@FocusState` and per-button `.focused()` bindings — without that, the
-/// error buttons were technically reachable from the Siri Remote (clicks
-/// fired their actions) but never visually highlighted, leaving the user
-/// unable to tell which button they were about to press. The visual
-/// highlight is driven off the outer `@FocusState` rather than
-/// `AppStoreButtonStyle`'s broken internal `@FocusState`, which doesn't
-/// reliably reflect the button's true focus state when wrapped in a
-/// `ButtonStyle.makeBody`.
+/// Player error overlay with explicit default focus. The highlight reads its own
+/// `@FocusState`, since `AppStoreButtonStyle`'s does not track focus inside `makeBody`.
 @MainActor
 private struct PlayerErrorOverlay: View {
     let error: PlayerError
@@ -1158,7 +1086,7 @@ private struct PlayerErrorOverlay: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 60)
 
-            HStack(spacing: 20) {
+            HStack(spacing: 32) {
                 if error.isRetryable {
                     actionButton(label: "Try Again", field: .retry, action: onRetry)
                 }
@@ -1201,12 +1129,12 @@ private struct PlayerErrorOverlay: View {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(isFocused ? Color.white : Color.white.opacity(0.15))
                 )
-                .scaleEffect(isFocused ? 1.1 : 1.0)
+                .scaleEffect(isFocused ? 1.06 : 1.0)
                 .animation(.spring(response: 0.25, dampingFraction: 0.8), value: isFocused)
         }
-        .buttonStyle(.plain)
+        // `.plain` adds the system focus lift on top of the scale above, so the pills overlapped (#385).
+        .buttonStyle(NoFocusEffectButtonStyle())
         .focused($focused, equals: field)
-        .focusEffectDisabled()
     }
 }
 

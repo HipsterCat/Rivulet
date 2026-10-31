@@ -35,16 +35,20 @@ The video player is **AetherPlayer** — an adapter around AetherEngine (FFmpeg 
 - **Language**: Swift 6
 - **UI Framework**: UIKit for the primary surfaces (see above); SwiftUI for the rest
 - **Video Player**: AetherPlayer for VOD and Live TV; AVPlayer only for the `hls` route (server transcode, primary-when-no-direct-URL or Aether fallback). See `Docs/RIVULET_PLAYER.md`.
-- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (7.44.0), with the `DualLayerDolbyVision` (P7 FEL), `DolbyVisionStillReshaping` (P5 stills), `TrueHDObjectAudio` and `DTSXObjectAudio` package traits set in `project.pbxproj`; object audio stays off until Settings → Playback → Height Speakers names a layout. A bump must keep the traits. **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
+- **AetherEngine**: consumed as an **upstream** SwiftPM dependency (`superuser404notfound/AetherEngine`), pinned `exactVersion` (7.53.0), with the `DualLayerDolbyVision` (P7 FEL), `DolbyVisionStillReshaping` (P5 stills), `TrueHDObjectAudio` and `DTSXObjectAudio` package traits set in `project.pbxproj`; object audio stays off until Settings → Playback → Height Speakers names a layout. A bump must keep the traits. **There is no fork** — engine fixes need an upstream release or a host-side workaround; do not propose editing engine sources. Bumping it has a procedure: use the `aether-update` skill. Every bump gets a changelog line. FFmpeg + libdovi arrive **only transitively through Aether**; there is no app-level FFmpeg layer and no direct FFmpegBuild dependency. Since FFmpegBuild 2.0.0 the FFmpeg libs ship as **embedded dynamic frameworks** in `Rivulet.app/Frameworks/` — their `MinimumOSVersion` (26.0) must stay >= `TVOS_DEPLOYMENT_TARGET` (26.0), so do not raise the deployment target.
 - **Design Guide**: See `Docs/DESIGN_GUIDE.md` for UI/UX patterns
 - **Repo is public**: keep commit messages short and plain; no internal detail.
 
 ## Project Structure
 
-Four code roots. `RivuletCore/` is a buildable folder compiled into BOTH app
+Five code roots. `RivuletCore/` is a buildable folder compiled into BOTH app
 targets (not a module: `internal` spans each target); `Rivulet/` is the tvOS
-app, `RivuletiOS/` the iOS app, `TopShelfExtension/` the tvOS Top Shelf. See
-"Platform Boundary" below for what goes where.
+app, `RivuletiOS/` the iOS app, `TopShelfExtension/` the tvOS Top Shelf, and
+`AssetPackExtension/` the tvOS Background Assets downloader that fetches the
+speech model as an Apple-hosted asset pack (`SpeechModelStore`; Debug builds,
+which can't reach Apple hosting, fall back to Hugging Face into Caches; repack
+with `Scripts/speech-model-pack.json`). See "Platform Boundary" below for what
+goes where.
 
 ```
 RivuletCore/            # Shared tvOS + iOS. The ONE Plex client (PlexNetworkManager,
@@ -179,8 +183,16 @@ exactly four files touch genuinely tvOS-only API: the three in `Services/Input/`
 plus `DisplayCriteriaManager`. Judge by tvOS-only frameworks (`TVServices`,
 `TVUIKit`, `AVDisplayManager`) and focus/press API, nothing else.
 
-Move files into `RivuletCore/` when a slice actually needs them, not
+Move existing files into `RivuletCore/` when a slice actually needs them, not
 speculatively. The list above is the destination, not a migration order.
+
+**New business logic starts in `RivuletCore/`, even when only tvOS ships it.**
+Rules, server and API behavior, and non-UI state go there from the first
+commit, written generic over the item type (closures for keys and dates) so
+they do not depend on tvOS models like `MediaItem`; only views, input and
+tvOS-shaped stores stay in `Rivulet/`. #87 is the worked example of getting
+this wrong: multi-server discovery and the Continue Watching merge landed in
+the tvOS folder and had to be lifted before iOS could use them.
 
 The Plex stack is already across: `PlexNetworkManager`, `PlexAuthManager`,
 `PlexUserProfileManager`, `Models/Plex/`, the TMDB client, `IntroDBClient`,
@@ -292,9 +304,13 @@ sidebar.
   with the sidebar closed (`collapseRequest`), as the Apple TV app does.
 - **Live TV with no media server opens on Live TV.** With no Plex or Jellyfin
   signed in, `ShellSidebarModel` hides Search, Home, Discover and Watchlist
-  (`opensToLiveTV`) and `TVSidebarView` switches to the Live TV tab. Home stays
-  only as the signed-out welcome, whose backdrop is `WelcomeGlowView` (maps from
-  `tools/welcome/flow_map.py`).
+  (`opensToLiveTV`) and `TVSidebarView` switches to the Live TV tab.
+- **A new install sees the setup landing instead of the shell.**
+  `SetupLandingViewController` (cards for Plex, Jellyfin and Live TV on
+  `WelcomeGlowView`, maps from `tools/welcome/flow_map.py`) stands in until Start
+  Watching sets `setupComplete`; signing out of everything clears it. Its flows
+  are the Settings pages themselves, run standalone
+  (`SettingsContainerViewController(rootPage:)` + `onExit`): never a second form.
 - **"Profile Picker on Launch" is a hard gate.** `ProfilePickerOverlay` reports a
   chosen profile through `onSelected`; `TVSidebarView` re-presents the picker on
   any other close, so Menu cannot dismiss it into the last profile's content.
@@ -511,6 +527,14 @@ Key components:
     transcode at the playhead instead (one extra rebuffer).
   RPlayer's old sidecar pipeline (`SubtitleManager`, `SubtitleOverlayView`) is
   deleted; do not revive it. Jellyfin's transcode still uses server subtitles.
+- **Generated subtitles** (the player's subtitle menu, aether route only; the first
+  pick downloads the model and the open menu shows its progress) are written from the content filter's speech model (`SpeechCaptions` groups
+  the heard words into lines). The track is id `generatedSubtitleId` (-2), added only
+  to the menu (`subtitleMenuTracks`), never to `subtitleTracks`, so intent, Plex
+  timeline ids and the filter's track logic never see it. While it shows, the
+  overlay's model holds generated cues and the engine's cues (the filter's unseen
+  read) wait in `engineCues`. The pick saves no preference; it carries on to the
+  session's next items unless one has a real English track (`preferRealSubtitlesOverGenerated`).
 - `SubtitleParser.swift` survived that cull and is NOT dead, but nothing in it
   renders: it serves the content filter. `VTTParser` reads `text/mcf+vtt` lists
   (`ContentFilterParsers`), and all three parsers (VTT, SRT, ASS) read a title's
@@ -683,10 +707,10 @@ Two rules that look wrong until you know them:
 
 **Changing watch state must repaint.** `.plexDataNeedsRefresh` is the live
 channel; all three UIKit surfaces observe it. Post it after the server call.
-`PlexDataStore.updateItemWatchStatus` and `.episodeWatchedStatusChanged` are
-both **dead** (no callers / no posters), orphaned when the SwiftUI detail view
-was deleted — don't revive either, and don't reintroduce optimistic Continue
-Watching mutation from a shelf (reverted in `90bfd2b` for focus reasons).
+The old optimistic path (`PlexDataStore.updateItemWatchStatus`,
+`.episodeWatchedStatusChanged`) is deleted; don't revive it, and don't
+reintroduce optimistic Continue Watching mutation from a shelf (reverted in
+`90bfd2b` for focus reasons).
 
 ### Content margin and tile grid
 
@@ -728,9 +752,24 @@ which never names a backend.
 
 - **One GUI for both servers.** No Jellyfin-only surface. A Plex-only feature
   is simply absent on a Jellyfin item.
-- **Never merge across servers.** Each server's libraries and Home rows show on
-  their own, labelled by server ("Plex - Movies", "Jellyfin - Continue Watching").
-  The user picks rows through the existing Home Rows setting.
+- **Never merge across servers, except Continue Watching.** Each server's
+  libraries and Home rows show on their own, labelled by server. With more than
+  one server signed in, Continue Watching is ONE row (`ContinueWatchingRow`,
+  `ContinueWatchingMerge`): the same title on two servers is one card, matched
+  on ids only (never title), episodes per show, the copy watched last shown.
+  Plex to Plex costs no request (`plex://` guids, `includeGuids=1` on the hub);
+  show ids for episodes come from one batched lookup per server, kept forever.
+  A card's Mark Watched / Remove reach every copy.
+- **The account's other Plex servers (#87) ride the same seam.** The selected
+  server keeps `PlexDataStore` and the legacy `.plex` paths; every other server
+  on the account is a `PlexProvider` from `PlexExtraServers` (RivuletCore:
+  per-profile list and tokens from `/resources`, shared with iOS), shown beside
+  Jellyfin by `ServerDataStore`. iOS keys the same servers on
+  `PlexMetadata.serverID` / `PlexLibrary.serverID` / `PlexHub.serverID` (nil is
+  the selected server) and resolves each through `IOSPlexSession.configuration(serverID:)`.
+  `MediaItemRef.isPlex` means the SELECTED server only, so an extra server's
+  item takes the provider path; never test `hasPrefix("plex:")` to mean
+  "the Plex server".
 - **A new feature is a protocol requirement plus one implementation per provider.**
   When a decision point names Jellyfin, generalize it onto the seam.
 - Server floor is 10.10 (`JellyfinSession.minimumVersion`), tested on 12.1. No
@@ -1106,7 +1145,7 @@ VOD is served by AetherPlayer (`aether` route, the default) or AVPlayer (`hls` r
 
 ### HDR / DV
 - Aether drives `AVDisplayManager.preferredDisplayCriteria` itself (host `DisplayCriteriaManager` stands down on the aether route).
-- DV is engine-owned; the RPU stays in the samples and Apple's decoder applies it. P5 is a `dvh1` sample entry with `dvcC` and `CODECS="dvh1.05.LL"`. P8.1 / P8.4 are `hvc1` + `dvvC` with `SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p"` (`/db4h` for 8.4), and the HDMI criteria request `dvh1`. The supplemental only rides the master playlist, which is served once the panel is in HDR, so real DV needs a DV TV plus Match Dynamic Range (or HDR/DV output locked). P7 FEL on a DV panel takes the engine's dual-layer route (#345): `AetherPlayer` sets `preferDualLayerDolbyVision` from `AetherEngine.displayCapabilities.supportsDolbyVision`, because the engine does not check the panel itself. That route is the software host, so it loses E-AC-3 Atmos objects and the AirPlay picture, and the engine refuses it over its real-time budget (UHD 30 fps plus a 1080p EL). P7 MEL, and FEL over budget, is converted live to single-layer 8.1 (libdovi, EL dropped) on a DV panel. Without DV on the TV, P7 plays the HDR10 base. P8.2 plays its SDR base. Without DV on the TV, 8.x plays its base layer. Rivulet sets neither `dolbyVisionHandling` nor `forceDolbyVisionOnNonDVDisplay`, so the engine defaults apply. Both FEL and P5 stills exist only because of package traits (see Quick Reference), so a bump that drops them silently turns FEL off. Routing lives in the engine's `CodecRoutePolicy.swift`.
+- DV is engine-owned; the RPU stays in the samples and Apple's decoder applies it. P5 is a `dvh1` sample entry with `dvcC` and `CODECS="dvh1.05.LL"`. P8.1 / P8.4 are `hvc1` + `dvvC` with `SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p"` (`/db4h` for 8.4), and the HDMI criteria request `dvh1`. The supplemental only rides the master playlist, which is served once the panel is in HDR, so real DV needs a DV TV plus Match Dynamic Range (or HDR/DV output locked). P7 FEL on a DV panel takes the engine's dual-layer route (#345): `AetherPlayer` sets `preferDualLayerDolbyVision` from `AetherEngine.displayCapabilities.supportsDolbyVision`, because the engine does not check the panel itself. That route is the software host: height channels still render there (Height Speakers), but it has no AirPlay picture, and the engine refuses it over its real-time budget (UHD 30 fps plus a 1080p EL). P7 MEL, and FEL over budget, is converted live to single-layer 8.1 (libdovi, EL dropped) on a DV panel. Without DV on the TV, P7 plays the HDR10 base. P8.2 plays its SDR base. Without DV on the TV, 8.x plays its base layer. Rivulet sets neither `dolbyVisionHandling` nor `forceDolbyVisionOnNonDVDisplay`, so the engine defaults apply. Both FEL and P5 stills exist only because of package traits (see Quick Reference), so a bump that drops them silently turns FEL off. Routing lives in the engine's `CodecRoutePolicy.swift`.
 
 ## Plex Discover API
 
@@ -1124,8 +1163,8 @@ The Plex Discover API uses three different hosts:
 
 ## Plex server API gotchas
 
-**Hub items are not full metadata.** `/hubs/continueWatching` sends no `Guid`
-array (so no TMDB id) and only three `Role` entries. Anything keyed on external
+**Hub items are not full metadata.** `/hubs/continueWatching` sends the `Guid`
+array only with `includeGuids=1` (which `continueWatchingURL` sends), and only three `Role` entries. Anything keyed on external
 ids or the full cast reads `getFullMetadata` first, as Insights does
 (`insightsFullMetadata`).
 

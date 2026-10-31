@@ -12,24 +12,21 @@ import UIKit
 import Foundation
 import ImageIO
 
-/// Requested decode size for a cached image.
-///
-/// The disk cache always holds the original downloaded bytes; quality only governs how
-/// large we decode them for display. The Apple TV renders its UI into a 1080p framebuffer
-/// and the system upscales the whole frame to 4K, so 3840px (a 2x supersample of the
-/// 1920pt full-screen width) is the practical ceiling for the largest surfaces — bigger
-/// sources are decoded and then thrown away, costing CPU/heat for no visible gain. `thumb`
-/// is a 2x supersample of the ~444pt poster card: ample for rows, cheap to decode.
+/// Decode size for a cached image; the disk keeps the original bytes. tvOS renders at 1080p
+/// and upscales to 4K, so 3840 px (2x the screen width) is the ceiling; `thumb` is 2x a ~444 pt poster.
 enum ImageQuality: Sendable {
     /// Small UI: poster rows, continue-watching, cast, episode stills, logos, blurred backdrops.
     case thumb
     /// Large surfaces that fill much of the screen: home hero, carousel, detail backdrops.
     case full
+    /// Channel logos drawn at under 128 pt. A 900 px decode of each was about 1 MB per logo.
+    case logo
 
     nonisolated var maxPixelSize: CGFloat {
         switch self {
         case .thumb: return 900
         case .full:  return 3840
+        case .logo:  return 256
         }
     }
 
@@ -37,6 +34,7 @@ enum ImageQuality: Sendable {
         switch self {
         case .thumb: return "t"
         case .full:  return "f"
+        case .logo:  return "l"
         }
     }
 }
@@ -69,6 +67,11 @@ actor ImageCacheManager: NSObject {
     nonisolated(unsafe) private let keyCache = NSCache<NSString, NSString>()
     private var cacheMetadata: [String: ImageCacheEntry] = [:]
     private var metadataLoaded = false
+    /// Bytes on disk, measured once and then kept up to date, so a download never lists the
+    /// directory. Rewriting the metadata and listing the cache per download was O(cache size)
+    /// on every image, which stalled every image load during a logo flood.
+    private var diskBytes: Int64?
+    private var metadataSaveScheduled = false
 
     // MARK: - URL Session (with SSL handling)
 
@@ -95,6 +98,9 @@ actor ImageCacheManager: NSObject {
         var waiters: Int
     }
     private var activeDownloads: [URL: Download] = [:]
+    /// URLs the server answered 4xx for this session; a dead channel logo otherwise
+    /// re-requests every time its cell is configured.
+    private var missingURLs: Set<URL> = []
 
     // MARK: - Cache Directory
 
@@ -222,6 +228,8 @@ actor ImageCacheManager: NSObject {
     func clearAll() async {
         memoryCache.removeAllObjects()
         cacheMetadata.removeAll()
+        diskBytes = 0
+        missingURLs.removeAll()
 
         guard let dir = cacheDirectory else { return }
         try? FileManager.default.removeItem(at: dir)
@@ -270,6 +278,15 @@ actor ImageCacheManager: NSObject {
         return await fetchOriginalData(url: url, key: key)
     }
 
+    /// The image's width in pixels, read from its header without decoding. Fetches and caches the original.
+    func pixelWidth(for url: URL) async -> Int? {
+        guard let data = await imageData(for: url),
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        else { return nil }
+        return properties[kCGImagePropertyPixelWidth] as? Int
+    }
+
     // MARK: - Private Implementation
 
     private func scheduleStaleRefresh(url: URL, key: String) {
@@ -295,8 +312,9 @@ actor ImageCacheManager: NSObject {
         if age > defaultTTL {
             if await fetchOriginalData(url: url, key: key) != nil {
                 // Drop decoded tiers so the next read re-decodes the fresh bytes.
-                memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: .thumb))
-                memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: .full))
+                for quality in [ImageQuality.thumb, .full, .logo] {
+                    memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: quality))
+                }
             }
         }
     }
@@ -304,6 +322,7 @@ actor ImageCacheManager: NSObject {
     /// Download the original image bytes, validate, persist to disk, and return them.
     /// Coalesced per-URL so concurrent requests share a single network fetch.
     private func fetchOriginalData(url: URL, key: String) async -> Data? {
+        guard !missingURLs.contains(url) else { return nil }
         if var existing = activeDownloads[url] {
             existing.waiters += 1
             activeDownloads[url] = existing
@@ -361,6 +380,7 @@ actor ImageCacheManager: NSObject {
                         try? await Task.sleep(nanoseconds: backoff[attempt])
                         continue
                     }
+                    if (400...499).contains(status), status != 408, status != 429 { await self.markMissing(url) }
                     return nil
                 } catch {
                     if Task.isCancelled { return nil }
@@ -398,6 +418,10 @@ actor ImageCacheManager: NSObject {
         }
     }
 
+    private func markMissing(_ url: URL) {
+        missingURLs.insert(url)
+    }
+
     private func removeActiveDownload(for url: URL, id: UUID) {
         if activeDownloads[url]?.id == id { activeDownloads[url] = nil }
     }
@@ -407,9 +431,11 @@ actor ImageCacheManager: NSObject {
     private func saveToDisk(data: Data, key: String, url: URL) {
         guard let cacheDir = cacheDirectory else { return }
         let fileURL = cacheDir.appendingPathComponent(key)
+        loadMetadataIfNeeded()
 
         do {
             try data.write(to: fileURL, options: .atomic)
+            diskBytes? += Int64(data.count) - (cacheMetadata[key]?.fileSize ?? 0)
 
             // Update metadata
             let entry = ImageCacheEntry(
@@ -419,12 +445,8 @@ actor ImageCacheManager: NSObject {
                 fileSize: Int64(data.count)
             )
             cacheMetadata[key] = entry
-            saveMetadata()
-
-            // Check if we need to evict
-            Task {
-                await evictIfNeeded()
-            }
+            scheduleMetadataSave()
+            evictIfNeeded()
         } catch {
             print("💾 ImageCacheManager: Failed to save image to disk: \(error.localizedDescription)")
         }
@@ -432,8 +454,8 @@ actor ImageCacheManager: NSObject {
 
     // MARK: - LRU Eviction
 
-    private func evictIfNeeded() async {
-        let currentSize = getCacheSize()
+    private func evictIfNeeded() {
+        let currentSize = diskBytes ?? measureDiskAndDropOrphans()
         guard currentSize > maxDiskCacheSize else { return }
 
         // Sort by last accessed time (oldest first)
@@ -451,28 +473,63 @@ actor ImageCacheManager: NSObject {
             do {
                 try FileManager.default.removeItem(at: fileURL)
                 freedSpace += entry.fileSize
+                diskBytes? -= entry.fileSize
                 cacheMetadata.removeValue(forKey: key)
                 // Drop any decoded tiers for this key
-                memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: .thumb))
-                memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: .full))
+                for quality in [ImageQuality.thumb, .full, .logo] {
+                    memoryCache.removeObject(forKey: memoryKey(diskKey: key, quality: quality))
+                }
             } catch {
                 // File might already be gone
             }
         }
 
-        saveMetadata()
+        scheduleMetadataSave()
+    }
+
+    /// Lists the cache once: sums its size and deletes files the metadata doesn't track (a file
+    /// written within the save debounce of the app being killed), which LRU eviction can't reach.
+    private func measureDiskAndDropOrphans() -> Int64 {
+        guard let dir = cacheDirectory,
+              let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey])
+        else { return 0 }
+        var size: Int64 = 0
+        for file in files where file.lastPathComponent != metadataFileName {
+            if cacheMetadata[file.lastPathComponent] == nil {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            size += Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        diskBytes = size
+        return size
     }
 
     // MARK: - Metadata Persistence
 
     private func ensureMetadataLoaded() async {
+        loadMetadataIfNeeded()
+    }
+
+    private func loadMetadataIfNeeded() {
         if !metadataLoaded {
             loadMetadata()
         }
     }
 
+    /// Writes the metadata at most every 5 s instead of once per download.
+    private func scheduleMetadataSave() {
+        guard !metadataSaveScheduled else { return }
+        metadataSaveScheduled = true
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            metadataSaveScheduled = false
+            saveMetadata()
+        }
+    }
+
     private func loadMetadata() {
-        guard let cacheDir = cacheDirectory else { return }
+        guard !metadataLoaded, let cacheDir = cacheDirectory else { return }
         let fileURL = cacheDir.appendingPathComponent(metadataFileName)
 
         guard let data = try? Data(contentsOf: fileURL),
@@ -481,7 +538,8 @@ actor ImageCacheManager: NSObject {
             return
         }
 
-        cacheMetadata = decoded
+        // Entries saved before this load ran are newer than the file's.
+        cacheMetadata = decoded.merging(cacheMetadata) { _, new in new }
         metadataLoaded = true
 
         // One-time scrub of tokens older builds wrote into the metadata file.

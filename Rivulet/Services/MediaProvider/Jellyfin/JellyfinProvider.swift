@@ -159,6 +159,8 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
 
     func fullDetail(for itemRef: MediaItemRef) async throws -> MediaItemDetail {
         let dto: JFItem = try await client.get("Items/\(itemRef.itemID)")
+        async let trailers = extras(itemRef.itemID, "LocalTrailers", count: dto.localTrailerCount)
+        async let features = extras(itemRef.itemID, "SpecialFeatures", count: dto.specialFeatureCount)
         var next: JFItem?
         if dto.type == "Series" {
             let up: JFQueryResult? = try? await client.get("Shows/NextUp", [
@@ -168,7 +170,15 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
             ])
             next = up?.items?.first
         }
-        return JellyfinMediaMapper.detail(dto, nextEpisode: next, providerID: id, baseURL: baseURL, token: token)
+        return JellyfinMediaMapper.detail(dto, nextEpisode: next, trailers: await trailers,
+                                          specialFeatures: await features,
+                                          providerID: id, baseURL: baseURL, token: token)
+    }
+
+    /// Local trailers or special features; asked only when the item counts some.
+    private func extras(_ itemID: String, _ endpoint: String, count: Int?) async -> [JFItem] {
+        guard (count ?? 0) > 0 else { return [] }
+        return (try? await client.get("Items/\(itemID)/\(endpoint)")) ?? []
     }
 
     // MARK: - Home rails
@@ -176,17 +186,68 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
     /// Plex's Continue Watching is one row: in-progress items plus the next
     /// episode of shows being watched. Jellyfin splits that into Resume and
     /// Next Up, so this asks both, Resume first.
+    /// Resume then Next Up, with what the cross-server merge needs: a movie's ids,
+    /// and for a never-played next episode its show's last watch as its date.
     func continueWatching(limit: Int) async throws -> [MediaItem] {
-        async let resumed = resumeItems(parentID: nil, limit: limit)
-        async let upNext = nextUpEpisodes(parentID: nil, limit: limit)
-        let items = try await resumed + (await upNext)
-        return map(Array(items.prefix(limit)))
+        async let resumed = resumeItems(parentID: nil, limit: limit, fields: Self.continueWatchingFields)
+        async let upNext = nextUpEpisodes(parentID: nil, limit: limit, fields: Self.continueWatchingFields)
+        async let lastWatched = lastWatchedBySeries()
+        let dtos = Array((try await resumed + (await upNext)).prefix(limit))
+        let showDates = await lastWatched
+        return zip(dtos, map(dtos)).map { dto, mapped in
+            var item = mapped
+            if item.kind == .movie {
+                item.identity = ContinueWatchingMerge.providerIDKeys(dto.providerIds ?? [:], scope: "m")
+            }
+            if item.userState.lastViewedAt == nil, let series = dto.seriesId {
+                item.userState.lastViewedAt = showDates[series]
+            }
+            return item
+        }
     }
 
-    private func resumeItems(parentID: String?, limit: Int) async throws -> [JFItem] {
+    private static let continueWatchingFields = URLQueryItem(
+        name: "fields", value: "Overview,RecursiveItemCount,SortName,ParentId,MediaSourceCount,ProviderIds"
+    )
+
+    /// Each show's latest played episode date. A series' own UserData carries
+    /// none (measured on 12.1), so this reads the recently played episodes.
+    private func lastWatchedBySeries() async -> [String: Date] {
+        let result: JFQueryResult? = try? await client.get("Items", [
+            URLQueryItem(name: "recursive", value: "true"),
+            URLQueryItem(name: "includeItemTypes", value: "Episode"),
+            URLQueryItem(name: "filters", value: "IsPlayed"),
+            URLQueryItem(name: "sortBy", value: "DatePlayed"),
+            URLQueryItem(name: "sortOrder", value: "Descending"),
+            URLQueryItem(name: "limit", value: "50"),
+            URLQueryItem(name: "fields", value: "SeriesId"),
+            URLQueryItem(name: "enableImages", value: "false")
+        ])
+        var dates: [String: Date] = [:]
+        for episode in result?.items ?? [] {
+            guard let series = episode.seriesId, dates[series] == nil,
+                  let played = episode.userData?.lastPlayedDate.flatMap(JellyfinMediaMapper.parseDate) else { continue }
+            dates[series] = played
+        }
+        return dates
+    }
+
+    func showIdentityKeys(for showIDs: [String]) async -> [String: [String]] {
+        guard !showIDs.isEmpty else { return [:] }
+        let result: JFQueryResult? = try? await client.get("Items", [
+            URLQueryItem(name: "ids", value: showIDs.joined(separator: ",")),
+            URLQueryItem(name: "fields", value: "ProviderIds"),
+            URLQueryItem(name: "enableImages", value: "false")
+        ])
+        return Dictionary((result?.items ?? []).compactMap { show in
+            show.id.map { ($0, ContinueWatchingMerge.providerIDKeys(show.providerIds ?? [:], scope: "s")) }
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func resumeItems(parentID: String?, limit: Int, fields: URLQueryItem = listFields) async throws -> [JFItem] {
         var query = [URLQueryItem(name: "limit", value: "\(limit)"),
                      URLQueryItem(name: "mediaTypes", value: "Video"),
-                     Self.listFields]
+                     fields]
         if let parentID { query.append(URLQueryItem(name: "parentId", value: parentID)) }
         let result: JFQueryResult = try await client.get("UserItems/Resume", query)
         return result.items ?? []
@@ -194,10 +255,10 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
 
     /// `enableResumable=false` keeps a half-watched episode, already in
     /// Resume, out of Next Up (measured on 12.1). A failure costs only these.
-    private func nextUpEpisodes(parentID: String?, limit: Int) async -> [JFItem] {
+    private func nextUpEpisodes(parentID: String?, limit: Int, fields: URLQueryItem = listFields) async -> [JFItem] {
         var query = [URLQueryItem(name: "limit", value: "\(limit)"),
                      URLQueryItem(name: "enableResumable", value: "false"),
-                     Self.listFields]
+                     fields]
         if let parentID { query.append(URLQueryItem(name: "parentId", value: parentID)) }
         let result: JFQueryResult? = try? await client.get("Shows/NextUp", query)
         return result?.items ?? []
@@ -266,6 +327,31 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
     private func recentlyAddedHub(_ library: MediaLibrary, _ added: [JFItem]) -> MediaHub? {
         added.isEmpty ? nil : MediaHub(id: "\(library.id).recentlyAdded", providerID: id,
                                        title: "Recently Added in \(library.title)", style: .shelf, items: map(added))
+    }
+
+    /// Two requests: the library's TMDB ids, then the matches. 12.1 ignores
+    /// `anyProviderIdEquals` (measured: every title comes back), so the ids are listed.
+    func trending(in library: MediaLibrary, from trending: [TMDBListItem], limit: Int) async throws -> [MediaItem] {
+        let index: JFQueryResult = try await client.get("Items", [
+            URLQueryItem(name: "parentId", value: library.id),
+            URLQueryItem(name: "recursive", value: "true"),
+            URLQueryItem(name: "includeItemTypes", value: "Movie,Series"),
+            URLQueryItem(name: "fields", value: "ProviderIds"),
+            URLQueryItem(name: "enableImages", value: "false"),
+            URLQueryItem(name: "enableUserData", value: "false")
+        ])
+        var owned: [String: String] = [:]
+        for dto in index.items ?? [] {
+            guard let itemID = dto.id, let tmdb = dto.providerIds?["Tmdb"] else { continue }
+            owned[TrendingMatch.key(tmdbID: tmdb, type: dto.type == "Series" ? .tv : .movie)] = itemID
+        }
+        let ids = TrendingMatch.ownedIDs(trending, owned: owned, limit: limit)
+        guard !ids.isEmpty else { return [] }
+        let result: JFQueryResult = try await client.get("Items", [
+            URLQueryItem(name: "ids", value: ids.joined(separator: ",")), Self.listFields
+        ])
+        let byID = Dictionary(map(result.items).map { ($0.ref.itemID, $0) }, uniquingKeysWith: { a, _ in a })
+        return ids.compactMap { byID[$0] }
     }
 
     /// Box sets with a member in this library (measured: `parentId` on a
@@ -508,5 +594,87 @@ struct JellyfinProgressReporter: ProgressReporter {
             URLQueryItem(name: "deviceId", value: client.deviceID),
             URLQueryItem(name: "playSessionId", value: playSessionID)
         ])
+    }
+}
+
+// MARK: - Playlists (video)
+
+extension JellyfinProvider {
+    var supportsPlaylists: Bool { true }
+
+    private static func asPlaylist(_ dto: JFItem, providerID: String, baseURL: URL) -> MediaPlaylist {
+        MediaPlaylist(item: JellyfinMediaMapper.item(dto, providerID: providerID, baseURL: baseURL), isSmart: false)
+    }
+
+    func videoPlaylists() async throws -> [MediaPlaylist] {
+        let result: JFQueryResult = try await client.get("Items", [
+            URLQueryItem(name: "userId", value: userID),
+            URLQueryItem(name: "includeItemTypes", value: "Playlist"),
+            URLQueryItem(name: "recursive", value: "true")
+        ])
+        return (result.items ?? []).filter { $0.mediaType == "Video" }
+            .map { Self.asPlaylist($0, providerID: id, baseURL: client.baseURL) }
+            .sorted { $0.item.title.localizedCaseInsensitiveCompare($1.item.title) == .orderedAscending }
+    }
+
+    /// Jellyfin playlists have no rules, so none is smart.
+    func playlistEntries(_ playlist: MediaItemRef) async throws -> PlaylistContents {
+        let size = 200
+        var entries: [PlaylistEntry] = []
+        while true {
+            let page: JFQueryResult = try await client.get("Playlists/\(playlist.itemID)/Items", [
+                URLQueryItem(name: "userId", value: userID),
+                URLQueryItem(name: "startIndex", value: String(entries.count)),
+                URLQueryItem(name: "limit", value: String(size)),
+                Self.listFields
+            ])
+            let rows = page.items ?? []
+            entries += rows.compactMap { dto in
+                (dto.playlistItemId ?? dto.id).map {
+                    PlaylistEntry(entryID: $0, item: JellyfinMediaMapper.item(dto, providerID: id, baseURL: client.baseURL))
+                }
+            }
+            if rows.isEmpty || entries.count >= (page.totalRecordCount ?? entries.count) {
+                return PlaylistContents(entries: entries, isSmart: false)
+            }
+        }
+    }
+
+    /// Seeds with `items` (an empty list is allowed), then reads the playlist back for its mapped row.
+    func createPlaylist(title: String, seededWith items: [MediaItemRef]) async throws -> MediaPlaylist {
+        let created: JFCreated = try await client.post("Playlists", body: JFCreatePlaylist(
+            name: title, ids: items.map(\.itemID), userId: userID, mediaType: "Video"
+        ))
+        let dto: JFItem = try await client.get("Items/\(created.id)", [URLQueryItem(name: "userId", value: userID)])
+        return Self.asPlaylist(dto, providerID: id, baseURL: client.baseURL)
+    }
+
+    func addToPlaylist(_ playlist: MediaItemRef, items: [MediaItemRef]) async throws {
+        guard !items.isEmpty else { return }
+        try await client.post("Playlists/\(playlist.itemID)/Items", query: [
+            URLQueryItem(name: "ids", value: items.map(\.itemID).joined(separator: ",")),
+            URLQueryItem(name: "userId", value: userID)
+        ])
+    }
+
+    func removeFromPlaylist(_ playlist: MediaItemRef, entryID: String) async throws {
+        try await client.delete("Playlists/\(playlist.itemID)/Items", query: [URLQueryItem(name: "entryIds", value: entryID)])
+    }
+
+    /// Jellyfin's newIndex is the final 0-based position, so `toIndex` goes through unchanged.
+    func movePlaylistEntry(_ playlist: MediaItemRef, entryID: String, toIndex: Int, in entries: [PlaylistEntry]) async throws {
+        try await client.post(Self.movePath(playlist: playlist.itemID, entryID: entryID, toIndex: toIndex))
+    }
+
+    nonisolated static func movePath(playlist: String, entryID: String, toIndex: Int) -> String {
+        "Playlists/\(playlist)/Items/\(entryID)/Move/\(toIndex)"
+    }
+
+    func renamePlaylist(_ playlist: MediaItemRef, title: String) async throws {
+        try await client.post("Playlists/\(playlist.itemID)", body: JFUpdatePlaylist(name: title))
+    }
+
+    func deletePlaylist(_ playlist: MediaItemRef) async throws {
+        try await client.delete("Items/\(playlist.itemID)")
     }
 }

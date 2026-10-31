@@ -8,7 +8,44 @@ import SwiftUI
 /// A line starting with "## " is a heading; any other line is a bullet.
 enum IOSChangelog {
     static let entries: [(version: String, lines: [String])] = [
+        ("1.0.7 (83)", [
+            "iPhone Duo optimization",
+        ]),
+        ("1.0.7 (82)", [
+            "New Tvheadend support in Live TV, with channels, guide and recording",
+            "Add Source in Live TV lists Dispatcharr, Tvheadend and Threadfin by name",
+            "Live TV channels now start in a few seconds",
+            "New Audio Delay control in the player's audio and subtitles menu",
+            "New Upscale SD and 720p setting in Playback",
+            "Posters now show the edition, such as Director's Cut",
+            "Plex's dashboard now shows bandwidth for Direct Play",
+            "The player stops and shows the reason when Plex ends your session",
+            "New Audio & Subtitles settings in Playback, saved for each Plex profile",
+            "Audio tracks are listed by language and format, and audio description tracks are no longer picked on their own",
+            "New Chapters list in the player, with a picture for each chapter",
+            "The Home hero can show Trending, Continue Watching, Recently Added or your Watchlist",
+            "Updated AetherEngine to 7.53.0",
+        ]),
+        ("1.0.7 (81)", [
+            "New video playlists: play, shuffle, add titles, reorder, rename and delete",
+            "Each skip marker can now show a button, skip automatically, or stay off",
+            "Videos now start in your Plex account's preferred audio language",
+            "What's On in Live TV now has a row for each source when you have several",
+            "Updated AetherEngine to 7.47.0",
+        ]),
+        ("1.0.7 (80)", [
+            "New App Icon setting in Account, with three new icons by @tresby",
+            "Captions now match the system player's size and placement (@tresby)",
+            "Live TV now includes every Plex server on your account",
+        ]),
         ("1.0.7 (79)", [
+            "Every Plex server on your account now shows in Home, Library and Search",
+            "Continue Watching is now one row across all your servers, without duplicates",
+            "Add Xtream Codes IPTV sources in Live TV settings",
+            "Your Plex server's Live TV now shows up automatically",
+            "Live TV guide now loads days ahead and stays up to date",
+            "Fixed PIN-protected Plex Home profiles not opening",
+            "Updated AetherEngine to 7.44.0",
             "Fixed the Plex Live TV guide failing to load on slower servers",
             "Fixed a managed profile briefly showing the owner's library at launch",
             "Fixed libraries not loading when one is missing details",

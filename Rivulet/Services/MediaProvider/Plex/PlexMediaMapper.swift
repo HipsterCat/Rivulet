@@ -38,6 +38,7 @@ enum PlexMediaMapper {
         case "season": return .season
         case "episode": return .episode
         case "collection": return .collection
+        case "playlist": return .playlist
         default: return .unknown
         }
     }
@@ -53,15 +54,8 @@ enum PlexMediaMapper {
         )
     }
 
-    /// `isPlayed` means FULLY watched, and Plex expresses that differently for
-    /// containers than for leaves.
-    ///
-    /// On a show or season, `viewCount` is an aggregate over watched children,
-    /// not a boolean — a season with 2 of 8 episodes watched reports
-    /// `viewCount == 2`, so `viewCount > 0` marked the whole season played.
-    /// Containers are only watched when every episode is
-    /// (`viewedLeafCount >= leafCount`), the same rule `PlexMetadata.isWatched`
-    /// uses.
+    /// Fully watched. On a show or season `viewCount` counts watched episodes, so a
+    /// container is watched only when `viewedLeafCount >= leafCount` (as `PlexMetadata.isWatched`).
     private static func isFullyWatched(_ meta: PlexMetadata) -> Bool {
         if meta.type == "show" || meta.type == "season" {
             guard let total = meta.leafCount, total > 0 else { return false }
@@ -88,15 +82,8 @@ enum PlexMediaMapper {
         return URL(string: "\(serverURL)\(path)\(separator)X-Plex-Token=\(authToken)")
     }
 
-    /// Build a tokenized URL for a PLAYABLE Plex key (a Part key, an extra key).
-    ///
-    /// Distinct from `artworkURL` because a playable key can carry its own query
-    /// string — Plex's IVA extras arrive as
-    /// `/services/iva/assets/715933/video.mp4?fmt=4&bitrate=5000`. Interpolating
-    /// `"...\(key)?X-Plex-Token=..."` around that produces TWO '?', so the token
-    /// is absorbed into the last parameter's value (`bitrate=5000?X-Plex-Token=…`)
-    /// and never authenticates. Split the key and merge instead, matching
-    /// ContentRouter.buildDirectPlayURL.
+    /// Tokenized URL for a playable key (Part, extra). The key can carry its own query
+    /// (IVA extras: `video.mp4?fmt=4&bitrate=5000`), so the token is merged into it, not appended.
     static func playableURL(_ key: String?, serverURL: String, authToken: String) -> URL? {
         guard let key, !key.isEmpty else { return nil }
         guard var components = URLComponents(string: serverURL) else { return nil }
@@ -144,7 +131,7 @@ enum PlexMediaMapper {
                 return .dolbyVision(profile: stream.DOVIProfile ?? 0)
             }
             if stream.colorTrc == "smpte2084" && stream.colorPrimaries == "bt2020" {
-                return .hdr10
+                return stream.HDR10PlusPresent == true ? .hdr10Plus : .hdr10
             }
             if stream.colorTrc == "arib-std-b67" {
                 return .hlg
@@ -162,7 +149,8 @@ enum PlexMediaMapper {
             bitrate: stream.bitrate,
             videoRange: range,
             isDefault: stream.default ?? false,
-            scanType: stream.scanType
+            scanType: stream.scanType,
+            hasHDR10Plus: stream.HDR10PlusPresent == true
         )
     }
 
@@ -253,7 +241,8 @@ enum PlexMediaMapper {
         // Child progress — for shows / seasons, leafCount = total episodes,
         // viewedLeafCount = watched count.
         let childProgress: ChildProgress? = {
-            if let total = meta.leafCount {
+            // A playlist's leafCount is not a count to show (see `playlist`).
+            if meta.type != "playlist", let total = meta.leafCount {
                 return ChildProgress(played: meta.viewedLeafCount ?? 0, total: total)
             }
             return nil
@@ -285,7 +274,7 @@ enum PlexMediaMapper {
             overview: meta.summary,
             year: meta.year,
             releaseDate: meta.originallyAvailableAt,
-            contentRating: meta.contentRating,
+            contentRating: meta.displayContentRating,
             runtime: runtime,
             isMusic: isMusic,
             parentRef: parentRef,
@@ -302,6 +291,43 @@ enum PlexMediaMapper {
             versionCount: meta.Media.map { Set($0.map(\.id)).count },
             editionTitle: meta.editionTitle
         )
+    }
+
+    // MARK: - Playlist
+
+    /// No count: Plex `leafCount` disagrees with the rows a playlist serves.
+    static func playlist(
+        _ playlist: PlexPlaylist,
+        providerID: String,
+        serverURL: String,
+        authToken: String
+    ) -> MediaPlaylist {
+        let art = artworkURL(playlist.composite, serverURL: serverURL, authToken: authToken)
+        // ponytail: always the composite, even over a custom thumb; decode `thumb` and prefer it if users ask.
+        // The composite endpoint lays out the collage at any aspect when asked (the transcoder returns it square).
+        let card = playlist.composite.flatMap {
+            artworkURL("\($0)?width=\(MediaPlaylist.cardSize.width)&height=\(MediaPlaylist.cardSize.height)",
+                       serverURL: serverURL, authToken: authToken)
+        }
+        let item = MediaItem(
+            ref: MediaItemRef(providerID: providerID, itemID: playlist.ratingKey),
+            kind: .playlist,
+            title: playlist.title ?? "",
+            sortTitle: nil,
+            overview: nil,
+            year: nil,
+            runtime: playlist.duration.map { TimeInterval($0) / 1000 },
+            parentRef: nil,
+            grandparentRef: nil,
+            episodeNumber: nil,
+            seasonNumber: nil,
+            childProgress: nil,
+            userState: MediaUserState(isPlayed: false, viewOffset: 0, isFavorite: false, lastViewedAt: nil),
+            artwork: MediaArtwork(poster: art, backdrop: card, thumbnail: art, logo: nil),
+            parentArtwork: nil,
+            grandparentArtwork: nil
+        )
+        return MediaPlaylist(item: item, isSmart: playlist.smart ?? false)
     }
 
     // MARK: - Media source
@@ -423,11 +449,8 @@ enum PlexMediaMapper {
         }
         let allExtras = meta.allExtras
 
-        // Trailer button: first trailer. Disc rips (Kino Lorber, Criterion, etc.)
-        // often bundle trailers for other films, so ideally we'd title-match, but
-        // Plex doesn't include Media[].Part[] on extras in the metadata response
-        // (hasLocalFile is always false), so we can't distinguish IVA streams from
-        // local files at this layer. Use first trailer as-is for now.
+        // First trailer. Disc rips bundle other films' trailers, but extras carry no
+        // Media[].Part[] here, so IVA and local trailers cannot be told apart.
         let trailerURL: URL? = allExtras
             .first(where: { ExtraSubtype.from(subtype: $0.subtype, extraType: $0.extraType).isTrailer })
             .flatMap { $0.key }
@@ -440,6 +463,7 @@ enum PlexMediaMapper {
                 thumbnailURL: artworkURL(ex.thumb, serverURL: serverURL, authToken: authToken),
                 duration: ex.duration.map { TimeInterval($0) / 1000 },
                 playbackKey: ex.key ?? ex.ratingKey,
+                providerID: providerID,
                 subtype: ExtraSubtype.from(subtype: ex.subtype, extraType: ex.extraType)
             )
         }
@@ -463,9 +487,9 @@ enum PlexMediaMapper {
             chapters: chapters,
             mediaSources: mediaSources,
             trailerURL: trailerURL,
-            contentRating: meta.contentRating,
+            contentRating: meta.displayContentRating,
             regionOfOrigin: meta.Country?.first?.tag,
-            rating: Self.rating(meta),
+            ratings: Self.ratings(meta),
             nextEpisode: nextEpisode,
             collections: collections,
             extras: extras,
@@ -474,23 +498,26 @@ enum PlexMediaMapper {
         )
     }
 
-    /// `rating` is the critic score and `audienceRating` the audience score,
-    /// each tagged by an image URI naming its source
-    /// ("rottentomatoes://image.rating.ripe", "imdb://image.rating",
-    /// "themoviedb://image.rating"). Legacy agents send `rating` with no image.
-    static func rating(_ meta: PlexMetadata) -> MediaRating? {
-        func source(_ image: String?) -> MediaRating.Source {
+    /// Full metadata carries a `Rating` entry per source, each tagged by an
+    /// image URI ("rottentomatoes://image.rating.ripe", "imdb://image.rating",
+    /// "themoviedb://image.rating"). Hub items carry only the flat
+    /// `rating` / `audienceRating` pair; legacy agents send `rating` with no image.
+    static func ratings(_ meta: PlexMetadata) -> [MediaRating] {
+        func source(_ image: String?, audience: Bool) -> MediaRating.Source {
             switch image?.split(separator: ":").first {
-            case "rottentomatoes": .rottenTomatoes
+            case "rottentomatoes": audience ? .rottenTomatoesAudience : .rottenTomatoes
             case "imdb": .imdb
             case "themoviedb": .tmdb
             default: .unknown
             }
         }
-        return MediaRating.preferred(
-            critic: MediaRating(meta.rating, source: source(meta.ratingImage)),
-            audience: MediaRating(meta.audienceRating, source: source(meta.audienceRatingImage))
-        )
+        let entries = (meta.Rating ?? []).map {
+            MediaRating($0.value, source: source($0.image, audience: $0.type == "audience"))
+        }
+        return MediaRating.ordered(entries + [
+            MediaRating(meta.rating, source: source(meta.ratingImage, audience: false)),
+            MediaRating(meta.audienceRating, source: source(meta.audienceRatingImage, audience: true)),
+        ])
     }
 
     /// `Guid` ids ("tmdb://603", "imdb://tt0133093", "tvdb://169") keyed

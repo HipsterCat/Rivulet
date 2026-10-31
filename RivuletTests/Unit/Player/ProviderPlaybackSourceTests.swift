@@ -57,7 +57,7 @@ final class ProviderPlaybackSourceTests: XCTestCase {
         let detail = MediaItemDetail(
             item: item, tagline: nil, genres: [], studios: [], cast: [], directors: [], writers: [],
             chapters: [], mediaSources: [stream.source], trailerURL: nil, contentRating: nil,
-            rating: nil, nextEpisode: nil, collections: []
+            nextEpisode: nil, collections: []
         )
         return ProviderPlayback(provider: provider, item: item, detail: detail, stream: stream, extras: PlaybackExtras())
     }
@@ -223,7 +223,7 @@ final class ProviderPlaybackSourceTests: XCTestCase {
         MediaItemDetail(
             item: item, tagline: nil, genres: [], studios: [], cast: [], directors: [], writers: [],
             chapters: [], mediaSources: [source], trailerURL: nil, contentRating: nil,
-            rating: nil, nextEpisode: nil, collections: []
+            nextEpisode: nil, collections: []
         )
     }
 
@@ -405,6 +405,24 @@ final class ProviderPlaybackSourceTests: XCTestCase {
         XCTAssertTrue(PlayerPresenter.requiresPlexConnection(for: .plex))
         XCTAssertFalse(PlayerPresenter.requiresPlexConnection(
             for: .provider(playback(provider: provider, stream: stream()))))
+    }
+
+    /// Another Plex server's item resolves from its own server (#87), so the
+    /// selected server being offline must not refuse it.
+    func test_plexItemOnAnotherServer_skipsTheSelectedServersGate() {
+        XCTAssertTrue(PlayerPresenter.requiresPlexConnection(
+            for: .plex, serverURL: "http://main:32400", selectedServerURL: "http://main:32400"))
+        XCTAssertFalse(PlayerPresenter.requiresPlexConnection(
+            for: .plex, serverURL: "http://office:32400", selectedServerURL: "http://main:32400"))
+    }
+
+    func test_plexStartOffset_followsTheResumePolicy() {
+        var meta = PlexMetadata(ratingKey: "1", type: "movie", title: "M", duration: 6_000_000)
+        meta.viewOffset = 1_200_000
+        XCTAssertEqual(ProviderPlayer.plexStartOffset(meta, fromBeginning: false), 1200)
+        XCTAssertNil(ProviderPlayer.plexStartOffset(meta, fromBeginning: true))
+        meta.viewOffset = 30_000
+        XCTAssertNil(ProviderPlayer.plexStartOffset(meta, fromBeginning: false), "under the 2% floor")
     }
 
     func test_play_ignoresASecondPressWhileOneIsPreparing() {

@@ -18,13 +18,27 @@ class ContentProvider: TVTopShelfContentProvider {
     override func loadTopShelfContent() async -> TVTopShelfContent? {
         let items = TopShelfCache.shared.readItems()
         logger.info("TopShelf: Read \(items.count) items from cache")
+        var returned = 0
+        defer { TopShelfCache.shared.noteRead(cached: items.count, returned: returned) }
 
         guard !items.isEmpty else {
             logger.warning("TopShelf: No items to display, returning nil")
             return nil
         }
 
-        let carouselItems = items.compactMap { item -> TVTopShelfCarouselItem? in
+        if !TopShelfCache.shared.fullScreen {
+            // Progress bars only on Continue Watching; a Recently Added tile's bar is noise.
+            let title = TopShelfCache.shared.sectionTitle
+            let lead = TVTopShelfItemCollection(items: items.compactMap { posterItem($0, showsProgress: title != "Recently Added") })
+            lead.title = title
+            let recent = TVTopShelfItemCollection(items: TopShelfCache.shared.readRecentItems().compactMap { posterItem($0, showsProgress: false) })
+            recent.title = "Recently Added"
+            let sections = [lead, recent].filter { !$0.items.isEmpty }
+            returned = sections.reduce(0) { $0 + $1.items.count }
+            return sections.isEmpty ? nil : TVTopShelfSectionedContent(sections: sections)
+        }
+
+        let carouselItems = items.prefix(5).compactMap { item -> TVTopShelfCarouselItem? in
             let cItem = TVTopShelfCarouselItem(identifier: item.ratingKey)
 
             // `title` (inherited from TVTopShelfObject) is the carousel's main
@@ -69,6 +83,26 @@ class ContentProvider: TVTopShelfContentProvider {
         }
 
         logger.info("TopShelf: Returning \(carouselItems.count) carousel items")
+        returned = carouselItems.count
         return TVTopShelfCarouselContent(style: .details, items: carouselItems)
+    }
+
+    /// A poster tile for the default sectioned row, the way Plex's Top Shelf looks.
+    private func posterItem(_ item: TopShelfItem, showsProgress: Bool) -> TVTopShelfSectionedItem? {
+        guard let playURL = RivuletLink(.play, ratingKey: item.ratingKey, server: item.serverIdentifier).url,
+              let detailURL = RivuletLink(.detail, ratingKey: item.ratingKey, server: item.serverIdentifier).url
+        else { return nil }
+        let tile = TVTopShelfSectionedItem(identifier: item.ratingKey)
+        tile.imageShape = .poster
+        // Episodes show the show's poster, so they carry its name.
+        tile.title = item.subtitle ?? item.title
+        if showsProgress, item.progress > 0 { tile.playbackProgress = item.progress }
+        if let url = URL(string: item.imageURL.isEmpty ? item.wideImageURL : item.imageURL) {
+            tile.setImageURL(url, for: .screenScale1x)
+            tile.setImageURL(url, for: .screenScale2x)
+        }
+        tile.playAction = TVTopShelfAction(url: playURL)
+        tile.displayAction = TVTopShelfAction(url: detailURL)
+        return tile
     }
 }

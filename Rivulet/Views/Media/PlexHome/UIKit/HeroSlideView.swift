@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  HeroSlideView.swift
-//  Rivulet
-//
-//  UIKit per-slide hero content: logo (or fallback serif title), metadata
-//  row (type · genre · rating-badge) and a single-sentence tagline. Mirror
-//  of SwiftUI `HeroSlideContent`.
-//
-//  Logo image swaps with a brief crossfade (0.22s) on slide change so the
-//  beat lines up with `HeroOverlayView.displayedIndex` and the backdrop's
-//  own crossfade.
-//
+// Per-slide hero content: logo or serif title, metadata row and a one-line tagline. The 0.22s logo
+// crossfade keeps time with `HeroOverlayView.displayedIndex` and the backdrop.
 
 import UIKit
 
@@ -31,7 +21,7 @@ final class HeroSlideView: UIView {
 
     static let maxLogoHeight: CGFloat = 180, maxTaglineWidth: CGFloat = 720, rowSpacing: CGFloat = 18
     private static let metadataFont = UIFont.systemFont(ofSize: 25, weight: .medium)
-    private static let taglineFont = UIFont.systemFont(ofSize: 22, weight: .regular)
+    private static let taglineFont = UIFont.systemFont(ofSize: 25, weight: .regular)
     /// The stack at its tallest: a full-height logo, the metadata row, two tagline lines.
     static var maxHeight: CGFloat {
         maxLogoHeight + rowSpacing + ceil(metadataFont.lineHeight) + rowSpacing + 2 * ceil(taglineFont.lineHeight)
@@ -60,9 +50,7 @@ final class HeroSlideView: UIView {
         logoImageView.translatesAutoresizingMaskIntoConstraints = false
         logoImageView.setContentHuggingPriority(.required, for: .horizontal)
 
-        // Fallback title (serif heavy, two lines max).
-        // SwiftUI uses `.font(.system(size: 72, weight: .heavy, design: .serif))`.
-        // UIFont system fonts gain `.serif` via UIFontDescriptor.withDesign.
+        // Fallback title: 72pt heavy serif, two lines max.
         let baseFont = UIFont.systemFont(ofSize: 72, weight: .heavy)
         if let serifDescriptor = baseFont.fontDescriptor.withDesign(.serif) {
             fallbackTitleLabel.font = UIFont(descriptor: serifDescriptor, size: 72)
@@ -76,14 +64,14 @@ final class HeroSlideView: UIView {
         fallbackTitleLabel.isHidden = true
 
         // Metadata text (type · genre)
-        // Apple's genres row: Caption1 (25) medium at full white, 6 pt to the badge.
+        // Apple's genres row: Caption1 (25) medium at full white, 12 pt to the badge.
         metadataLabel.font = Self.metadataFont
         metadataLabel.textColor = .white
         metadataLabel.numberOfLines = 1
 
         // Metadata row container (text + rating badge inline)
         metadataRow.axis = .horizontal
-        metadataRow.spacing = 6
+        metadataRow.spacing = 12
         metadataRow.alignment = .center
         metadataRow.addArrangedSubview(metadataLabel)
         metadataRow.addArrangedSubview(ratingBadge)
@@ -113,7 +101,7 @@ final class HeroSlideView: UIView {
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             logoImageView.heightAnchor.constraint(lessThanOrEqualToConstant: Self.maxLogoHeight),
-            logoImageView.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            logoImageView.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
 
             taglineLabel.widthAnchor.constraint(lessThanOrEqualToConstant: Self.maxTaglineWidth)
         ])
@@ -127,10 +115,7 @@ final class HeroSlideView: UIView {
 
     func configure(item: PlexMetadata?, serverURL: String, authToken: String,
                    animated: Bool, manageAlpha: Bool = true, onReady: (() -> Void)? = nil) {
-        // Snapshot the CURRENT state before we mutate anything — so the
-        // fade-out has the old content to anim against. SwiftUI's
-        // `.transition(.opacity)` is symmetric: old fades out as new
-        // fades in. Just fading the new in would snap the old away.
+        // Snapshot the current content first so the old fades out as the new fades in.
         let snapshot: UIView?
         if animated, bounds.width > 0, bounds.height > 0 {
             snapshot = self.snapshotView(afterScreenUpdates: false)
@@ -248,7 +233,7 @@ final class HeroSlideView: UIView {
         }
     }
 
-    // MARK: - Metadata helpers (mirror SwiftUI versions)
+    // MARK: - Metadata helpers
 
     private func metaLine(for item: PlexMetadata) -> String? {
         var parts: [String] = []
@@ -297,19 +282,19 @@ final class HeroRatingBadgeView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        layer.borderWidth = 1
-        layer.borderColor = UIColor.white.withAlphaComponent(0.7).cgColor
-        layer.cornerRadius = 4
+        layer.borderWidth = 2
+        layer.borderColor = UIColor.white.cgColor
+        layer.cornerRadius = 5
         layer.cornerCurve = .continuous
 
-        label.font = .systemFont(ofSize: 15, weight: .bold)
+        label.font = .systemFont(ofSize: 17, weight: .bold)
         label.textColor = .white
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 22),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             label.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
     }

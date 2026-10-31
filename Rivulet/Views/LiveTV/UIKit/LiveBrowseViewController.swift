@@ -5,16 +5,9 @@
 //  LiveBrowseViewController.swift
 //  Rivulet
 //
-//  What's On, the default Live TV layout (the Guide is the other), after the
-//  Apple TV app: shelves of 16:9 cards (recordings, favourites, what is on
-//  now, what starts soon, genres, then each channel group) under a header
-//  that describes whatever has focus.
-//
-//  Selecting a live card plays it full screen on the VOD glass rail. Back
-//  from there keeps it playing in the header's corner; selecting it again
-//  takes it back full screen with no new tune. Multiview opens from the
-//  player's chrome or from a card's long-press menu, and a tile can come back
-//  out full screen. One session moves between the three the whole time.
+//  What's On, the default Live TV layout, after the Apple TV app: shelves of
+//  16:9 cards under a header describing the focused one. One playback session
+//  moves between full screen, the header's corner player and multiview.
 //
 
 import UIKit
@@ -124,6 +117,10 @@ final class LiveBrowseViewController: UIViewController {
         store.$isLoadingChannels
             .receive(on: DispatchQueue.main)
             .sink { [weak self] loading in self?.updateEmptyState(loading: loading) }
+            .store(in: &cancellables)
+        // Backgrounding ends the corner channel too: its tune expires (#390).
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.stopMini() }
             .store(in: &cancellables)
 
         Task { @MainActor in

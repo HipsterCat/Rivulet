@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  BelowFoldCells.swift
-//  Rivulet
-//
-//  UICollectionViewCell wrappers that host the ported below-fold section views
-//  (EpisodeCell / SeasonPillView / CastCell) so they can live in the
-//  compositional below-fold collection, plus a section-header reusable view.
-//  Each wrapper forwards focus to the inner view's setFocused (the standard
-//  tvOS didUpdateFocus + UIFocusAnimationCoordinator pattern) and resets it in
-//  prepareForReuse (avoids the stuck-scale fast-scroll bug). See
-//  perf-spike/EXPANDED_DETAIL_CONVERSION_SPIKE.md §3.
-//
+//  Collection cells hosting the below-fold views, plus the section header. Each forwards
+//  focus to its view and resets it in prepareForReuse, or fast scrolls leave a stuck scale.
 
 import UIKit
 
@@ -21,15 +11,15 @@ import UIKit
 final class EpisodeCollectionCell: UICollectionViewCell {
     static let reuseID = "EpisodeCollectionCell"
     private let episodeView = EpisodeCell()
-    /// Fires when either sub-target (thumb/description) gains focus. Cell-level
-    /// (not collection-level) so it fires for horizontal moves within the
-    /// orthogonal episode row — the collection's own didUpdateFocus does NOT fire
-    /// for intra-section nav. Drives season-pill tracking.
+    /// Fires when the thumb or description gains focus, including moves within the row,
+    /// which the collection's didUpdateFocus misses. Drives season-pill tracking.
     var onFocused: ((Bool) -> Void)?
     /// Thumb Select → play this episode.
     var onPlay: (() -> Void)?
     /// Description Select → open the episode detail page.
     var onShowDetails: (() -> Void)?
+    /// Held Select → the episode menu, from the thumb's window frame.
+    var onLongPress: ((CGRect) -> Void)?
     /// Reports which sub-target is focused (thumb / description / none).
     var onFocusKind: ((EpisodeFocusKind) -> Void)?
 
@@ -42,6 +32,7 @@ final class EpisodeCollectionCell: UICollectionViewCell {
         // real focus targets and report focus/select up through these closures.
         episodeView.onPlay = { [weak self] in self?.onPlay?() }
         episodeView.onShowDetails = { [weak self] in self?.onShowDetails?() }
+        episodeView.onLongPress = { [weak self] frame in self?.onLongPress?(frame) }
         episodeView.onFocusKindChanged = { [weak self] kind in
             self?.onFocusKind?(kind)
             if kind != .none { self?.onFocused?(true) }
@@ -64,6 +55,7 @@ final class EpisodeCollectionCell: UICollectionViewCell {
         onFocused = nil
         onPlay = nil
         onShowDetails = nil
+        onLongPress = nil
         onFocusKind = nil
         episodeView.resetFocusVisual()
     }
@@ -275,35 +267,38 @@ final class CastCollectionCell: UICollectionViewCell {
 
 final class BelowFoldSectionHeader: UICollectionReusableView {
     static let reuseID = "BelowFoldSectionHeader"
+    /// Baseline above the first row's frame top, measured on device (tvOS 27): a card
+    /// frame carries 20 of focus reserve, so the artwork sits 34.5 below. Cast circles have none beyond 20 above.
+    static let cardBaseline: CGFloat = 14.5
+    static let castBaseline: CGFloat = 41.5
     private let titleLabel = UILabel()
+    private var baselineConstraint: NSLayoutConstraint!
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = .systemFont(ofSize: 30, weight: .semibold)
-        titleLabel.textColor = .white
+        titleLabel.font = MediaRowMetrics.headerFont
+        titleLabel.textColor = MediaRowMetrics.headerColor
         addSubview(titleLabel)
+        baselineConstraint = titleLabel.lastBaselineAnchor.constraint(equalTo: bottomAnchor, constant: -Self.cardBaseline)
         NSLayoutConstraint.activate([
             titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor),
             titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
-            titleLabel.topAnchor.constraint(equalTo: topAnchor),
-            titleLabel.bottomAnchor.constraint(equalTo: bottomAnchor),
+            baselineConstraint,
         ])
     }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(title: String) { titleLabel.text = title }
+    func configure(title: String, baseline: CGFloat = BelowFoldSectionHeader.cardBaseline) {
+        titleLabel.text = title
+        baselineConstraint.constant = -baseline
+    }
 }
 
 // MARK: - Season divider
 
-/// Slim, non-focusable boundary marker between seasons in the flat episode
-/// rail: a broken vertical hairline through the thumb band with a compact
-/// season chip ("S3" / "SP") in the gap. Structure only — the season's full
-/// identity lives in the pills. The focus engine skips it
-/// (canBecomeFocused false + the collection's canFocusItemAt exclusion), so
-/// the rail's focus order is unchanged.
+/// An unfocusable season boundary in the episode rail: a broken hairline with a chip ("S3", "SP").
 final class SeasonDividerCell: UICollectionViewCell {
     static let reuseID = "SeasonDividerCell"
     /// Wide enough that the chip is fully off screen when the next season's

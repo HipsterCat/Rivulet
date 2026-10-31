@@ -46,6 +46,9 @@ class LibrarySettingsManager: ObservableObject {
     private let hiddenLibrariesBaseKey = "hiddenLibraryKeys"
     private let libraryOrderBaseKey = "libraryOrder"
     private let sortOptionsBaseKey = "librarySortOptions"
+    /// The order across every server, per Plex profile. Each server's own list
+    /// keeps its libraries' relative order; this one says how they interleave.
+    private let combinedOrderBaseKey = "libraryOrderAllServers"
 
     /// Retired in the #295 cleanup. Kept only so `loadSettingsForCurrentUser`
     /// can delete what old builds wrote; see the Home Screen Visibility note.
@@ -80,23 +83,8 @@ class LibrarySettingsManager: ObservableObject {
         self.libraryOrder = []
         self.librarySortOptions = [:]
 
-        // PRIVACY: this singleton initializes before the Plex profile
-        // resolves. If we loaded the BASE keys here, a Plex Home /
-        // multi-profile account (whose real hidden set lives under
-        // `<key>_user_<id>`) would get an EMPTY hidden set at launch, so
-        // `isLibraryVisible` would report every library — including
-        // private ones the profile hid — as visible until the async
-        // per-user load lands. That race fails OPEN and leaks private
-        // libraries into the launch list.
-        //
-        // The last-selected profile id is, however, already persisted
-        // synchronously by PlexUserProfileManager (it restores from the
-        // same key). Seed `currentUserId` from it so the FIRST load below
-        // reads the correct per-user keys immediately — no race, no
-        // network wait. `nil` (never selected a profile ⇒ legit
-        // single-user / no Plex Home) keeps the base keys, which are
-        // authoritative there. `onProfileSwitched` still corrects this if
-        // the profile changes in-session.
+        // Privacy: seed the persisted profile id so the first load reads that profile's
+        // keys. Base keys here would show its hidden libraries until the profile resolves.
         currentUserId = userDefaults.object(forKey: persistedSelectedUserIdKey) as? Int
 
         // Load settings for current user (if any)
@@ -154,7 +142,9 @@ class LibrarySettingsManager: ObservableObject {
     /// Load settings for the current user from UserDefaults
     private func loadSettingsForCurrentUser() {
         self.hiddenLibraryKeys = Set(storedKeys(hiddenLibrariesBaseKey))
-        self.libraryOrder = storedKeys(libraryOrderBaseKey)
+        let combined = userDefaults.array(forKey: currentKey(combinedOrderBaseKey)) as? [String] ?? []
+        self.libraryOrder = Self.arrange(storedKeys(libraryOrderBaseKey), key: { $0 }, savedOrder: combined)
+        seedSidebarOrderIfNeeded()
 
         pruneRetiredHomeVisibilityKeys()
 
@@ -185,22 +175,9 @@ class LibrarySettingsManager: ObservableObject {
 
     // MARK: - Public Methods
 
-    /// Check if a library is visible
-    /// Sidebar visibility is THIS DEVICE'S own preference, deliberately.
-    ///
-    /// There is no Plex-side sidebar pin list to follow. Measured against a live
-    /// PMS 1.43.3 and plex.tv: the server exposes no pin field, plex.tv exposes
-    /// no pinned-sources endpoint, and `/hubs/promoted` returns the same rows
-    /// whatever `pinnedContentDirectoryID` you pass it. The client PASSES that
-    /// parameter, which is the tell: the server has to be told, because it does
-    /// not know. Every Plex app keeps its own pinned list, so "the user's Plex
-    /// sidebar" is not one thing to match.
-    ///
-    /// `PlexLibrary.hidden` is NOT it. On the reference account Audio Books
-    /// (`hidden == 1`) was pinned while musicDemo (`hidden == 0`) was not, so
-    /// the two are independent. `hidden` governs HOME (see
-    /// `PlexDataStore.projectHomeItems`), which IS account-level and shared, and
-    /// that is the one Rivulet follows.
+    /// Sidebar visibility is this device's preference. Plex keeps sidebar pins per app: PMS 1.43.3
+    /// and plex.tv expose no pin list, and `/hubs/promoted` ignores `pinnedContentDirectoryID`.
+    /// `PlexLibrary.hidden` is the Home pin, independent of the sidebar.
     func isLibraryVisible(_ libraryKey: String) -> Bool {
         !hiddenLibraryKeys.contains(libraryKey)
     }
@@ -226,19 +203,8 @@ class LibrarySettingsManager: ObservableObject {
 
     // MARK: - Home Screen Visibility
     //
-    // There is no separate shown-on-Home set any more. `librariesShownOnHome`,
-    // `homeVisibilityConfigured`, `isLibraryShownOnHome`, `setLibraryShownOnHome`
-    // and `initializeHomeVisibility` all lived here with NO writer anywhere in
-    // the app: the UIKit settings migration deleted the SwiftUI page that was
-    // their only caller, so the flag never flipped and the whole concept
-    // degraded to `isLibraryVisible`. Worse, anyone carrying
-    // `homeVisibilityConfigured = true` from a build before that migration was
-    // left with a frozen set they could no longer edit.
-    //
-    // Home visibility is now the sidebar toggle plus Plex's own pin; see
-    // `PlexDataStore.librariesPinnedToHome`. Per-row control is
-    // `HomeRowSettings`. Do not add a third one. The stale UserDefaults keys are
-    // dropped in `pruneRetiredHomeVisibilityKeys` below.
+    // Home visibility is the sidebar toggle plus Plex's pin (`PlexDataStore.librariesPinnedToHome`),
+    // and per-row control is `HomeRowSettings`. Do not add a third.
 
     /// Move a library in the order list
     /// - Parameters:
@@ -308,25 +274,30 @@ class LibrarySettingsManager: ObservableObject {
         let currentKeys = Set(libraries.map { $0.key })
         let orderedKeys = Set(libraryOrder)
 
-        // Add any new libraries to the end of the order
-        for library in libraries {
-            if !orderedKeys.contains(library.key) {
-                libraryOrder.append(library.key)
-            }
+        // A new library goes after this server's last one, never past another
+        // server's, so it does not split the user's order into mixed servers.
+        var order = libraryOrder
+        for library in libraries where !orderedKeys.contains(library.key) {
+            order = SidebarArrangement.insert(library.key, into: order)
         }
 
         // Remove any libraries from order that no longer exist
         // Jellyfin keys are not this server's to prune: a Plex refresh would
         // otherwise delete every Jellyfin library's place and visibility.
-        libraryOrder = libraryOrder.filter { currentKeys.contains($0) || Self.isProviderKey($0) }
+        // Nor are the sidebar's other rows.
+        libraryOrder = order.filter { currentKeys.contains($0) || Self.isProviderKey($0) || SidebarArrangement.isAppRow($0) }
 
         // Also clean up hidden keys for libraries that no longer exist
-        hiddenLibraryKeys = hiddenLibraryKeys.filter { currentKeys.contains($0) || Self.isProviderKey($0) }
+        hiddenLibraryKeys = hiddenLibraryKeys.filter {
+            currentKeys.contains($0) || Self.isProviderKey($0) || SidebarArrangement.isAppRow($0)
+        }
     }
 
     /// A non-Plex library's key (`MediaLibrary.settingsKey`). Plex section
     /// keys are bare numbers and never contain ":".
-    static func isProviderKey(_ key: String) -> Bool { key.contains(":") }
+    nonisolated static func isProviderKey(_ key: String) -> Bool {
+        key.contains(":") && !SidebarArrangement.isAppRow(key)
+    }
 
     /// `filterAndSortLibraries` for a non-Plex server's libraries: hidden ones
     /// dropped, ordered ones first in their saved order, the rest in server order.
@@ -342,10 +313,52 @@ class LibrarySettingsManager: ObservableObject {
             .map(\.element)
     }
 
-    /// One step up or down within `keys` (one server's libraries in displayed
-    /// order). Rewrites `libraryOrder` as that run followed by every other
-    /// key, so nothing is dropped. A step off either end of the run does
-    /// nothing: the sidebar shows each server in its own section.
+    /// Every server's libraries in the one sidebar and Home order (#87). `items`
+    /// come grouped by server, the selected Plex server first.
+    func arrange<T>(_ items: [T], key: (T) -> String) -> [T] {
+        Self.arrange(items, key: key, savedOrder: libraryOrder)
+    }
+
+    /// Saved keys first, in saved order. An unsaved key (a new library) goes right
+    /// after the last of its own server's, so it never splits a server's run; one
+    /// whose server has none saved goes last.
+    nonisolated static func arrange<T>(_ items: [T], key: (T) -> String, savedOrder: [String]) -> [T] {
+        let rank = Dictionary(savedOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        var result = items.filter { rank[key($0)] != nil }.sorted { rank[key($0)]! < rank[key($1)]! }
+        for item in items where rank[key(item)] == nil {
+            let server = serverID(ofKey: key(item))
+            if let last = result.lastIndex(where: { serverID(ofKey: key($0)) == server }) {
+                result.insert(item, at: last + 1)
+            } else {
+                result.append(item)
+            }
+        }
+        return result
+    }
+
+    /// The server a key belongs to: "" for the selected Plex server's bare section
+    /// keys, else the provider id of a "<providerID>/<library id>" key.
+    nonisolated static func serverID(ofKey key: String) -> String {
+        isProviderKey(key) ? String(key.prefix { $0 != "/" }) : ""
+    }
+
+    /// Whether each server's libraries sit together in `keys`, so the sidebar can
+    /// head them with the server's name instead of badging each one.
+    nonisolated static func isGroupedByServer(_ keys: [String]) -> Bool {
+        var seen: Set<String> = []
+        var current: String?
+        for key in keys {
+            let server = serverID(ofKey: key)
+            guard server != current else { continue }
+            guard seen.insert(server).inserted else { return false }
+            current = server
+        }
+        return true
+    }
+
+    /// One step up or down within `keys` (the libraries in displayed order).
+    /// Rewrites `libraryOrder` as that run followed by every other key, so
+    /// nothing is dropped. A step off either end of the run does nothing.
     func moveLibrary(key: String, up: Bool, among keys: [String]) {
         var run = keys
         guard let i = run.firstIndex(of: key) else { return }
@@ -355,14 +368,50 @@ class LibrarySettingsManager: ObservableObject {
         libraryOrder = run + libraryOrder.filter { !run.contains($0) }
     }
 
-    /// Show every library in the sidebar, and so on Home too.
+    /// Show every library in the sidebar, and so on Home too. Other rows keep theirs.
     func showAllLibraries() {
-        hiddenLibraryKeys = []
+        hiddenLibraryKeys = hiddenLibraryKeys.filter(SidebarArrangement.isAppRow)
     }
 
-    /// Hide every library from the sidebar.
+    /// Hide every library from the sidebar. Other rows keep theirs.
     func hideAllLibraries(_ allLibraryKeys: [String]) {
-        hiddenLibraryKeys = Set(allLibraryKeys)
+        hiddenLibraryKeys = hiddenLibraryKeys.filter(SidebarArrangement.isAppRow).union(allLibraryKeys)
+    }
+
+    // MARK: - Sidebar rows
+
+    /// One step up or down among the sidebar's shown rows (`visible`, in order).
+    func moveSidebarRow(key: String, up: Bool, visible: [String]) {
+        libraryOrder = SidebarArrangement.move(key, up: up, visible: visible, order: libraryOrder)
+    }
+
+    /// A Playlists row's visibility. The retired Show Playlists toggle hid them all.
+    func isPlaylistsRowVisible(_ key: String) -> Bool {
+        !hiddenLibraryKeys.contains(key) && !hiddenLibraryKeys.contains(SidebarArrangement.allPlaylistsHidden)
+    }
+
+    /// `allKeys`: every server's Playlists key, so turning one on keeps the others off.
+    func setPlaylistsRow(_ key: String, visible: Bool, allKeys: [String]) {
+        var hidden = hiddenLibraryKeys
+        if hidden.remove(SidebarArrangement.allPlaylistsHidden) != nil { hidden.formUnion(allKeys) }
+        if visible { hidden.remove(key) } else { hidden.insert(key) }
+        hiddenLibraryKeys = hidden
+    }
+
+    /// Settings > Sidebar > Reset: the default order with every row shown.
+    func resetSidebar() {
+        hiddenLibraryKeys = []
+        libraryOrder = SidebarArrangement.seed(libraryOrder: [], discoverAbove: true, liveTVAbove: false)
+    }
+
+    /// The first load on a build with an arrangeable sidebar keeps today's layout.
+    private func seedSidebarOrderIfNeeded() {
+        guard !SidebarArrangement.isSeeded(libraryOrder) else { return }
+        let flag = { (key: String, fallback: Bool) in self.userDefaults.object(forKey: key) as? Bool ?? fallback }
+        libraryOrder = SidebarArrangement.seed(libraryOrder: libraryOrder,
+                                               discoverAbove: flag("discoverAboveLibraries", true),
+                                               liveTVAbove: flag("liveTVAboveLibraries", false))
+        if !flag("showPlaylistsTab", true) { hiddenLibraryKeys.insert(SidebarArrangement.allPlaylistsHidden) }
     }
 
     // MARK: - Sort Options
@@ -456,6 +505,7 @@ class LibrarySettingsManager: ObservableObject {
 
     private func saveLibraryOrder() {
         save(libraryOrder, baseKey: libraryOrderBaseKey)
+        userDefaults.set(libraryOrder, forKey: currentKey(combinedOrderBaseKey))
     }
 
     /// Drop what pre-#295 builds wrote for the retired shown-on-Home set, so a

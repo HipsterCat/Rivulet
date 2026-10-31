@@ -5,16 +5,9 @@
 //  SubtitleAdjustments.swift
 //  Rivulet
 //
-//  User-tunable subtitle timing and placement, surfaced as steppers inside
-//  the OSD Subtitles panel (VOD rail and Live TV rail).
-//
-//  Both adjustments are STICKY PER MEDIA: keyed by the Plex ratingKey for VOD
-//  and the channel id for Live TV, so one channel can hold +3.0s and sit two
-//  units higher while another stays at the defaults. Both default to 0.
-//
-//  Height is stored as whole units of `heightUnitPt`, clamped to
-//  ±`heightUnitMax`, and does NOT move a cue that carries its own placement —
-//  an authored position must not drift with an app-level offset.
+//  Subtitle delay and height steppers for the VOD and Live TV Subtitles panels.
+//  Both are sticky per media (ratingKey or channel id) and default to 0. Height
+//  does not move a cue that carries its own placement.
 //
 
 import Foundation
@@ -98,23 +91,28 @@ enum SubtitleAdjustments {
     /// spans the screen's bottom `PlayerRailView.railHeight` (340) points.
     static let railTopFromScreenBottom: CGFloat = 340
 
-    /// The margin a caption keeps off whatever it rests above, as a fraction
-    /// of the PICTURE height — the bottom of the picture with the rail hidden,
-    /// the top of the rail with it showing. One number for both, so captions
-    /// keep the same visual distance either way.
-    ///
-    /// Measured against the picture rather than the screen so letterboxed
-    /// content keeps its captions on the image instead of dropping them into
-    /// the black bar, and so the placement holds at any presentation size.
-    /// Tuned against AVPlayer's own placement (a two-line caption centres at
-    /// roughly 8% of picture height).
-    static let bottomMarginFraction: CGFloat = 0.06
+    /// The margin a resting caption keeps off the picture bottom, as a fraction
+    /// of picture height. Measured against AVKit (tvOS 27): its built-in Default
+    /// style sits 3.5pt higher than every other style.
+    static let bottomMarginFraction: CGFloat = 0.0493
+    static let systemDefaultBottomMarginFraction: CGFloat = 0.0526
+
+    /// The margin a caption keeps off the rail top while the rail is up. AVKit's
+    /// lift is a constant, the same for every picture shape and caption size;
+    /// the built-in Default style sits higher, as it does at rest (measured,
+    /// tvOS 27 sim, within 1pt at 1.0, 1.5 and Default; device agrees).
+    static let railMargin: CGFloat = 19
+    static let systemDefaultRailMargin: CGFloat = 26
 
     /// The lowest a caption may sit while the rail is showing. Lives here
     /// because BOTH overlays need it and they must agree: captions should not
     /// change height when a title falls back from the engine to the HLS route.
-    static func controlsFloor(pictureHeight: CGFloat) -> CGFloat {
-        railTopFromScreenBottom + pictureHeight * bottomMarginFraction
+    /// How much higher AVKit sets captions while an info pane is open: just above
+    /// its risen pills (measured, tvOS 27 sim; the pills rise 334, captions 116).
+    static let paneLift: CGFloat = 116
+
+    static func controlsFloor(isSystemDefault: Bool) -> CGFloat {
+        railTopFromScreenBottom + (isSystemDefault ? systemDefaultRailMargin : railMargin)
     }
 
     /// "0", "+3", "-2" — the stepper's centre label.
@@ -122,12 +120,7 @@ enum SubtitleAdjustments {
         units == 0 ? "0" : String(format: "%+d", units)
     }
 
-    /// Extra bottom padding for the subtitle overlays, derived from the stored
-    /// units. Hosts pass the raw units to the overlays, which convert here, so
-    /// the units→points rule lives in one place.
-    ///
-    /// Applied to the DEFAULT caption band only. A cue carrying its own
-    /// placement is exempt — see `AetherSubtitleOverlayView.placedCue`.
+    /// Extra bottom padding for the default caption band, from the stored units.
     static func heightOffset(forUnits units: Int) -> CGFloat {
         CGFloat(clampUnits(units)) * heightUnitPt
     }

@@ -17,7 +17,7 @@ final class LiveShelvesTests: XCTestCase {
 
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-    private func channel(_ id: String, group: String, number: Int) -> UnifiedChannel {
+    private func channel(_ id: String, group: String, number: ChannelNumber) -> UnifiedChannel {
         UnifiedChannel(id: id, sourceType: .genericM3U, sourceId: "s", channelNumber: number, name: id,
                        groupTitle: group)
     }
@@ -94,6 +94,26 @@ final class LiveShelvesTests: XCTestCase {
         XCTAssertEqual(items["recent"]?.first?.kind, .upcoming)
         XCTAssertEqual(items["favorites"]?.map(\.id), ["favorites|sun:7200.0", "favorites|news"])
         XCTAssertNil(items["group|NFL"])
+    }
+
+    /// Combined sources get a row each, as the Guide's tabs (#377); a group
+    /// holding part of the lineup gets one too, one holding all of it does not.
+    func test_sourceRows() {
+        func ch(_ id: String, source: String, group: String?) -> UnifiedChannel {
+            UnifiedChannel(id: id, sourceType: .genericM3U, sourceId: source, name: id, groupTitle: group)
+        }
+        let channels = [ch("a", source: "1", group: "HD"), ch("b", source: "1", group: nil),
+                        ch("c", source: "2", group: "News"), ch("d", source: "3", group: "HD")]
+        let epg = Dictionary(uniqueKeysWithValues: channels.map { ($0.id, [program($0.id, "Show", from: -60, to: 60)]) })
+        let input = LiveShelves.Input(channels: channels, epg: epg, suggestionsEnabled: false,
+                                      sourceNames: ["1": "Cooking", "2": "News", "3": "News"])
+
+        let shelves = LiveShelves.build(input, sourceIdFilter: nil, now: now)
+        XCTAssertEqual(shelves.map(\.id), ["now", "source|Cooking", "source|News", "group|HD"])
+        XCTAssertEqual(shelves.first { $0.id == "source|News" }?.items.map(\.id), ["source|News|c", "source|News|d"])
+
+        let one = LiveShelves.build(input, sourceIdFilter: "1", now: now)
+        XCTAssertEqual(one.map(\.id), ["now", "group|HD"])
     }
 
     func test_sourceFilter() {

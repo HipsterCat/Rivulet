@@ -26,17 +26,14 @@ struct TVSidebarView: View {
     // @StateObject here, SwiftUI doesn't see hiddenLibraryKeys updates.
     @StateObject private var librarySettings = LibrarySettingsManager.shared
     @StateObject private var liveTVDataStore = LiveTVDataStore.shared
-    // Jellyfin libraries (sidebar section) and its account (welcome gate).
-    @StateObject private var jellyfinStore = JellyfinDataStore.shared
+    // Other servers' libraries (sidebar sections) and sign-ins (welcome gate).
+    @StateObject private var serverStore = ServerDataStore.shared
     @StateObject private var profileManager = PlexUserProfileManager.shared
     @StateObject private var nestedNavState = NestedNavigationState()
     @StateObject private var deepLinkHandler = DeepLinkHandler.shared
     @AppStorage("combineLiveTVSources") private var combineLiveTVSources = true
-    @AppStorage("liveTVAboveLibraries") private var liveTVAboveLibraries = false
     @AppStorage("showDiscoverTab") private var showDiscoverTab = true
-    @AppStorage("discoverAboveLibraries") private var discoverAboveLibraries = true
     @AppStorage("showWatchlistTab") private var showWatchlistTab = true
-    @AppStorage("displaySize") private var displaySizeRaw = DisplaySize.normal.rawValue
     @State private var selectedTab: SidebarTab = .home
     @State private var showProfilePicker = false
     /// A profile was entered through the picker; any other close re-presents it.
@@ -52,18 +49,21 @@ struct TVSidebarView: View {
     @State private var hasCheckedProfilePicker = false
     @State private var isAwaitingProfileSelection = false
     @AppStorage("lastSeenBuild") private var lastSeenBuild = ""
+    /// The setup landing was finished. Unset, an install that already has a source counts as set up.
+    @AppStorage("setupComplete") private var setupComplete = SetupLandingViewController.hasAnySource
     @State private var showWhatsNew = false
     @State private var didApplyDebugLaunch = false
 
     @Namespace private var contentNamespace
 
-    private var uiScale: CGFloat {
-        (DisplaySize(rawValue: displaySizeRaw) ?? .normal).scale
-    }
-
     /// Home's welcome overlay stands down for any signed-in server.
     private var isSignedInToAnyServer: Bool {
-        authManager.hasCredentials || jellyfinStore.account != nil
+        authManager.hasCredentials || serverStore.isSignedIn
+    }
+
+    /// Signing out of everything brings the setup landing back.
+    private var hasAnySource: Bool {
+        isSignedInToAnyServer || liveTVDataStore.sources.contains { !$0.sourceType.followsServer }
     }
 
     private var profileName: String {
@@ -99,20 +99,25 @@ struct TVSidebarView: View {
     /// sidebar wedged on live mutation; ours does not.
     private var shellSections: [ShellSidebarSection] {
         ShellSidebarModel.sections(
-            libraries: dataStore.visibleSidebarLibraries,
+            libraries: SidebarLibrary.current(),
             liveTVSources: liveTVDataStore.sources,
             combineLiveTV: combineLiveTVSources,
             showDiscover: showDiscoverTab,
-            discoverAbove: discoverAboveLibraries,
             showWatchlist: showWatchlistTab,
-            liveTVAbove: liveTVAboveLibraries,
-            serverName: authManager.savedServerName,
+            order: librarySettings.libraryOrder,
+            hiddenKeys: librarySettings.hiddenLibraryKeys,
             profileName: profileName,
             profileAvatar: profileManager.selectedUser?.thumb.flatMap { URL(string: $0) },
             canSwitchProfile: profileManager.hasMultipleProfiles,
-            jellyfinServerName: jellyfinStore.account?.serverName,
-            jellyfinLibraries: jellyfinStore.visibleLibraries,
-            hasMediaServer: isSignedInToAnyServer)
+            hasMediaServer: isSignedInToAnyServer,
+            playlistServers: PlaylistServer.current(visiblePlaylistProviders))
+    }
+
+    /// Servers that get a Playlists row: those with playlists, less the rows Settings hides.
+    private var visiblePlaylistProviders: Set<String> {
+        Set(PlaylistServer.current(PlaylistAvailability.shared.providerIDs)
+            .filter { librarySettings.isPlaylistsRowVisible(SidebarArrangement.playlists(server: $0.serverID)) }
+            .map(\.providerID))
     }
 
     private var opensToLiveTV: Bool {
@@ -140,10 +145,8 @@ struct TVSidebarView: View {
         )
     }
 
-    /// The UIKit shell replaces the TabView(.sidebarAdaptable). Menu-to-Home
-    /// (issue #192), the sidebar focus guard, and the focus watchdog were
-    /// all workarounds for the system sidebar and live on inside the shell
-    /// (or died with the TabView). Its modifiers keep the selected tab valid.
+    /// The UIKit shell, which owns Menu-to-Home (#192) and the sidebar focus
+    /// rules. Its modifiers keep the selected tab valid.
     private var shell: some View {
         RootShellHost(
             selection: tabSelection,
@@ -201,9 +204,9 @@ struct TVSidebarView: View {
                 selectedTab = .home
             }
         }
-        .onChange(of: jellyfinStore.visibleLibraries) { _, libraries in
-            if case .providerLibrary(_, let libraryID) = selectedTab,
-               !libraries.contains(where: { $0.id == libraryID }) {
+        .onChange(of: serverStore.visibleLibraries) { _, libraries in
+            if case .providerLibrary(let providerID, let libraryID) = selectedTab,
+               !libraries.contains(where: { $0.providerID == providerID && $0.id == libraryID }) {
                 selectedTab = .home
             }
         }
@@ -212,12 +215,33 @@ struct TVSidebarView: View {
                 selectedTab = .home
             }
         }
+        // The toggle went off, or the server's last playlist went.
+        .onChange(of: visiblePlaylistProviders) { _, providers in
+            if case .playlists(let providerID) = selectedTab, !providers.contains(providerID) {
+                selectedTab = .home
+            }
+        }
     }
 
     var body: some View {
         // Split from `shell`: the whole chain as one expression outran the
         // type checker on CI ("unable to type-check this expression").
-        shell
+        ZStack {
+            if setupComplete {
+                shell
+            } else {
+                // Start Watching fades the landing away over the home, which mounts under it at once.
+                SetupLandingHost { withAnimation(.easeInOut(duration: 0.8)) { setupComplete = true } }
+                    .ignoresSafeArea()
+                    .zIndex(1)
+                    .transition(.asymmetric(insertion: .identity, removal: .opacity))
+                    // Store the key, so connecting a source here can't flip the unset default.
+                    .onAppear { setupComplete = false }
+            }
+        }
+        .onChange(of: hasAnySource) { _, has in
+            if !has { setupComplete = false }
+        }
         .task(id: authManager.hasCredentials) {
             StartupTimer.mark("TVSidebar .task entry")
             guard authManager.hasCredentials else { return }
@@ -287,6 +311,16 @@ struct TVSidebarView: View {
             deepLinkHandler.pendingDetail = nil
             presentDetailForDeepLink(metadata)
         }
+        .onChange(of: deepLinkHandler.pendingProviderLink) { _, link in
+            guard let link else { return }
+            deepLinkHandler.pendingProviderLink = nil
+            presentReplacingStack { top in
+                switch link.action {
+                case .play: ProviderPlayer.play(link.item, fromBeginning: false, from: top, onDismiss: nil)
+                case .detail: presentDetail(link.item, from: top)
+                }
+            }
+        }
         // What's New: present the SAME UIKit glass changelog popup as
         // Settings → Changelog (not a separate SwiftUI dialog) for consistency.
         .onChange(of: showWhatsNew) { _, show in
@@ -306,7 +340,9 @@ struct TVSidebarView: View {
         // `xcrun simctl launch --setenv RIVULET_OPEN_LIBRARY="TV Shows" ...`
         .onChange(of: dataStore.libraries.count) { _, _ in applyDebugLaunchTab() }
         // Profile picker overlay (launch-time "Who's Watching")
-        .fullScreenCover(isPresented: $showProfilePicker) {
+        // What's New waits for the dismissal to finish: presented any sooner it
+        // lands on the closing picker and leaves with it.
+        .fullScreenCover(isPresented: $showProfilePicker, onDismiss: checkAndShowWhatsNew) {
             ProfilePickerOverlay(isPresented: $showProfilePicker, onSelected: { profileChosen = true })
         }
         .onChange(of: showProfilePicker) { _, isShowing in
@@ -327,9 +363,6 @@ struct TVSidebarView: View {
                 if dataStore.hubs.isEmpty {
                     Task { await loadLaunchContent() }
                 }
-
-                // Now show What's New if applicable (was deferred for profile picker)
-                checkAndShowWhatsNew()
             }
         }
         // Content is withheld until a profile is entered: ask who is watching.
@@ -377,12 +410,9 @@ struct TVSidebarView: View {
             await PlexWatchlistService.shared.fetchWatchlist()
         }
 
-        // IMMEDIATE: hydrate the library GUID index from last launch's
-        // persisted snapshot. Local decode (a few ms), so it runs with no
-        // defer — this makes "do I own this?" answers (and the trending
-        // hero upgrade) available right after the home paints, instead of
-        // waiting ~20s for the network rebuild below. A fresh network
-        // rebuild always supersedes this (see LibraryGUIDIndex.hasFreshData).
+        // Hydrate the GUID index from last launch's snapshot (a few ms) so
+        // ownership answers are ready at first paint; the network rebuild
+        // below supersedes it.
         Task.detached(priority: .userInitiated) {
             _ = await LibraryGUIDIndex.shared.hydrateFromDisk()
         }
@@ -396,44 +426,51 @@ struct TVSidebarView: View {
             await dataStore.loadLibraryHubsIfNeeded()
             dataStore.startBackgroundPrefetch(libraries: dataStore.visibleMediaLibraries)
 
-            // Rebuild the library GUID index in the background. Used by Discover and
-            // Watchlist surfaces to answer "do I own this?" in O(1). The index
-            // matches by external GUID, so the fetch must include them
-            // (Plex omits them from the default summary response).
-            //
-            // DEFERRED 5s past launch: this fetches ~5MB per page
-            // (5000 items + includeGuids, paginated) — so it must stay
-            // clear of the home's first-paint window. It no longer gates the
-            // trending hero or "in your library" badges: hydrateFromDisk()
-            // above serves last launch's snapshot in ms. This fetch refreshes
-            // that snapshot from the server, and replace(with:) re-posts
-            // .libraryGUIDIndexDidUpdate so the hero picks up any new data.
+            // Rebuild the GUID index ("do I own this?") with includeGuids, which
+            // Plex omits by default. Deferred 5s: each 5000-movie page is ~12MB, so
+            // each page is cut to index entries before the next one arrives (#409).
             Task.detached(priority: .background) {
                 try? await Task.sleep(for: .seconds(5))
                 let (serverURL, token) = await MainActor.run {
                     (PlexAuthManager.shared.selectedServerURL, PlexAuthManager.shared.selectedServerToken)
                 }
                 guard let serverURL, let token else { return }
+                guard await LibraryGUIDIndex.shared.claimRebuild() else { return }
+                defer { Task { await LibraryGUIDIndex.shared.finishRebuild() } }
 
                 let visible = await MainActor.run { PlexDataStore.shared.visibleVideoLibraries }
 
-                var allItems: [PlexMetadata] = []
-                // Completeness is tracked per section, not as a single global
-                // flag, because the two ways a build goes wrong look identical
-                // in aggregate: a section that threw on its very first page
-                // contributes nothing, and a section that threw at offset 5000
-                // of 12000 contributes a plausible-looking 5000 items. Both are
-                // incomplete, and the second one is the dangerous case, since
-                // the totals alone give no hint that anything is missing.
+                // One 1-item probe per section (about 3 KB); an unchanged library skips the
+                // full refetch, about 130 MB at 56k items.
+                var stamps: [String: String] = [:]
+                for library in visible {
+                    if let probe = try? await PlexNetworkManager.shared.getLibraryItemsWithTotal(
+                        serverURL: serverURL, authToken: token, sectionId: library.key,
+                        start: 0, size: 1, sort: "updatedAt:desc"
+                    ), let stamp = LibraryGUIDIndex.sectionStamp(totalSize: probe.totalSize, newest: probe.items.first) {
+                        stamps[library.key] = stamp
+                    }
+                }
+                if stamps.count == visible.count, await LibraryGUIDIndex.shared.isCurrent(for: stamps) {
+                    libraryIndexLog.info("[GUIDIndex] unchanged since last build, skipping rebuild")
+                    return
+                }
+
+                var allItems: [LibraryGUIDIndex.Entry] = []
+                var fetchedCount = 0
+                // Per section: one that failed mid-way still contributes a
+                // plausible count, and the totals would hide it.
                 var incompleteSections = 0
                 let pageSize = 5000
                 for library in visible {
-                    // Page through the whole section — libraries larger than one
-                    // page used to be truncated, silently dropping ownership
-                    // matches for everything past the first 5000 titles (#202).
+                    // Page through the whole section (#202).
                     var start = 0
                     var sectionComplete = false
                     while true {
+                        // Not alongside playback: a 4K software decode needs the headroom (#409).
+                        while await MainActor.run(body: { PlexDataStore.shared.isPlaybackActive }) {
+                            try? await Task.sleep(for: .seconds(10))
+                        }
                         do {
                             let result = try await PlexNetworkManager.shared.getLibraryItemsWithTotal(
                                 serverURL: serverURL,
@@ -443,7 +480,8 @@ struct TVSidebarView: View {
                                 size: pageSize,
                                 includeGuids: true
                             )
-                            allItems.append(contentsOf: result.items)
+                            allItems += result.items.compactMap { LibraryGUIDIndex.Entry($0, sectionID: library.key) }
+                            fetchedCount += result.items.count
                             start += result.items.count
                             // An empty page or reaching the reported total is the
                             // only way out that means we actually saw the section
@@ -471,58 +509,49 @@ struct TVSidebarView: View {
                 let completeness: LibraryGUIDIndex.Completeness =
                     incompleteSections == 0 ? .complete : .partial
 
-                let withGuids = allItems.filter { ($0.Guid ?? []).isEmpty == false }
-                let sample = withGuids.first.flatMap { $0.Guid?.first?.id } ?? "(none)"
-                libraryIndexLog.info("[GUIDIndex] populated: \(allItems.count) items total, \(withGuids.count) with external GUIDs, \(incompleteSections) incomplete sections, sample=\(sample, privacy: .public)")
+                let sample = allItems.first?.guids.first ?? "(none)"
+                libraryIndexLog.info("[GUIDIndex] populated: \(fetchedCount) items total, \(allItems.count) with external GUIDs, \(incompleteSections) incomplete sections, sample=\(sample, privacy: .public)")
 
                 let crumb = Breadcrumb(level: .info, category: "guid_index")
                 crumb.message = "Library GUID index rebuilt"
                 crumb.data = [
                     "libraries": visible.count,
                     "failed_sections": incompleteSections,
-                    "items": allItems.count,
-                    "with_guids": withGuids.count
+                    "items": fetchedCount,
+                    "with_guids": allItems.count
                 ]
                 SentryBridge.addBreadcrumb(crumb)
 
-                // No standalone Sentry event for an incomplete build. The
-                // underlying cause is the user's own Plex server going
-                // unreachable, and PlexNetworkManager already captures each
-                // transport failure with its endpoint, elapsed time and error
-                // code. An event here only duplicated that, once per launch, for
-                // users whose whole server was down. The breadcrumb above keeps
-                // the context on any real downstream error at no cost.
+                // No Sentry event for an incomplete build: PlexNetworkManager
+                // already captures each transport failure.
 
                 // An empty result with at least one section incomplete means we
                 // learned nothing from the server, so keep whatever the disk
                 // hydrate gave us rather than blanking a working index.
-                if allItems.isEmpty && completeness == .partial { return }
+                if fetchedCount == 0 && completeness == .partial { return }
                 // The token changed hands while this ran: not that profile's library.
                 guard await MainActor.run(body: { PlexAuthManager.shared.selectedServerToken }) == token else { return }
-                await LibraryGUIDIndex.shared.replace(with: allItems, completeness: completeness)
+                await LibraryGUIDIndex.shared.replace(
+                    with: allItems, completeness: completeness,
+                    stamps: completeness == .complete && stamps.count == visible.count ? stamps : [:]
+                )
             }
         }
     }
 
     // MARK: - Tab Content
 
-    /// Builds one tab's content view controller for the UIKit shell.
-    ///
-    /// A surface that is ALREADY UIKit mounts directly, with no
-    /// `UIHostingController` in between. That sandwich is not free: a hosting
-    /// controller is not focusable in the runloop turn it mounts in, which is
-    /// the whole reason `RootShellViewController.driveFocusIntoContent` has to
-    /// retry at all (issue #280), and every hosted tab's root is rebuilt on
-    /// every SwiftUI update of this view.
-    ///
-    /// Still hosted, and correctly so: Live TV is genuinely SwiftUI, and Home
-    /// carries the welcome / profile-gate overlays.
+    /// Builds one tab's content view controller for the UIKit shell. UIKit
+    /// surfaces mount directly: a hosting controller is not focusable in its
+    /// first runloop turn (#280) and is rebuilt on every update of this view.
     private func contentViewController(for tab: SidebarTab) -> UIViewController {
         switch tab {
         case .discover:
             return PlexHomeViewController(mode: .discover)
         case .watchlist:
             return PlexHomeViewController(mode: .watchlist)
+        case .playlists(let providerID):
+            return PlexHomeViewController(mode: .playlists(providerID: providerID))
         case .search:
             let search = SearchContainerViewController()
             search.onNestedChange = { [nestedNavState] isNested in
@@ -530,9 +559,8 @@ struct TVSidebarView: View {
             }
             return search
         case .library(let key):
-            // The shell caches per `SidebarTab`, so each library key already
-            // gets its own controller — this is what the SwiftUI `.id(key)`
-            // was buying.
+            // The shell caches per `SidebarTab`, so each library key gets its
+            // own controller.
             if let lib = dataStore.libraries.first(where: { $0.key == key }) {
                 if lib.hasNoMetadataAgent { return FolderLibraryViewController(plex: lib) }
                 if lib.isVideoLibrary { return PlexLibraryModeViewController(library: lib) }
@@ -547,9 +575,9 @@ struct TVSidebarView: View {
                     ? MusicLibraryViewController(libraryKey: lib.key, title: lib.title)
                     : PlexHomeViewController(mode: .library(key: lib.key, title: lib.title))
             }
-        case .providerLibrary(_, let libraryID):
+        case .providerLibrary(let providerID, let libraryID):
             // The same page as a Plex library, through the provider.
-            if let library = jellyfinStore.libraries.first(where: { $0.id == libraryID }) {
+            if let library = serverStore.libraries.first(where: { $0.providerID == providerID && $0.id == libraryID }) {
                 if library.browsesByFolder {
                     return FolderLibraryViewController(title: library.title) {
                         (MediaProviderRegistry.shared.provider(for: library.providerID) as? any FolderProvider)
@@ -575,9 +603,7 @@ struct TVSidebarView: View {
         return RootShellHostingController(rootView: AnyView(tabContent(for: tab)))
     }
 
-    /// Settings tab content. The Settings surface is pure UIKit
-    /// (`UIKitSettingsContainer` → `SettingsContainerViewController`); the old
-    /// SwiftUI `SettingsView` has been retired.
+    /// Settings tab content (`SettingsContainerViewController`).
     @ViewBuilder
     private var settingsTabContent: some View {
         UIKitSettingsContainer()
@@ -585,13 +611,8 @@ struct TVSidebarView: View {
 
     @ViewBuilder
     private func tabContent(for tab: SidebarTab) -> some View {
-        // The profile gate is an OVERLAY, not a structural branch. The old
-        // `if isAwaitingProfileSelection { Color.clear } else { content }`
-        // swapped the whole tree when the flag flipped, changing the
-        // content's SwiftUI identity — which discarded and REBUILT the UIKit
-        // home (two live home VCs through the entire launch window). An
-        // overlay conceals without touching identity. (Focus isolation while
-        // the gate is up comes from the profile picker's own presentation.)
+        // Gates are overlays, never if/else branches: a branch changes the
+        // content's SwiftUI identity and rebuilds or orphans the UIKit home.
         Group {
             switch tab {
             case .account:
@@ -602,32 +623,12 @@ struct TVSidebarView: View {
                 // stays exhaustive over SidebarTab.
                 Color.clear
             case .home:
-                // PlexHomeRoot is ALWAYS rendered (never an if/else branch) so
-                // its SwiftUI identity — and the singleton UIKit home VC it
-                // hosts — stays stable across the `hasCredentials` false→true
-                // flip on sign-in. The old `if hasCredentials { PlexHomeRoot }
-                // else { welcomeView }` swapped the tree on sign-in, which made
-                // SwiftUI tear the home VC out of the hierarchy (willMove(to:
-                // nil) → window=nil, orphaned) and never re-host it: blank,
-                // unfocusable Home + watchdog loop. This is the SAME structural-
-                // branch anti-pattern the profile gate (below) already fixed by
-                // becoming an overlay. The welcome screen is now an opaque
-                // overlay; the home behind is `.disabled` so focus lands on the
-                // welcome button, not a hidden home element.
                 PlexHomeRoot()
-                    .disabled(!isSignedInToAnyServer)
-                    .overlay {
-                        if !isSignedInToAnyServer {
-                            welcomeView
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .background { WelcomeGlowBackground().ignoresSafeArea() }
-                        }
-                    }
             case .providerLibrary:
                 // Unreachable: mounted directly as a UIKit VC above. Kept so
                 // this switch stays exhaustive over SidebarTab.
                 Color.clear
-            case .watchlist:
+            case .watchlist, .playlists:
                 // Unreachable: mounted directly as a UIKit VC above. Kept so
                 // this switch stays exhaustive over SidebarTab.
                 Color.clear
@@ -662,43 +663,6 @@ struct TVSidebarView: View {
         }
         .focusScope(contentNamespace)
         .environment(\.nestedNavigationState, nestedNavState)
-        .environment(\.uiScale, uiScale)
-    }
-
-    // MARK: - Welcome View
-
-    private var welcomeView: some View {
-        VStack(spacing: 28) {
-            VStack(spacing: 12) {
-                Text("Welcome to Rivulet")
-                    .font(.system(size: 46, weight: .semibold))
-
-                Text("Your Media and Live TV, together in one place.")
-                    .font(.system(size: 28))
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 1100)
-
-                Text("To get started, connect Plex, Jellyfin, or a Live TV source in Settings.")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 1100)
-            }
-
-            Button {
-                selectedTab = .settings
-            } label: {
-                Text("Open Settings")
-                    .font(.system(size: 24, weight: .semibold))
-                    .padding(.horizontal, 40)
-                    .padding(.vertical, 16)
-            }
-            .buttonStyle(.card)
-            .padding(.top, 12)
-        }
-        // Lower than centre, where the backdrop darkens behind the text.
-        .padding(.top, 260)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// DEBUG: jump straight to a library named by the RIVULET_OPEN_LIBRARY env
@@ -784,7 +748,9 @@ struct TVSidebarView: View {
     }
 
     private func presentDetail(_ item: MediaItem, from top: UIViewController) {
-        if item.kind == .episode || item.kind == .season {
+        if item.kind == .season {
+            top.present(SeasonDetailViewController(season: item), animated: true)
+        } else if item.kind == .episode {
             let page = MediaItemDetailPageViewController(
                 item: item,
                 seriesTitle: nil,
@@ -874,10 +840,23 @@ struct TVSidebarView: View {
         let current = "\(version) (\(build))"
 
         if current != lastSeenBuild {
-            if WhatsNewView.features(for: current) != nil {
+            // A new install sets up instead; What's New is for updates.
+            if setupComplete, WhatsNewView.features(for: current) != nil {
                 showWhatsNew = true
             }
             lastSeenBuild = current
         }
     }
+}
+
+/// The setup landing, standing in for the shell until the user finishes it.
+private struct SetupLandingHost: UIViewControllerRepresentable {
+    let onDone: () -> Void
+
+    func makeUIViewController(context: Context) -> SetupLandingViewController {
+        let vc = SetupLandingViewController()
+        vc.onDone = onDone
+        return vc
+    }
+    func updateUIViewController(_ vc: SetupLandingViewController, context: Context) {}
 }

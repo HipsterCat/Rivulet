@@ -50,6 +50,7 @@ enum JellyfinMediaMapper {
         case "Season": return .season
         case "Episode": return .episode
         case "BoxSet": return .collection
+        case "Playlist": return .playlist
         case "Person": return .person
         default: return .unknown
         }
@@ -89,9 +90,13 @@ enum JellyfinMediaMapper {
 
     static func artwork(_ dto: JFItem, baseURL: URL) -> MediaArtwork {
         let primary = imageURL(baseURL, itemID: dto.id, type: "Primary", tag: dto.imageTags?["Primary"])
-        let backdrop = imageURL(baseURL, itemID: dto.id, type: "Backdrop", tag: dto.backdropImageTags?.first)
-            ?? imageURL(baseURL, itemID: dto.parentBackdropItemId, type: "Backdrop",
-                        tag: dto.parentBackdropImageTags?.first)
+        // A playlist's card is its Primary collage, filled to 16:9.
+        let backdrop = dto.type == "Playlist"
+            ? primary?.appending(queryItems: [URLQueryItem(name: "fillWidth", value: "\(MediaPlaylist.cardSize.width)"),
+                                              URLQueryItem(name: "fillHeight", value: "\(MediaPlaylist.cardSize.height)")])
+            : imageURL(baseURL, itemID: dto.id, type: "Backdrop", tag: dto.backdropImageTags?.first)
+                ?? imageURL(baseURL, itemID: dto.parentBackdropItemId, type: "Backdrop",
+                            tag: dto.parentBackdropImageTags?.first)
         let logo = imageURL(baseURL, itemID: dto.id, type: "Logo", tag: dto.imageTags?["Logo"])
             ?? imageURL(baseURL, itemID: dto.parentLogoItemId, type: "Logo", tag: dto.parentLogoImageTag)
         return MediaArtwork(poster: primary, backdrop: backdrop, thumbnail: primary, logo: logo)
@@ -192,7 +197,8 @@ enum JellyfinMediaMapper {
             bitrate: s.bitRate,
             videoRange: range,
             isDefault: s.isDefault ?? false,
-            scanType: s.isInterlaced.map { $0 ? "interlaced" : "progressive" }
+            scanType: s.isInterlaced.map { $0 ? "interlaced" : "progressive" },
+            hasHDR10Plus: s.videoRangeType?.hasSuffix("HDR10Plus") == true
         )
     }
 
@@ -320,7 +326,8 @@ enum JellyfinMediaMapper {
     // MARK: - Detail
 
     static func detail(
-        _ dto: JFItem, nextEpisode: JFItem?, providerID: String, baseURL: URL, token: String
+        _ dto: JFItem, nextEpisode: JFItem?, trailers: [JFItem] = [], specialFeatures: [JFItem] = [],
+        providerID: String, baseURL: URL, token: String
     ) -> MediaItemDetail {
         let item = item(dto, providerID: providerID, baseURL: baseURL)
         let itemID = dto.id ?? ""
@@ -370,13 +377,31 @@ enum JellyfinMediaMapper {
             trailerURL: nil,
             contentRating: dto.officialRating,
             regionOfOrigin: dto.productionLocations?.first,
-            rating: MediaRating.preferred(
-                critic: MediaRating(dto.criticRating.map { $0 / 10 }, source: .rottenTomatoes),
-                audience: MediaRating(dto.communityRating, source: .unknown)
-            ),
+            ratings: MediaRating.ordered([
+                MediaRating(dto.criticRating.map { $0 / 10 }, source: .rottenTomatoes),
+                MediaRating(dto.communityRating, source: .unknown),
+            ]),
             nextEpisode: nextEpisode.map { self.item($0, providerID: providerID, baseURL: baseURL) },
             collections: [],
+            extras: trailers.compactMap { extra($0, providerID: providerID, baseURL: baseURL, isTrailer: true) }
+                + specialFeatures.compactMap { extra($0, providerID: providerID, baseURL: baseURL, isTrailer: false) },
             externalIDs: externalIDs(dto.providerIds)
+        )
+    }
+
+    /// A local trailer or special feature. It is a library item, so its id plays it.
+    static func extra(_ dto: JFItem, providerID: String, baseURL: URL, isTrailer: Bool) -> MediaItemDetail.Extra? {
+        guard let id = dto.id else { return nil }
+        // "BehindTheScenes" -> Plex's "behindTheScenes"
+        let type = dto.extraType.map { $0.prefix(1).lowercased() + $0.dropFirst() }
+        return MediaItemDetail.Extra(
+            id: id,
+            title: dto.name ?? "",
+            thumbnailURL: imageURL(baseURL, itemID: id, type: "Primary", tag: dto.imageTags?["Primary"]),
+            duration: JellyfinTicks.seconds(dto.runTimeTicks),
+            playbackKey: id,
+            providerID: providerID,
+            subtype: isTrailer ? .trailer : ExtraSubtype.from(subtype: type, extraType: nil)
         )
     }
 

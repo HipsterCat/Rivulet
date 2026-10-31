@@ -5,14 +5,9 @@
 //  EPGGuideView.swift
 //  Rivulet
 //
-//  UHF-style Live TV guide ported from the PlexGuide (Flume) project.
-//
-//  High-performance EPG grid backed by a UIKit `UICollectionView` with a custom
-//  layout: virtualized (fast with large lineups), a sticky channel column
-//  (pinned left, scrolls vertically), a sticky time ruler (pinned top, scrolls
-//  horizontally), a single "now" line, and a fade where cells pass under the
-//  column. Adapted to Rivulet's `UnifiedChannel` / `UnifiedProgram` data and
-//  Rivulet's player (selection is handed back to SwiftUI via `onSelect`).
+//  Live TV guide grid: a virtualized UICollectionView with a sticky channel
+//  column, a sticky time ruler and a "now" line. Selection goes back to SwiftUI
+//  through `onSelect`.
 //
 
 import SwiftUI
@@ -392,27 +387,10 @@ struct EPGGuide: UIViewRepresentable {
             }
         }
 
-        /// Hold Left at the start of the timeline instead of letting it escape
-        /// to the sidebar. `apply` builds one section per channel and sorts that
-        /// channel's programmes by start time, so `item == 0` is the earliest
-        /// programme in the row: the leftmost cell. There is nothing focusable
-        /// to its left, so the focus engine walks up the chain and hands focus
-        /// to the enclosing `.sidebarAdaptable` TabView. That is the sidebar
-        /// opening on its own, which is what makes the guide feel like it
-        /// cannot be scrolled back left once the user has moved right.
-        ///
-        /// This is deliberately `shouldUpdateFocusIn` and NOT `pressesBegan`.
-        /// Siri Remote swipes arrive as indirect touches and never synthesize
-        /// arrow `UIPress` events, so a press handler would only catch the
-        /// click wheel (and a keyboard in the Simulator) and would silently do
-        /// nothing for anyone who swipes. Both input paths ultimately request a
-        /// focus update, so vetoing here covers both.
-        ///
-        /// There is also no backward scrolling to offer. `setupStartTime` pins
-        /// `timelineStart` to the current half hour and fetching only ever runs
-        /// forward, so there is no past programming loaded to reveal; scrolling
-        /// left would just expose empty grid. Do not "fix" this by allowing the
-        /// move through. The edge is a real boundary, not a missing feature.
+        /// Holds Left on a row's first programme (`item == 0`) so focus does not
+        /// escape to the sidebar. Vetoed here rather than in `pressesBegan` so
+        /// swipes are caught too. The timeline starts at the current half hour
+        /// and never loads the past, so there is nothing to the left.
         func collectionView(_ collectionView: UICollectionView,
                             shouldUpdateFocusIn context: UICollectionViewFocusUpdateContext) -> Bool {
             if context.focusHeading == .up || context.focusHeading == .down {
@@ -861,15 +839,9 @@ final class EPGContainerView: UIView {
         }
     }
 
-    /// Symmetric boundary handoff from the top programme row back to the last
-    /// focused category pill. Called only for a declined Up press or a gated
-    /// indirect-touch Up swipe while section zero owns focus.
-    ///
-    /// Returns false when there is no realized pill to hand off to. The
-    /// remembered index survives a `reloadData()` that shortens the category
-    /// list, and `cellForItem` is nil for anything not on screen right now.
-    /// The press caller must not swallow the arrow in that case, or Up dead-ends
-    /// with no way back to the pills to refresh the remembered index.
+    /// Hands focus from the top programme row back to the last category pill.
+    /// Returns false when that pill is not on screen; the caller must then let
+    /// the press through, or Up dead-ends.
     @discardableResult
     func moveFocusToCategories() -> Bool {
         guard pendingCategoryFocusTarget == nil,
@@ -1417,6 +1389,9 @@ final class ProgramCellView: UICollectionViewCell {
     static let reuseID = "ProgramCellView"
     private let titleLabel = UILabel()
     private let subtitleLabel = UILabel()
+    /// "NEW" or "LIVE" after the second line (#429).
+    private let tagLabel = PaddingLabel()
+    private lazy var detailRow = UIStackView(arrangedSubviews: [subtitleLabel, tagLabel])
     private let stack = UIStackView()
     private let card = UIView()
     private var stackLeading: NSLayoutConstraint!
@@ -1450,11 +1425,20 @@ final class ProgramCellView: UICollectionViewCell {
         subtitleLabel.numberOfLines = 1
         subtitleLabel.lineBreakMode = .byTruncatingTail
 
+        tagLabel.font = .systemFont(ofSize: 15, weight: .bold)
+        tagLabel.insets = UIEdgeInsets(top: 3, left: 7, bottom: 3, right: 7)
+        tagLabel.layer.cornerRadius = 5
+        tagLabel.layer.cornerCurve = .continuous
+        tagLabel.clipsToBounds = true
+        tagLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        detailRow.spacing = 8
+        detailRow.alignment = .center
+
         stack.axis = .vertical
         stack.spacing = 2
         stack.alignment = .leading
         stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(subtitleLabel)
+        stack.addArrangedSubview(detailRow)
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
 
@@ -1514,10 +1498,12 @@ final class ProgramCellView: UICollectionViewCell {
     }
 
     func configure(_ program: UnifiedProgram, isRecording: Bool = false) {
-        titleLabel.text = program.title
-        let sub = program.subtitle
-        subtitleLabel.text = sub
-        subtitleLabel.isHidden = (sub?.isEmpty ?? true)
+        titleLabel.text = program.displayTitle
+        subtitleLabel.text = program.guideDetail
+        subtitleLabel.isHidden = program.guideDetail == nil
+        tagLabel.text = program.guideTag
+        tagLabel.isHidden = program.guideTag == nil
+        detailRow.isHidden = subtitleLabel.isHidden && tagLabel.isHidden
         setRecording(isRecording)
         applyFocus(false)
     }
@@ -1599,6 +1585,8 @@ final class ProgramCellView: UICollectionViewCell {
         card.layer.borderColor = UIColor(white: 1, alpha: 0.1).cgColor
         titleLabel.textColor = focused ? UIColor(white: 0.08, alpha: 1) : .white
         subtitleLabel.textColor = focused ? UIColor(white: 0.08, alpha: 0.6) : UIColor(white: 1, alpha: 0.7)
+        tagLabel.textColor = focused ? UIColor(white: 0.08, alpha: 0.8) : .white
+        tagLabel.backgroundColor = focused ? UIColor(white: 0, alpha: 0.1) : UIColor(white: 1, alpha: 0.2)
     }
 }
 
@@ -1711,7 +1699,7 @@ final class ChannelColumnView: UICollectionReusableView {
         guard let url = currentLogoURL else { return }
 
         logoLoadTask = Task { [weak self] in
-            let image = await ImageCacheManager.shared.image(for: url, quality: .thumb)
+            let image = await ImageCacheManager.shared.image(for: url, quality: .logo)
             guard let self,
                   !Task.isCancelled,
                   self.currentLogoURL == url
@@ -1862,48 +1850,20 @@ final class CornerView: UICollectionReusableView {
 
 // MARK: - Info bar
 
-/// Plex-style guide header: a poster + details on the left, scrolling beneath
-/// the grid. Uses the focused programme's icon (from XMLTV) or the channel logo.
+/// Guide header: the focused programme's details on the left, scrolling
+/// beneath the grid. No poster slot: the text stays put whatever art a
+/// programme has (#360), and the art itself is the guide backdrop.
 struct GuideInfoBar: View {
     let channel: UnifiedChannel?
     let program: UnifiedProgram?
 
-    /// Programme artwork for the poster, prioritising a 2:3 portrait image.
-    /// Landscape images are NEVER shown in the 2:3 poster slot — they route
-    /// to the guide backdrop instead, while the poster slot falls back to the
-    /// channel logo.
-    private var programImageURL: URL? {
-        if let poster = program?.posterURL {
-            if EPGImageClassifier.shared.isLandscape(poster) {
-                return nil
-            }
-            return poster
-        }
-        if let icon = program?.iconURL {
-            if program?.landscapeURL == icon || EPGImageClassifier.shared.isLandscape(icon) {
-                return nil
-            }
-            return icon
-        }
-        return nil
-    }
-
-    @State private var loadedPoster: (url: URL, image: UIImage)?
-
     var body: some View {
         content
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .task(id: programImageURL) { await loadPoster(programImageURL) }
     }
-
-    /// Fixed poster height; width follows the image's own aspect ratio so a
-    /// 2:3 poster shows 2:3 and a 16:9 fallback shows 16:9 (never cropped).
-    private let posterHeight: CGFloat = EPGTheme.miniPlayerSize.height
 
     private var content: some View {
         HStack(alignment: .top, spacing: 30) {
-            poster
-
             VStack(alignment: .leading, spacing: 10) {
                 if let channel {
                     Text(channelLine(channel))
@@ -1936,37 +1896,6 @@ struct GuideInfoBar: View {
         .padding(.bottom, 9)
     }
 
-    /// 2:3 poster box width.
-    private var posterWidth: CGFloat { posterHeight * 2.0 / 3.0 }
-
-    /// The 2:3 poster slot, only when the programme has portrait artwork. No
-    /// channel-logo stand-in: the logo is already in the channel column, and
-    /// squeezed into a poster frame it read as a broken poster. Most IPTV
-    /// guides carry no portrait art, so there the info text starts at the edge.
-    /// Nothing is drawn until the image is loaded AND measured portrait:
-    /// drawing during the load showed an empty frame, or the wide art, that
-    /// then vanished.
-    @ViewBuilder private var poster: some View {
-        if let loaded = loadedPoster, loaded.url == programImageURL {
-            ZStack {
-                EPGTheme.surface
-                Image(uiImage: loaded.image).resizable().aspectRatio(contentMode: .fit)
-            }
-            .frame(width: posterWidth, height: posterHeight)
-            .clipShape(RoundedRectangle(cornerRadius: EPGTheme.columnCorner))
-            .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
-        }
-    }
-
-    /// Loads and measures the poster; keeps it only when it is portrait.
-    private func loadPoster(_ url: URL?) async {
-        guard let url, !EPGImageClassifier.shared.isLandscape(url),
-              let image = await ImageCacheManager.shared.image(for: url) else { return }
-        let kind = await EPGImageClassifier.shared.classify(url) { image.size }
-        guard !Task.isCancelled, kind == .portrait else { return }
-        loadedPoster = (url, image)
-    }
-
     private func channelLine(_ channel: UnifiedChannel) -> String {
         if let number = channel.channelNumber { return "\(number) · \(channel.name)" }
         return channel.name
@@ -1977,6 +1906,3 @@ struct GuideInfoBar: View {
         return "\(program.startTime.formatted(f)) — \(program.endTime.formatted(f))"
     }
 }
-
-/// Dynamically inspects artwork aspect ratio to guarantee landscape images
-/// are never placed in the 2:3 poster slot, falling back to the channel logo.

@@ -101,7 +101,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "TV-14",
             regionOfOrigin: "United States",
-            rating: MediaRating(8.2, source: .imdb),
+            ratings: MediaRating.ordered([MediaRating(8.2, source: .imdb)]),
             nextEpisode: episode(),
             collections: ["Sandbox Samples"],
             extras: [
@@ -111,6 +111,7 @@ enum MockDetailFixtures {
                     thumbnailURL: thumbURL,
                     duration: 142,
                     playbackKey: nil,
+                    providerID: providerID,
                     subtype: .trailer
                 ),
                 MediaItemDetail.Extra(
@@ -119,6 +120,7 @@ enum MockDetailFixtures {
                     thumbnailURL: thumbURL,
                     duration: 310,
                     playbackKey: nil,
+                    providerID: providerID,
                     subtype: .behindTheScenes
                 )
             ],
@@ -150,7 +152,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "PG-13",
             regionOfOrigin: "Canada",
-            rating: MediaRating(7.4, source: .imdb),
+            ratings: MediaRating.ordered([MediaRating(7.4, source: .imdb)]),
             nextEpisode: nil,
             collections: ["Sandbox Samples"],
             extras: [
@@ -160,6 +162,7 @@ enum MockDetailFixtures {
                     thumbnailURL: thumbURL,
                     duration: 118,
                     playbackKey: nil,
+                    providerID: providerID,
                     subtype: .trailer
                 )
             ],
@@ -182,7 +185,7 @@ enum MockDetailFixtures {
             trailerURL: nil,
             contentRating: "TV-14",
             regionOfOrigin: "United States",
-            rating: MediaRating(8.0, source: .imdb),
+            ratings: MediaRating.ordered([MediaRating(8.0, source: .imdb)]),
             nextEpisode: episode(id: "ep-4", title: "Silt", number: 4, progress: 0),
             collections: [],
             extras: [],
@@ -244,7 +247,7 @@ enum MockDetailFixtures {
                 trailerURL: nil,
                 contentRating: "TV-14",
                 regionOfOrigin: "United States",
-                rating: nil,
+                ratings: [],
                 nextEpisode: nil,
                 collections: []
             )
@@ -445,7 +448,7 @@ private extension MediaItemDetail {
             trailerURL: trailerURL,
             contentRating: contentRating,
             regionOfOrigin: regionOfOrigin,
-            rating: rating,
+            ratings: ratings,
             nextEpisode: nextEpisode,
             collections: collections,
             extras: extras,
@@ -467,7 +470,7 @@ private extension MediaItemDetail {
             trailerURL: trailerURL,
             contentRating: contentRating,
             regionOfOrigin: regionOfOrigin,
-            rating: rating,
+            ratings: ratings,
             nextEpisode: nextEpisode,
             collections: collections,
             extras: extras,

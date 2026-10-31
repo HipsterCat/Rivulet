@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  HubHeaderView.swift
-//  Rivulet
-//
-//  Section headers above each home row. Two distinct styles in SwiftUI
-//  that must both be supported here:
-//
-//   - InfiniteContentRow / ContentRow (Continue Watching, Recently Added,
-//     Personalized Recommendations): 30pt semibold, foreground white-0.6,
-//     with no inline count indicator.
-//
-//   - WatchlistHubRow: ScaledDimensions.sectionTitleSize (30pt) bold,
-//     full white. No count.
-//
-//  Style is set per-configure via `Style.swiftUIInfiniteRow` or
-//  `.swiftUIWatchlist` — the dataSource picks the right one per section.
-//
+// Home row section headers. `.swiftUIInfiniteRow`: 31pt semibold, white 0.55 (MediaRowMetrics).
+// `.swiftUIWatchlist`: 30pt bold, full white. Neither shows a count.
 
 import UIKit
 
@@ -34,6 +19,7 @@ final class HubHeaderView: UICollectionReusableView {
     private let countLabel = UILabel()
     private let badge = SourceBadgeView(style: .inline)
     private let stack = UIStackView()
+    private var stackBottom: NSLayoutConstraint!
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -61,6 +47,7 @@ final class HubHeaderView: UICollectionReusableView {
         stack.addArrangedSubview(countLabel)
         addSubview(stack)
 
+        stackBottom = stack.bottomAnchor.constraint(equalTo: bottomAnchor)
         NSLayoutConstraint.activate([
             // Leading 0: the section's contentInsets.leading already insets the
             // header (supplementariesFollowContentInsets defaults to true), so 0
@@ -68,7 +55,7 @@ final class HubHeaderView: UICollectionReusableView {
             // non-zero value double-insets the header to the right of the cards.
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 0),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -48),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+            stackBottom
         ])
     }
 
@@ -84,13 +71,15 @@ final class HubHeaderView: UICollectionReusableView {
                    sourceBadge: String? = nil) {
         switch style {
         case .swiftUIInfiniteRow:
-            titleLabel.font = .systemFont(ofSize: 34, weight: .semibold)
-            titleLabel.textColor = UIColor.white.withAlphaComponent(0.9)
+            titleLabel.font = MediaRowMetrics.headerFont
+            titleLabel.textColor = MediaRowMetrics.headerColor
         case .swiftUIWatchlist:
-            titleLabel.font = .systemFont(ofSize: ScaledDimensions.sectionTitleSize, weight: .bold)
+            titleLabel.font = .systemFont(ofSize: MediaRowMetrics.sectionTitleSize, weight: .bold)
             titleLabel.textColor = .white
         }
         titleLabel.text = title
+        // Rests the baseline `headerBaselineInset` above the header's bottom edge.
+        stackBottom.constant = -titleLabel.font.descender - MediaRowMetrics.headerBaselineInset
         badge.text = sourceBadge
 
         countLabel.text = nil

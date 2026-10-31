@@ -24,6 +24,15 @@ struct RivuletApp: App {
         // which returns false for an unset key, so register the default here
         // before any read. An explicit user choice still wins.
         UserDefaults.standard.register(defaults: ["showHomeHero": true])
+        // Every surface is dark artwork, so menus, popups and alerts stay dark in Light mode
+        // too; Settings alone follows the system. On the window: SwiftUI's preferredColorScheme
+        // never reached UIKit's presented popups.
+        NotificationCenter.default.addObserver(forName: UIWindow.didBecomeVisibleNotification,
+                                               object: nil, queue: .main) { note in
+            let window = note.object as? UIWindow
+            MainActor.assumeIsolated { window?.overrideUserInterfaceStyle = .dark }
+        }
+        AetherPlayer.settleFELDefault(existingInstall: PlexAuthManager.shared.hasCredentials || JellyfinSession.account != nil)
         // Start the path monitor now; its first reading arrives after a delay.
         _ = NetworkPathMonitor.shared
 
@@ -37,110 +46,51 @@ struct RivuletApp: App {
             MusicQueue.shared.stop()
             MusicQueue.shared.clear()
             PlexDataStore.shared.reset()
+            PlexExtraServers.shared.clear()
             // Older builds recorded token-bearing URLs in the cache metadata.
             Task { await ImageCacheManager.shared.clearAll() }
         }
-        JellyfinSession.onChanged = { JellyfinDataStore.shared.reload() }
+        JellyfinSession.onChanged = { ServerDataStore.shared.reload() }
         PlexLiveTimelineKeepalive.releaseOtherSession = { JellyfinLiveTVProvider.closeLiveStream($0) }
         PlexUserProfileManager.onProfileChanged = {
             // The queue reports progress with whichever token is current.
             MusicQueue.shared.stop()
             MusicQueue.shared.clear()
             await PlexDataStore.shared.onProfileSwitched()
-            // A restricted profile does not see the Jellyfin server.
-            JellyfinDataStore.shared.reload()
+            // The previous profile's other Plex servers go now; a restricted
+            // profile does not see the Jellyfin server.
+            MediaProviderRegistry.shared.populateFromCurrentAuth()
+            ServerDataStore.shared.reload()
+        }
+        ContinueWatchingRow.shared.fetchShowKeys = { providerID, showIDs in
+            await MediaProviderRegistry.shared.provider(for: providerID)?.showIdentityKeys(for: showIDs) ?? [:]
+        }
+        ContinueWatchingRow.shared.onResolved = { await TopShelfFeed.refresh() }
+        PlexExtraServers.onChanged = {
+            MediaProviderRegistry.shared.populateFromCurrentAuth()
+            ServerDataStore.shared.reload()
+        }
+        PlexUserProfileManager.onProfileEntered = { token in
+            Task { await PlexExtraServers.shared.refresh(plexToken: token) }
         }
         PlexUserProfileManager.onInitialProfileSelected = {
             LibrarySettingsManager.shared.onProfileSwitched()
-            JellyfinDataStore.shared.reload()
+            ServerDataStore.shared.reload()
         }
 
         #if !DEBUG
-        // Sentry start is DEFERRED off the launch window. Starting it in init()
-        // fired envelope/session uploads to sentry.io before the network nexus
-        // was ready — every cold launch spammed `NECP [22: Invalid argument]`
-        // / `-1000 bad URL` failures (visible in release device logs) AND paid
-        // its swizzling + session-tracking cost on the critical path. A few
-        // seconds later the network is up, the uploads succeed, and the launch
-        // window is clean. Trade-off: a crash in the first ~3s is not captured
-        // (rare; acceptable given the launch-perf + log-noise win).
+        // Sentry starts 3 s after launch: in init() its uploads beat the network
+        // (`NECP [22]`, `-1000 bad URL`) and its swizzling cost the launch. A crash before then is lost.
         Task.detached(priority: .utility) {
-            // No DSN baked into the release build — skip Sentry entirely rather
-            // than initializing a dead SDK. SentryBridge stays inactive so
-            // breadcrumb/capture calls no-op instead of spamming "SDK is
-            // disabled" fatals.
+            // No DSN baked into the release build: skip Sentry so SentryBridge calls no-op.
             guard SentryConfig.isEnabled else { return }
             try? await Task.sleep(for: .seconds(3))
-            SentrySDK.start { options in
-                options.dsn = Secrets.sentryDSN
-                options.debug = false
-                // Transactions we deliberately measure stay at full fidelity;
-                // everything else is sampled hard.
-                //
-                // This was a flat 1.0, which meant `enableSwizzling` was sending
-                // a transaction for EVERY UIViewController appearance and HTTP
-                // request at 100%. On a small performance quota that ambient
-                // auto-instrumentation is what consumes it, and once the quota
-                // is hit Sentry drops spans server-side — which would bias the
-                // named measurements we actually reason from rather than just
-                // thinning them.
-                options.tracesSampler = { context in
-                    context.transactionContext.name == "live.join"
-                        ? NSNumber(value: 1.0)
-                        : NSNumber(value: 0.05)
-                }
-                // Only consulted if the sampler ever returns nil.
-                options.tracesSampleRate = 0.05
-                options.attachStacktrace = true
-                options.enableAutoSessionTracking = true
-                options.enableCaptureFailedRequests = true
-                options.enableSwizzling = true
-                // App Hang tracking. On tvOS the SDK uses ANR Tracker V2
-                // unconditionally (no `enableAppHangTrackingV2` toggle exists
-                // in 9.x — it was made GA and removed), which snapshots ALL
-                // threads with stack traces at the moment the watchdog fires.
-                // This is what backs RIVULET-41. The reason that issue's
-                // in-app frames show as <unknown> is missing/mismatched dSYMs
-                // for the release, NOT a tracker-version problem — ensure
-                // dSYMs upload for each App Store build so the frames resolve.
-                options.enableAppHangTracking = true
-                options.appHangTimeoutInterval = 2
-                // Also report non-fully-blocking hangs (partial main-thread
-                // stalls), not just fully-blocked ones. Defaults true in 9.x;
-                // set explicitly so a future SDK default flip can't silence them.
-                options.enableReportNonFullyBlockingAppHangs = true
-
-                options.beforeSend = { event in
-                    // Drop cancelled URL request errors — these are normal when navigating away
-                    if let exceptions = event.exceptions,
-                       exceptions.contains(where: { $0.value?.contains("Code=-999") == true || $0.value?.contains("cancelled") == true }) {
-                        return nil
-                    }
-                    if let message = event.message?.formatted,
-                       message.contains("Code=-999") || (message.contains("NSURLErrorDomain") && message.contains("cancelled")) {
-                        return nil
-                    }
-                    // Plex passes `X-Plex-Token` as a URL query parameter, and
-                    // IPTV providers pass username/password the same way, so any
-                    // URL that reaches an event carries a live credential. Call
-                    // sites use SensitiveDataRedactor directly, but this hook is
-                    // the actual guarantee: it also covers events the SDK builds
-                    // itself (enableCaptureFailedRequests attaches the failing
-                    // request URL) and NSError descriptions with an embedded URL,
-                    // neither of which any call site can reach.
-                    return SentryEventRedaction.redact(event)
-                }
-            }
-            SentryBridge.isActive = false
-
-            // Seed the App Hang triage scope so the very first hang event after
-            // launch already carries a screen tag. Updated thereafter via
-            // AppHangContext as the user navigates and plays. See RIVULET-41.
-            await MainActor.run {
-                AppHangContext.setScreen("launch")
-            }
+            await Self.startSentry()
         }
         #endif
+
+        let info = Bundle.main.infoDictionary ?? [:]
+        DiagLog.notice(.launch, "Launch \(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?")) tvOS \(ProcessInfo.processInfo.operatingSystemVersionString) signed_in=\(PlexAuthManager.shared.hasCredentials) setup=\(UserDefaults.standard.bool(forKey: "setupComplete"))")
 
         // NowPlayingService disabled — AVPlayerViewController handles Now Playing natively.
         // NowPlayingService.shared.initialize()
@@ -168,14 +118,17 @@ struct RivuletApp: App {
         // AppHangContext as the user navigates and plays. See RIVULET-41.
         // Already on the main actor here, so no hop.
         AppHangContext.setScreen("launch")
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(60))
+            SettingsUsageTelemetry.sendIfDue()
+        }
     }
     #endif
 
     var sharedModelContainer: ModelContainer = {
-        // Runs BEFORE init()'s body (Swift initializes stored properties first),
-        // so this is the earliest app code on the launch path and a prime suspect
-        // for the ~2.2s that used to sit unattributed between init and the
-        // sidebar's first task. Opening a 7-model store is not free.
+        // Runs before init()'s body, so this is the earliest app code at launch.
+        // Opening a 7-model store is not free.
         StartupTimer.mark("sharedModelContainer build start")
         defer { StartupTimer.mark("sharedModelContainer build end") }
         let schema = Schema([

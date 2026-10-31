@@ -19,14 +19,9 @@ actor DispatcharrService {
     let baseURL: URL
     let apiToken: String?
 
-    /// Dispatcharr channel profile to scope the playlist and guide to, or nil for
-    /// every channel. In Dispatcharr this is a PATH segment, not a query item and
-    /// not something the API token implies: `apps/output/urls.py` routes
-    /// `^m3u(?:/(?P<profile_name>[^/]+))?/?$`, and `generate_m3u` only filters on
-    /// `channelprofilemembership__channel_profile` when that segment is present.
-    /// The API key does not scope the playlist (the output endpoints do not
-    /// even authenticate), so without this segment the server correctly returns
-    /// every channel regardless of which profiles exist. See GitHub issue #246.
+    /// Dispatcharr channel profile for the playlist and guide, or nil for every
+    /// channel. It is a path segment (`m3u/<profile>`); the API key does not scope
+    /// output (#246).
     let channelProfile: String?
 
     let session: URLSession
@@ -62,15 +57,8 @@ actor DispatcharrService {
         return DispatcharrService(baseURL: url, apiToken: apiToken, channelProfile: profile)
     }
 
-    /// Separates a pasted address into the server base URL and, when the user
-    /// pasted a full endpoint, the channel profile that followed it.
-    ///
-    /// We still have to cut `/output/m3u` and `/output/epg` off the base so the
-    /// later `appendingPathComponent` calls do not double them up, but the
-    /// trailing segment after the endpoint is a Dispatcharr channel profile name
-    /// and is now kept rather than thrown away. Do not "simplify" this back to a
-    /// plain prefix truncation: discarding that segment is the bug behind
-    /// issue #246.
+    /// Splits a pasted address into the server base URL and the channel profile
+    /// after `/output/m3u` or `/output/epg`. Keep that trailing segment (#246).
     static func splitEndpointPath(from urlString: String) -> (baseURL: String, channelProfile: String?) {
         // Clean up the URL string
         var cleanedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -180,10 +168,10 @@ actor DispatcharrService {
 
     /// Fetch and parse EPG from Dispatcharr
     /// - Returns: Parsed EPG data
-    func fetchParsedEPG() async throws -> XMLTVParser.ParseResult {
+    func fetchParsedEPG(filter: XMLTVParser.GuideFilter? = nil) async throws -> XMLTVParser.ParseResult {
         let data = try await fetchEPG()
         let parser = XMLTVParser()
-        return try await parser.parse(data: data)
+        return try await parser.parse(data: data, filter: filter)
     }
 
     /// Signs in as a Dispatcharr user and returns that user's API key, so
@@ -225,6 +213,65 @@ actor DispatcharrService {
         return key
     }
 
+    // MARK: - Stream switching (#369)
+
+    /// The channel's streams in failover order, with the one playing now.
+    /// Needs an admin user's key: Dispatcharr answers 403 to anyone else.
+    func channelStreams(channelUUID: String) async throws -> DispatcharrChannelStreams {
+        struct Channel: Decodable { let id: Int }
+        struct Account: Decodable { let id: Int; let name: String }
+        struct Status: Decodable { let streamId: Int? }
+
+        var lookup = authenticatedRequest(
+            for: baseURL.appendingPathComponent("api/channels/channels/by-uuids", isDirectory: true), method: "POST")
+        lookup.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        lookup.httpBody = try JSONEncoder().encode(["uuids": [channelUUID]])
+        guard let channelID = try await decode([Channel].self, lookup).first?.id else {
+            throw DispatcharrError.notFound
+        }
+
+        let streams = try await decode([DispatcharrStream].self, authenticatedRequest(
+            for: baseURL.appendingPathComponent("api/channels/channels/\(channelID)/streams", isDirectory: true)))
+        // Names only label the rows, and a stopped channel has no status.
+        let accounts = (try? await decode([Account].self, authenticatedRequest(
+            for: baseURL.appendingPathComponent("api/m3u/accounts", isDirectory: true)))) ?? []
+        let status = try? await decode(Status.self, authenticatedRequest(
+            for: baseURL.appendingPathComponent("proxy/ts/status/\(channelUUID)")))
+
+        return DispatcharrChannelStreams(
+            streams: streams,
+            accountNames: Dictionary(accounts.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a }),
+            currentStreamID: status?.streamId)
+    }
+
+    /// Moves a running channel onto another of its streams, for every viewer of it.
+    func switchStream(channelUUID: String, to streamID: Int) async throws {
+        var request = authenticatedRequest(
+            for: baseURL.appendingPathComponent("proxy/ts/change_stream/\(channelUUID)"), method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(["stream_id": streamID])
+        // The reply echoes the provider URL, which carries credentials: never log it.
+        let (_, response) = try await session.data(for: request)
+        try validateResponse(response)
+    }
+
+    /// The channel uuid in a `/proxy/ts/stream/<uuid>` URL. Xtream-form URLs have none.
+    static func channelUUID(fromStreamURL url: URL) -> String? {
+        let parts = url.pathComponents
+        guard parts.count >= 2, parts[parts.count - 2] == "stream",
+              parts.dropLast(2).last == "ts", UUID(uuidString: parts[parts.count - 1]) != nil
+        else { return nil }
+        return parts[parts.count - 1]
+    }
+
+    private func decode<T: Decodable>(_ type: T.Type, _ request: URLRequest) async throws -> T {
+        let (data, response) = try await session.data(for: request)
+        try validateResponse(response)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(type, from: data)
+    }
+
     // MARK: - Private Methods
 
     func authenticatedRequest(for url: URL, method: String = "GET") -> URLRequest {
@@ -237,12 +284,8 @@ actor DispatcharrService {
         return request
     }
 
-    /// How Dispatcharr wants `token` presented. Its API authenticates an API
-    /// key (what its UI generates, sent as `X-API-Key`) or a JWT access token
-    /// (`Authorization: Bearer`). It has never accepted DRF's
-    /// `Authorization: Token`, which is what this used to send; nobody noticed
-    /// because the playlist and guide are not authenticated at all (they are
-    /// allowed by network), and nothing else here called the API.
+    /// How Dispatcharr wants `token` presented: an API key as `X-API-Key`, or a
+    /// JWT as `Authorization: Bearer`. It never accepts DRF's `Authorization: Token`.
     static func authorizationHeader(for token: String) -> (field: String, value: String)? {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -290,6 +333,36 @@ struct DispatcharrStatus: Sendable {
     }
 }
 
+// MARK: - Channel streams
+
+struct DispatcharrStream: Decodable, Sendable {
+    struct Stats: Decodable, Sendable {
+        let height: Int?
+        let sourceFps: Double?
+    }
+    let id: Int
+    let name: String
+    let m3uAccount: Int?
+    let streamStats: Stats?
+}
+
+struct DispatcharrChannelStreams: Sendable {
+    let streams: [DispatcharrStream]
+    let accountNames: [Int: String]
+    let currentStreamID: Int?
+
+    /// "TREX • 1080p60": the provider, then the picture Dispatcharr last measured.
+    func detail(for stream: DispatcharrStream) -> String? {
+        var picture: String?
+        if let height = stream.streamStats?.height {
+            let fps = stream.streamStats?.sourceFps.map { Int($0.rounded()) }
+            picture = "\(height)p" + (fps.map(String.init) ?? "")
+        }
+        let parts = [stream.m3uAccount.flatMap { accountNames[$0] }, picture].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " • ")
+    }
+}
+
 // MARK: - Errors
 
 enum DispatcharrError: LocalizedError {
@@ -328,19 +401,9 @@ extension DispatcharrService {
         Self.outputURL(base: baseURL, kind: "epg", channelProfile: channelProfile)
     }
 
-    /// Builds an output endpoint URL, appending the channel profile as its own
-    /// path segment when one is set. Dispatcharr scopes a playlist by profile
-    /// only through this segment, so a profile that is set but not appended has
-    /// no effect at all.
-    ///
-    /// `appendingPathComponent` performs the encoding: it escapes a space as
-    /// `%20` and leaves already-legal path characters alone, so a profile named
-    /// "Kids TV" yields `/output/m3u/Kids%20TV`. Interpolating the name into a
-    /// string instead would emit a raw space and produce a URL that fails to
-    /// construct.
-    ///
-    /// With no profile set this returns exactly `base/output/<kind>`, byte for
-    /// byte what every existing source already requests.
+    /// Builds an output endpoint URL, with the channel profile as its own path
+    /// segment. `appendingPathComponent` escapes the name ("Kids TV" becomes
+    /// `Kids%20TV`); with no profile this is `base/output/<kind>`.
     static func outputURL(base: URL, kind: String, channelProfile: String?) -> URL {
         let url = base.appendingPathComponent("output/\(kind)")
         guard let profile = normalizedProfile(channelProfile) else { return url }

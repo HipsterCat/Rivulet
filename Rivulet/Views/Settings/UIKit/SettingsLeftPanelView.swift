@@ -15,14 +15,23 @@ import UIKit
 
 final class SettingsLeftPanelView: UIView {
 
+    static let width: CGFloat = 870
+    /// Every explainer fits in this many lines at full size (`SettingsDescriptorLengthTests`).
+    static let descriptionLines = 3
+    static let descriptionFont = UIFont.preferredFont(forTextStyle: .body)
+
     private let iconContainer = UIView()
     private let iconView = UIImageView()
+    /// The focused App Icon option's artwork, shown in place of the page tile.
+    private let artworkView = UIImageView()
     private let descriptionLabel = UILabel()
     private let subtextLabel = UILabel()
     /// Page-level instruction shown under the icon (e.g. the reorder hint on the
     /// libraries page). Collapses to zero height when the page has no hint.
     private let hintLabel = UILabel()
     private var hintHeightZero: NSLayoutConstraint!
+    private var page: SettingsPage = .root
+    private var iconName: String?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -41,11 +50,17 @@ final class SettingsLeftPanelView: UIView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconContainer.addSubview(iconView)
 
-        descriptionLabel.font = .preferredFont(forTextStyle: .body)
+        artworkView.contentMode = .scaleAspectFill
+        artworkView.layer.cornerRadius = 40
+        artworkView.layer.cornerCurve = .continuous
+        artworkView.clipsToBounds = true
+        artworkView.isHidden = true
+        artworkView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(artworkView)
+
+        descriptionLabel.font = Self.descriptionFont
         descriptionLabel.textColor = .secondaryLabel
-        descriptionLabel.numberOfLines = 5
-        descriptionLabel.adjustsFontSizeToFitWidth = true
-        descriptionLabel.minimumScaleFactor = 12.0 / 29.0
+        descriptionLabel.numberOfLines = Self.descriptionLines
         descriptionLabel.textAlignment = .center
         descriptionLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(descriptionLabel)
@@ -57,7 +72,7 @@ final class SettingsLeftPanelView: UIView {
         addSubview(hintLabel)
 
         subtextLabel.font = .monospacedSystemFont(ofSize: 24, weight: .medium)
-        subtextLabel.textColor = UIColor.white.withAlphaComponent(0.35)
+        subtextLabel.textColor = SettingsPalette.dim
         subtextLabel.numberOfLines = 2
         subtextLabel.textAlignment = .center
         subtextLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -72,6 +87,12 @@ final class SettingsLeftPanelView: UIView {
             iconContainer.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconContainer.widthAnchor.constraint(equalToConstant: 540),
             iconContainer.heightAnchor.constraint(equalToConstant: 540),
+
+            // The Home Screen icon's 5:3, as wide as the tile.
+            artworkView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+            artworkView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+            artworkView.widthAnchor.constraint(equalTo: iconContainer.widthAnchor),
+            artworkView.heightAnchor.constraint(equalTo: artworkView.widthAnchor, multiplier: 3.0 / 5.0),
 
             iconView.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
             iconView.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
@@ -103,7 +124,7 @@ final class SettingsLeftPanelView: UIView {
 
     /// Reorder-style hint: an up/down glyph + text, dim like the description.
     private func hintAttributed(_ text: String) -> NSAttributedString {
-        let color = UIColor.white.withAlphaComponent(0.5)
+        let color = SettingsPalette.caption.resolvedColor(with: traitCollection)
         let result = NSMutableAttributedString()
         let cfg = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
         if let img = UIImage(systemName: "arrow.up.arrow.down", withConfiguration: cfg)?
@@ -122,12 +143,15 @@ final class SettingsLeftPanelView: UIView {
 
     /// Set the page icon (matching `pageInfo(for:)`). Crossfades when animated
     /// (on a page change), like the SwiftUI panel's symbol-replace transition.
-    func configure(page: SettingsPage, animated: Bool = false) {
+    func configure(page: SettingsPage, section: String? = nil, animated: Bool = false) {
         let info = SettingsDescriptorStore.pageInfo(for: page)
         let color = info.color
+        let icon = SettingsDescriptorStore.sectionIcon(for: page, section: section) ?? info.icon
+        self.page = page
+        iconName = icon
         let apply = {
             self.iconContainer.backgroundColor = color.withAlphaComponent(0.18)
-            self.iconView.image = UIImage(systemName: info.icon)
+            self.iconView.image = UIImage(systemName: icon)
             self.iconView.tintColor = color
         }
         if animated {
@@ -148,14 +172,33 @@ final class SettingsLeftPanelView: UIView {
         }
     }
 
+    /// Morphs the icon to the focused group's own symbol, or back to the page's.
+    func showSection(_ section: String?) {
+        let name = SettingsDescriptorStore.sectionIcon(for: page, section: section)
+            ?? SettingsDescriptorStore.pageInfo(for: page).icon
+        guard name != iconName, let image = UIImage(systemName: name) else { return }
+        iconName = name
+        iconView.setSymbolImage(image, contentTransition: .replace)
+    }
+
     /// Update the per-row description (crossfade), keyed by `focusedSettingId`.
     func show(id: String?, subtext: String? = nil) {
         let descriptor = id.flatMap { SettingsDescriptorStore.descriptor(for: $0) }
+        let artwork = id.flatMap(Self.appIconArtwork)
         UIView.transition(with: self, duration: 0.25, options: .transitionCrossDissolve) {
+            self.artworkView.image = artwork
+            self.artworkView.isHidden = artwork == nil
+            self.iconContainer.isHidden = artwork != nil
             self.descriptionLabel.text = descriptor?.description ?? " "
             self.descriptionLabel.alpha = descriptor != nil ? 1 : 0
             self.subtextLabel.text = subtext
             self.subtextLabel.isHidden = (subtext == nil)
         }
+    }
+
+    /// Artwork for an App Icon option row (`ai_<rawValue>`); nil for every other row.
+    private static func appIconArtwork(for id: String) -> UIImage? {
+        guard id.hasPrefix("ai_"), let icon = AppIcon(rawValue: String(id.dropFirst(3))) else { return nil }
+        return UIImage(named: "AppIconArt-\(icon.rawValue)")
     }
 }

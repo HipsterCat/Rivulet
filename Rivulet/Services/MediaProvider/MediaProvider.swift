@@ -64,6 +64,9 @@ protocol MediaProvider: Sendable, Identifiable {
     /// nil when it has none. Home asks for this per library on every reload,
     /// so a provider whose `hubs(in:)` costs more than one request overrides it.
     func recentlyAddedHub(in library: MediaLibrary) async throws -> MediaHub?
+    /// The library's titles on `trending`, in its order, at most `limit`.
+    /// Home's hero on a server with no TMDB index of its own. Default: none.
+    func trending(in library: MediaLibrary, from trending: [TMDBListItem], limit: Int) async throws -> [MediaItem]
     /// The library's collections (Plex collections, Jellyfin box sets), in
     /// the server's order. Default: none.
     func collections(in library: MediaLibrary) async throws -> [MediaItem]
@@ -119,11 +122,29 @@ protocol MediaProvider: Sendable, Identifiable {
     func addToWatchlist(_ ref: MediaItemRef) async throws
     func removeFromWatchlist(_ ref: MediaItemRef) async throws
 
+    // MARK: - Playlists (video)
+    var supportsPlaylists: Bool { get }
+    /// Regular and smart video playlists, sorted by title.
+    func videoPlaylists() async throws -> [MediaPlaylist]
+    /// Every row, all pages, in the server's order.
+    func playlistEntries(_ playlist: MediaItemRef) async throws -> PlaylistContents
+    func createPlaylist(title: String, seededWith items: [MediaItemRef]) async throws -> MediaPlaylist
+    func addToPlaylist(_ playlist: MediaItemRef, items: [MediaItemRef]) async throws
+    func removeFromPlaylist(_ playlist: MediaItemRef, entryID: String) async throws
+    /// `entries` is the order before the move; each backend derives what its server takes.
+    func movePlaylistEntry(_ playlist: MediaItemRef, entryID: String, toIndex: Int, in entries: [PlaylistEntry]) async throws
+    func renamePlaylist(_ playlist: MediaItemRef, title: String) async throws
+    func deletePlaylist(_ playlist: MediaItemRef) async throws
+
     // MARK: - Content advisory
 
     /// Provider-agnostic content advisory (Common Sense Media on Plex). Returns
     /// nil when the backend has none. Default = nil so backends opt in.
     func contentAdvisory(for ref: MediaItemRef) async throws -> ContentAdvisory?
+
+    /// Identity keys (`ContinueWatchingMerge`) for these shows, by show item id,
+    /// fetched in as few requests as the server allows. Default: none.
+    func showIdentityKeys(for showIDs: [String]) async -> [String: [String]]
 
     /// Skip markers (intro, credits, ...) for the item. Default: none.
     /// Best effort: a backend without the data returns an empty value.
@@ -147,6 +168,7 @@ extension MediaProvider {
         throw MediaProviderError.transcodeRequired
     }
     func playbackExtras(for itemRef: MediaItemRef, sourceID: String?) async -> PlaybackExtras { PlaybackExtras() }
+    func showIdentityKeys(for showIDs: [String]) async -> [String: [String]] { [:] }
     func contentAdvisory(for ref: MediaItemRef) async throws -> ContentAdvisory? { nil }
     func search(_ query: String, inLibraries libraryIDs: [String]) async throws -> [MediaItem] {
         try await search(query)
@@ -156,6 +178,7 @@ extension MediaProvider {
     func recentlyAddedHub(in library: MediaLibrary) async throws -> MediaHub? {
         try await hubs(in: library).first { $0.id == "\(library.id).recentlyAdded" }
     }
+    func trending(in library: MediaLibrary, from trending: [TMDBListItem], limit: Int) async throws -> [MediaItem] { [] }
     func letterCounts(in library: MediaLibrary) async throws -> [PlexFirstCharacter] { [] }
     func refreshMetadata(_ itemRef: MediaItemRef) async throws {
         throw MediaProviderError.backendSpecific(underlying: "refresh not supported")
@@ -163,6 +186,30 @@ extension MediaProvider {
     func canDeleteMedia() async -> Bool { false }
     func deleteMedia(_ itemRef: MediaItemRef) async throws {
         throw MediaProviderError.backendSpecific(underlying: "delete not supported")
+    }
+
+    var supportsPlaylists: Bool { false }
+    func videoPlaylists() async throws -> [MediaPlaylist] { [] }
+    func playlistEntries(_ playlist: MediaItemRef) async throws -> PlaylistContents {
+        PlaylistContents(entries: [], isSmart: false)
+    }
+    func createPlaylist(title: String, seededWith items: [MediaItemRef]) async throws -> MediaPlaylist {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
+    }
+    func addToPlaylist(_ playlist: MediaItemRef, items: [MediaItemRef]) async throws {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
+    }
+    func removeFromPlaylist(_ playlist: MediaItemRef, entryID: String) async throws {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
+    }
+    func movePlaylistEntry(_ playlist: MediaItemRef, entryID: String, toIndex: Int, in entries: [PlaylistEntry]) async throws {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
+    }
+    func renamePlaylist(_ playlist: MediaItemRef, title: String) async throws {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
+    }
+    func deletePlaylist(_ playlist: MediaItemRef) async throws {
+        throw MediaProviderError.backendSpecific(underlying: "playlists not supported")
     }
 }
 

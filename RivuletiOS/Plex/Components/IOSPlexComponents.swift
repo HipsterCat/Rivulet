@@ -218,6 +218,7 @@ struct IOSPlexPosterCard: View {
             )
             .modifier(TileSize(width: width, ratio: ratio))
             .plexWatchState(item)
+            .overlay(alignment: .topLeading) { editionBadge }
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .plexZoomSource(item)
 
@@ -236,9 +237,26 @@ struct IOSPlexPosterCard: View {
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel([item.showTitle, item.type == "episode" ? item.episodeCode : nil]
+        .accessibilityLabel([item.showTitle, item.type == "episode" ? item.episodeCode : nil, edition]
             .compactMap { $0 }.joined(separator: ", "))
         .accessibilityValue(item.watchStateDescription)
+    }
+
+    /// Plex edition ("Director's Cut"), so two editions sharing a poster tell apart (#413).
+    private var edition: String? { item.editionTitle?.isEmpty == false ? item.editionTitle : nil }
+
+    @ViewBuilder
+    private var editionBadge: some View {
+        if let edition {
+            Text(edition)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(.black.opacity(0.55), in: Capsule())
+                .padding(6)
+        }
     }
 }
 
@@ -341,6 +359,8 @@ struct IOSPlexHubRoute: Hashable {
 struct IOSPlexShelfHeader: View {
     let title: String
     var route: IOSPlexHubRoute?
+    /// The row's server, named while more than one is signed in, as on tvOS.
+    var badge: String?
 
     var body: some View {
         Group {
@@ -357,6 +377,16 @@ struct IOSPlexShelfHeader: View {
     private func label(chevron: Bool) -> some View {
         HStack(spacing: 4) {
             Text(title).font(.title3.bold())
+            if let badge {
+                Text(badge)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.quaternary, in: .capsule)
+                    .padding(.leading, 4)
+            }
             if chevron {
                 Image(systemName: "chevron.right")
                     .font(.subheadline.bold())
@@ -471,12 +501,14 @@ struct IOSPlexShelfView: View {
     var body: some View {
         let route = IOSPlexHubRoute(hub: hub)
         if hub.isContinueWatching {
+            // One row across every server, so no badge.
             IOSPlexRail(title: hub.displayTitle, route: route, kind: .landscape, items: hub.items) { item, width in
                 IOSPlexContinueCard(item: item, width: width)
                     .task(id: width) { await prefetchAhead(of: item, width: width) }
             }
         } else {
-            IOSPlexRail(title: hub.displayTitle, route: route, kind: .poster, items: hub.items) {
+            IOSPlexRail(title: hub.displayTitle, route: route, kind: .poster, items: hub.items,
+                        badge: plex.serverBadge(serverID: hub.serverID)) {
                 IOSPlexPosterCard(item: $0, width: $1)
             }
         }
@@ -500,6 +532,7 @@ struct IOSPlexRail<Tile: View>: View {
     var route: IOSPlexHubRoute?
     let kind: IOSShelfGeometry.Kind
     let items: [PlexMetadata]
+    var badge: String? = nil
     @ViewBuilder let tile: (PlexMetadata, CGFloat) -> Tile
 
     /// Each rail owns its zoom sources; an item can sit in several rows.
@@ -507,7 +540,7 @@ struct IOSPlexRail<Tile: View>: View {
 
     var body: some View {
         IOSShelfRow(kind: kind, items: items) {
-            IOSPlexShelfHeader(title: title, route: route)
+            IOSPlexShelfHeader(title: title, route: route, badge: badge)
         } tile: { item, width in
             NavigationLink(value: IOSPlexDetailRoute(item: item, scope: zoomScope)) { tile(item, width) }
                 .buttonStyle(.plain)
@@ -517,27 +550,85 @@ struct IOSPlexRail<Tile: View>: View {
     }
 }
 
-/// Adaptive poster grid for libraries and See All. Calls `loadMore` when the
-/// last tile appears.
+/// Adaptive poster grid for libraries and See All. A nil slot is an item not
+/// fetched yet and draws as a placeholder; `slotAppeared` reports each index shown.
 struct IOSPlexPosterGrid: View {
-    let items: [PlexMetadata]
-    var loadMore: (() -> Void)?
+    let slots: [PlexMetadata?]
+    var slotAppeared: ((Int) -> Void)?
     @Environment(\.horizontalSizeClass) private var sizeClass
     @ScaledMetric(relativeTo: .body) private var minimumWidth: CGFloat = 104
+    /// While iPhone Duo's fold runs down the grid's middle: the adaptive count rounded down to even.
+    @State private var evenColumns: Int?
+
+    init(slots: [PlexMetadata?], slotAppeared: ((Int) -> Void)?) {
+        self.slots = slots
+        self.slotAppeared = slotAppeared
+    }
+
+    /// A fully loaded list that pages by calling `loadMore` when the last tile appears.
+    init(items: [PlexMetadata], loadMore: (() -> Void)?) {
+        slots = items
+        slotAppeared = { [count = items.count] index in
+            if index == count - 1 { loadMore?() }
+        }
+    }
 
     var body: some View {
         let minimum = min(minimumWidth * (sizeClass == .regular ? 1.4 : 1), 260)
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: minimum), spacing: 12, alignment: .top)], spacing: 18) {
-            ForEach(items) { item in
-                NavigationLink(value: item) { IOSPlexPosterCard(item: item) }
-                    .buttonStyle(.plain)
-                    .plexContextMenu(item)
-                    .onAppear {
-                        if item.id == items.last?.id { loadMore?() }
+        let columns = evenColumns.map { Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: $0) }
+            ?? [GridItem(.adaptive(minimum: minimum), spacing: 12, alignment: .top)]
+        LazyVGrid(columns: columns, spacing: 18) {
+            ForEach(slots.indices, id: \.self) { index in
+                Group {
+                    if let item = slots[index] {
+                        NavigationLink(value: item) { IOSPlexPosterCard(item: item) }
+                            .buttonStyle(.plain)
+                            .plexContextMenu(item)
+                    } else {
+                        IOSPlexPosterPlaceholder()
                     }
+                }
+                .onAppear { slotAppeared?(index) }
             }
         }
         .padding(.horizontal, IOSShelfGeometry.leading)
+        // Inactive folds count too, so the grid doesn't reflow as the device folds.
+        .onGeometryChange(for: Int?.self) { proxy in
+            guard proxy.duoFoldDividesMiddle() else { return nil }
+            let fit = Int((proxy.size.width - 2 * IOSShelfGeometry.leading + 12) / (minimum + 12))
+            return max(2, fit - fit % 2)
+        } action: { evenColumns = $0 }
+    }
+}
+
+/// A poster tile's shape while its item loads, captions included, so the grid doesn't shift.
+private struct IOSPlexPosterPlaceholder: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.quaternary)
+                .aspectRatio(2 / 3, contentMode: .fit)
+            Text(" ").font(.footnote.weight(.semibold))
+            Text(" ").font(.caption)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+extension GeometryProxy {
+    /// iPhone Duo's fold where it crosses this view, in the view's space. Nil on
+    /// every other device, and while fully open unless `includeInactive`.
+    func duoFold(includeInactive: Bool = false) -> CGRect? {
+        guard #available(iOS 27.1, *) else { return nil }
+        return reservedRegions(kind: .division, options: includeInactive ? .includeInactive : []).first?.frame
+    }
+
+    /// True when iPhone Duo's fold, folded or not, runs down this view near its middle,
+    /// so an even column count puts the fold between columns. A pane beside a split
+    /// view's sidebar has the fold off to one side, and keeps its own count.
+    func duoFoldDividesMiddle() -> Bool {
+        guard let fold = duoFold(includeInactive: true), fold.height > fold.width else { return false }
+        return abs(fold.midX - size.width / 2) < size.width / 10
     }
 }
 

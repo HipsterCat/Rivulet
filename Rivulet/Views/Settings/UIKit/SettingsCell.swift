@@ -30,6 +30,17 @@ final class CapsuleBackgroundView: UIView {
 /// (`SettingsRowItem.header(_:)` is built on the unfocusable `.info` kind).
 /// The label is bottom-aligned, so the empty top of the cell IS the gap that
 /// separates one group from the previous one.
+/// Settings follows the system appearance, as tvOS Settings does. Light values measured off
+/// tvOS Settings in light mode: rows are white 0.24 over a ~0.87 gray, with black text.
+enum SettingsPalette {
+    static func adaptive(dark: UIColor, light: UIColor) -> UIColor {
+        UIColor { $0.userInterfaceStyle == .light ? light : dark }
+    }
+    static let text = adaptive(dark: .white, light: .black)
+    static let caption = adaptive(dark: .white.withAlphaComponent(0.5), light: .black.withAlphaComponent(0.45))
+    static let dim = adaptive(dark: .white.withAlphaComponent(0.35), light: .black.withAlphaComponent(0.4))
+}
+
 final class SettingsHeaderCell: UICollectionViewCell {
     static let reuseID = "SettingsHeaderCell"
 
@@ -51,12 +62,15 @@ final class SettingsHeaderCell: UICollectionViewCell {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    /// Not tertiaryLabel: the dynamic gray vanishes on the dark page.
+    static let captionColor = SettingsPalette.caption
+
     func configure(title: String) {
         // 31 = tvOS Callout. Measured off tvOS Settings' own captions: 21.0-21.5pt
         // cap height (31 x 0.70 = 21.7), against 27.0pt for a row title.
         label.attributedText = NSAttributedString(string: title.uppercased(), attributes: [
             .font: UIFont.systemFont(ofSize: 31, weight: .semibold),
-            .foregroundColor: UIColor.tertiaryLabel
+            .foregroundColor: Self.captionColor
         ])
     }
 }
@@ -64,13 +78,9 @@ final class SettingsHeaderCell: UICollectionViewCell {
 final class SettingsCell: UICollectionViewCell {
     static let reuseID = "SettingsCell"
 
-    /// How far the capsule grows on EVERY side when focused. Measured off tvOS
-    /// Settings at 4K: its rows go from 780.0 x 66.5pt at rest to 788.0 x 74.5pt
-    /// focused, i.e. exactly 4pt on all four sides.
-    ///
-    /// A scale factor cannot reproduce that, which is why this is an outset in
-    /// points: a row here is ~816pt wide and 58pt tall, so the `scale 1.04` this
-    /// replaced grew it 16.3pt per side horizontally against 1.3pt vertically.
+    /// Focus growth per side, an outset because a scale factor cannot match it.
+    /// Measured off tvOS Settings at 4K: 780.0 x 66.5pt at rest, 788.0 x 74.5pt
+    /// focused, so 4pt on all four sides.
     private static let focusOutset: CGFloat = 4
     /// Resting inset of the capsule inside the 64pt row height.
     private static let restingInsetY: CGFloat = 3
@@ -80,6 +90,8 @@ final class SettingsCell: UICollectionViewCell {
     private let valueLabel = UILabel()
     private let chevron = UIImageView()
     private let checkmark = UIImageView()
+    /// Stands in for the value while the row's change is in flight.
+    private let spinner = UIActivityIndicatorView(style: .medium)
 
     private var bgTop: NSLayoutConstraint!
     private var bgBottom: NSLayoutConstraint!
@@ -88,9 +100,12 @@ final class SettingsCell: UICollectionViewCell {
     private var valueToChevron: NSLayoutConstraint!
     private var valueToEdge: NSLayoutConstraint!
 
-    // Measured off tvOS Settings: fill white 0.10, value and chevron white 0.3 / black 0.4.
-    private static let restingFill = UIColor.white.withAlphaComponent(0.10)
-    private static let restingValue = UIColor.white.withAlphaComponent(0.3)
+    // Measured off tvOS Settings: fill white 0.10 (0.24 in light mode), value and chevron
+    // white 0.3 / black 0.4.
+    private static let restingFill = SettingsPalette.adaptive(dark: .white.withAlphaComponent(0.10),
+                                                              light: .white.withAlphaComponent(0.24))
+    private static let restingValue = SettingsPalette.adaptive(dark: .white.withAlphaComponent(0.3),
+                                                               light: .black.withAlphaComponent(0.4))
     private static let focusedValue = UIColor.black.withAlphaComponent(0.4)
 
     /// Called when this cell GAINS focus (drives the description panel).
@@ -123,7 +138,7 @@ final class SettingsCell: UICollectionViewCell {
         // 38 = tvOS Headline, and a 27.0pt cap height measured off tvOS
         // Settings' own rows (38 x 0.70 = 26.6).
         titleLabel.font = .systemFont(ofSize: 38, weight: .medium)
-        titleLabel.textColor = .white
+        titleLabel.textColor = SettingsPalette.text
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(titleLabel)
 
@@ -150,6 +165,10 @@ final class SettingsCell: UICollectionViewCell {
         checkmark.translatesAutoresizingMaskIntoConstraints = false
         bg.addSubview(checkmark)
 
+        spinner.hidesWhenStopped = true
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(spinner)
+
         // Held as properties: focus grows the capsule by moving these four, so
         // the labels ride with it and nothing is scaled (text stays crisp).
         bgTop = bg.topAnchor.constraint(equalTo: contentView.topAnchor, constant: Self.restingInsetY)
@@ -173,6 +192,9 @@ final class SettingsCell: UICollectionViewCell {
             checkmark.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -28),
             checkmark.centerYAnchor.constraint(equalTo: bg.centerYAnchor),
 
+            spinner.trailingAnchor.constraint(equalTo: valueLabel.trailingAnchor),
+            spinner.centerYAnchor.constraint(equalTo: bg.centerYAnchor),
+
             valueToChevron,
             valueLabel.centerYAnchor.constraint(equalTo: bg.centerYAnchor),
             valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 16)
@@ -180,11 +202,12 @@ final class SettingsCell: UICollectionViewCell {
     }
 
     func configure(title: String, value: String?, showsChevron: Bool, destructive: Bool,
-                   showsCheckmark: Bool = false, dimmed: Bool = false) {
+                   showsCheckmark: Bool = false, dimmed: Bool = false, busy: Bool = false) {
         titleLabel.text = title
         checkmark.isHidden = !showsCheckmark
         valueLabel.text = value
-        valueLabel.isHidden = (value == nil || value?.isEmpty == true)
+        valueLabel.isHidden = busy || (value == nil || value?.isEmpty == true)
+        if busy { spinner.startAnimating() } else { spinner.stopAnimating() }
         chevron.isHidden = !showsChevron
         NSLayoutConstraint.deactivate([valueToChevron, valueToEdge])
         (showsChevron ? valueToChevron : valueToEdge).isActive = true
@@ -207,7 +230,7 @@ final class SettingsCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         onFocusGained = nil
-        bg.layer.removeAnimation(forKey: "reorderWiggle")
+        bg.setReorderWiggle(false)
         setDimmed(false)
         applyAppearance(focused: false)
     }
@@ -216,16 +239,7 @@ final class SettingsCell: UICollectionViewCell {
     /// capsule (the cell keeps its focused scale). Toggled by the reorder
     /// (move) mode in `SettingsPageViewController`.
     func setReordering(_ on: Bool) {
-        if on {
-            let wiggle = CAKeyframeAnimation(keyPath: "transform.rotation.z")
-            wiggle.values = [-0.022, 0.022, -0.022]
-            wiggle.duration = 0.34
-            wiggle.repeatCount = .infinity
-            wiggle.isRemovedOnCompletion = false
-            bg.layer.add(wiggle, forKey: "reorderWiggle")
-        } else {
-            bg.layer.removeAnimation(forKey: "reorderWiggle")
-        }
+        bg.setReorderWiggle(on)
     }
 
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
@@ -255,13 +269,15 @@ final class SettingsCell: UICollectionViewCell {
             valueLabel.textColor = Self.focusedValue
             chevron.tintColor = Self.focusedValue
             checkmark.tintColor = .black
+            spinner.color = Self.focusedValue
         } else {
             // Unfocused rows are translucent glass capsules (visible buttons).
             bg.backgroundColor = Self.restingFill
-            titleLabel.textColor = destructive ? .systemRed : .white
+            titleLabel.textColor = destructive ? .systemRed : SettingsPalette.text
             valueLabel.textColor = Self.restingValue
             chevron.tintColor = Self.restingValue
             checkmark.tintColor = .systemBlue
+            spinner.color = SettingsPalette.text
         }
         // Grow the capsule outward by the same amount on all four sides. The
         // grown capsule reaches past the cell's own bounds, so lift it above its

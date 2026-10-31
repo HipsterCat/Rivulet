@@ -1,22 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  AmbientBackdropView.swift
-//  Rivulet
-//
-//  The page's ambient background — the Apple TV -style color wash. A single
-//  artwork image stretched full-bleed UNDERNEATH the home's frosted material
-//  (`backgroundBlurView` sits in front and diffuses it into an unrecognizable
-//  tint field), plus a vertical vignette so the lower half stays dark behind
-//  the shelf labels.
-//
-//  The wash tracks the hero: paging the carousel recolors the page. Because
-//  the material in front destroys all detail, the crossfade is slow (0.6s) so
-//  the tint drifts between colors rather than snapping — a hard cut would read
-//  as a flicker of the whole background. Surfaces with no hero (or before one
-//  loads) fall back to the first featured item, set once.
-//
+// The page's ambient color wash: one artwork stretched under the home's frosted material, plus a
+// vignette that keeps the lower half dark. It follows the hero with a slow 0.6s crossfade, since a
+// hard cut reads as the whole background flickering.
 
 import UIKit
 
@@ -40,6 +27,9 @@ final class AmbientBackdropView: UIView {
         didSet { vignette.isHidden = !showsVignette }
     }
     var imageTransform: (@Sendable (UIImage) -> UIImage)?
+
+    /// The artwork any page washed last; Settings borrows it for its own background.
+    static private(set) var lastURL: URL?
 
     private let crossfadeDuration: TimeInterval = 0.6
     private let imageAlpha: CGFloat = 0.85
@@ -87,6 +77,7 @@ final class AmbientBackdropView: UIView {
     func setAmbient(url: URL?) {
         guard let url, url != currentURL else { return }
         currentURL = url
+        Self.lastURL = url
         loadTask?.cancel()
         clearPreviousTask?.cancel()
 

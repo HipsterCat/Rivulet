@@ -56,21 +56,9 @@ extension DirectPlayFailureKind {
 
     /// Map an AetherEngine `PlaybackErrorKind` raw value onto our own buckets.
     ///
-    /// This replaces guesswork, not a working rule. The old path lowercased the
-    /// engine's message and looked for "open input", "decoder", "stream info"
-    /// and friends, which fails twice over: half those messages are
-    /// `AVPlayerItem.error.localizedDescription`, so they are in the device's
-    /// language and match nothing on a non-English Apple TV, and the two things
-    /// worth telling apart in RIVULET-19 (an origin answering with an HTTP
-    /// status vs a genuinely unreadable file) produced the identical FFmpeg
-    /// sentence until AetherEngine 6.29.0 split them.
-    ///
-    /// Unlisted kinds land on `.runtimeFatal` rather than `.unknown` on
-    /// purpose: the engine only publishes one of these when a session actually
-    /// died, so "we have no bucket for it" is not the same claim as "we do not
-    /// know that anything failed". The raw kind travels to Sentry beside this,
-    /// so a kind that starts showing up in the default arm is visible there
-    /// rather than silently pooled.
+    /// Do not match on the engine's message: much of it is localized.
+    /// Unlisted kinds map to `.runtimeFatal`, since the engine publishes one only when a
+    /// session died; the raw kind goes to Sentry beside it.
     init(engineKind: String) {
         switch engineKind {
         case EngineFailureKind.sourceRefused,
@@ -268,11 +256,16 @@ struct ContentRouter {
     static func buildDirectPlayURL(context: ContentRoutingContext) -> (url: URL, headers: [String: String])? {
         guard let media = context.metadata.Media?.first,
               let part = media.Part?.first,
-              let partKey = part.key else {
+              let partKey = part.key,
+              let url = directPlayURL(partKey: partKey, serverURL: context.serverURL, authToken: context.authToken) else {
             return nil
         }
+        return (url, ["X-Plex-Token": context.authToken])
+    }
 
-        var components = URLComponents(url: context.serverURL, resolvingAgainstBaseURL: false)!
+    /// The direct Plex URL of one Part's file.
+    static func directPlayURL(partKey: String, serverURL: URL, authToken: String) -> URL? {
+        var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)!
 
         // A Part key can carry its OWN query string. Library parts don't
         // (/library/parts/1/2/file.mkv), but Plex's IVA extras do:
@@ -287,13 +280,9 @@ struct ContentRouter {
         components.path = path
 
         var queryItems = inheritedItems
-        queryItems.append(URLQueryItem(name: "X-Plex-Token", value: context.authToken))
+        queryItems.append(URLQueryItem(name: "X-Plex-Token", value: authToken))
         components.queryItems = queryItems
-
-        guard let url = components.url else { return nil }
-
-        let headers = ["X-Plex-Token": context.authToken]
-        return (url, headers)
+        return components.url
     }
 
     /// Build Aether route — Aether demuxes the source itself and remuxes

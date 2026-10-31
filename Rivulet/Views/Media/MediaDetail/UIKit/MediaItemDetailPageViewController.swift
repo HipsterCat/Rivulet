@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  MediaItemDetailPageViewController.swift
-//  Rivulet
-//
-//  A reusable, title-first detail page for any MediaItem (episode, movie, show).
-//  Layout follows Docs/atv_ref/episode_details_ref.JPG (hero) and
-//  episode_details_bottom_ref.JPG (Information / Languages / Accessibility
-//  columns). Reached by a blur-fade from the carousel detail's episode
-//  description; Menu/Back returns.
-//
-//  Stage 3a: the hero. Hero order matches the reference:
-//    show title (small) · episode title (large) · genre · rating ·
-//    "S2, E1: synopsis" · date · runtime + capability badges ·
-//    Play + Watched + Watchlist (+ Go to Show on an episode).
-//  Below-fold info columns (3b) and the custom blur-fade (3c) land next.
-//
+//  The title-first detail page for any MediaItem (Docs/atv_ref/episode_details_ref.JPG,
+//  episode_details_bottom_ref.JPG), blur-faded in over the carousel; Menu returns.
 
 import Combine
 import UIKit
@@ -152,7 +138,7 @@ final class MediaItemDetailPageViewController: UIViewController {
             scrim.bottomAnchor.constraint(equalTo: heroContent.bottomAnchor),
 
             textColumn.leadingAnchor.constraint(equalTo: heroContent.leadingAnchor, constant: PreviewCarouselGeometry.expandedChromeInset),
-            textColumn.bottomAnchor.constraint(equalTo: heroContent.safeAreaLayoutGuide.bottomAnchor, constant: -98),
+            textColumn.bottomAnchor.constraint(equalTo: heroContent.safeAreaLayoutGuide.bottomAnchor, constant: -115),   // measured on device, tvOS 27
             textColumn.widthAnchor.constraint(lessThanOrEqualToConstant: 860),
 
             belowFold.topAnchor.constraint(equalTo: heroContent.bottomAnchor),
@@ -231,7 +217,7 @@ final class MediaItemDetailPageViewController: UIViewController {
         parent.addSubview(textColumn)
 
         // 1. Show title (small) — filled by setShowTitle (init or fetch).
-        style(showTitleLabel, size: 38, weight: .bold, alpha: 0.9)
+        style(showTitleLabel, size: 38, weight: .bold, alpha: 0.5)
         showTitleLabel.isHidden = (showTitleLabel.text ?? "").isEmpty
         textColumn.addArrangedSubview(showTitleLabel)
         textColumn.setCustomSpacing(6, after: showTitleLabel)
@@ -309,7 +295,7 @@ final class MediaItemDetailPageViewController: UIViewController {
 
         belowFoldTitle.translatesAutoresizingMaskIntoConstraints = false
         belowFoldTitle.text = item.title
-        belowFoldTitle.font = .systemFont(ofSize: 52, weight: .bold)
+        belowFoldTitle.font = .systemFont(ofSize: 76, weight: .bold)
         belowFoldTitle.textColor = .white
         belowFoldTitle.textAlignment = .center
         belowFoldTitle.numberOfLines = 2
@@ -340,7 +326,9 @@ final class MediaItemDetailPageViewController: UIViewController {
             darkBG.bottomAnchor.constraint(equalTo: belowFold.bottomAnchor),
 
             // Title in the top (light) half.
-            belowFoldTitle.topAnchor.constraint(equalTo: belowFold.safeAreaLayoutGuide.topAnchor, constant: 64),
+            // Cap top 64 from the screen top, measured on device (tvOS 27).
+            belowFoldTitle.topAnchor.constraint(equalTo: belowFold.topAnchor,
+                                                constant: 64 - (belowFoldTitle.font.ascender - belowFoldTitle.font.capHeight)),
             belowFoldTitle.centerXAnchor.constraint(equalTo: belowFold.centerXAnchor),
             belowFoldTitle.leadingAnchor.constraint(greaterThanOrEqualTo: belowFold.leadingAnchor, constant: inset),
 
@@ -357,44 +345,17 @@ final class MediaItemDetailPageViewController: UIViewController {
         // route — the primary action is the Watchlist toggle, and the
         // watched/watchlist circles are dropped (no provider state).
         if item.isMetadataOnly { return makeMetadataOnlyActionRow() }
-        let pill = FocusableActionButton()
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.layer.cornerRadius = HeroPillButton.buttonHeight / 2
-        pill.setContentHuggingPriority(.required, for: .horizontal)
-        pill.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        let icon = UIImageView(image: UIImage(systemName: "play.fill"))
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.tintColor = .white
-        icon.contentMode = .scaleAspectFit
-        let title = UILabel()
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = HeroPillButton.titleFont
-        title.textColor = .white
-        title.text = playPillTitle
-        pill.addSubview(icon)
-        pill.addSubview(title)
-        NSLayoutConstraint.activate([
-            pill.heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
-            icon.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: HeroPillButton.sidePadding),
-            icon.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
-            icon.heightAnchor.constraint(equalToConstant: 24),
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: HeroPillButton.iconGap),
-            title.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -HeroPillButton.sidePadding),
-            title.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-        ])
-        pill.invertOnFocus = [icon, title]
+        let (pill, title, _) = FocusableActionButton.pill(title: playPillTitle, systemImage: "play.fill")
         pill.onPrimaryAction = { [weak self] in guard let self else { return }; self.onPlay(self.item, nil) }
         playButton = pill
         playTitleLabel = title
 
         // Match the carousel chrome: Watched = checkmark, Watchlist = plus.
-        let watched = circleButton(systemImage: isWatched ? "checkmark.circle.fill" : "checkmark")
+        let watched = FocusableActionButton.circle(systemImage: isWatched ? "checkmark.circle.fill" : "checkmark")
         watchedButton = watched
         watched.onPrimaryAction = { [weak self] in self?.toggleWatched() }
 
-        let watchlist = circleButton(systemImage: "plus")
+        let watchlist = FocusableActionButton.circle(systemImage: "plus")
         watchlistButton = watchlist
         watchlist.onPrimaryAction = { [weak self] in self?.toggleWatchlist() }
         let ref = item.ref
@@ -409,7 +370,7 @@ final class MediaItemDetailPageViewController: UIViewController {
         // An episode's Watched acts on the episode alone; the whole show is
         // marked from the show's own page, which this opens.
         if item.kind == .episode, let showRef, !showRef.itemID.isEmpty {
-            let goToShow = circleButton(systemImage: "tv")
+            let goToShow = FocusableActionButton.circle(systemImage: "tv")
             goToShow.onPrimaryAction = { [weak self] in
                 guard let self else { return }
                 PreviewCarouselViewController.openShowDetail(showRef, show: self.show, from: self)
@@ -423,34 +384,7 @@ final class MediaItemDetailPageViewController: UIViewController {
     }
 
     private func makeMetadataOnlyActionRow() -> UIView {
-        let pill = FocusableActionButton()
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.layer.cornerRadius = HeroPillButton.buttonHeight / 2
-        pill.setContentHuggingPriority(.required, for: .horizontal)
-        pill.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        let icon = UIImageView()
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.tintColor = .white
-        icon.contentMode = .scaleAspectFit
-        let title = UILabel()
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = HeroPillButton.titleFont
-        title.textColor = .white
-        title.text = "Watchlist"
-        pill.addSubview(icon)
-        pill.addSubview(title)
-        NSLayoutConstraint.activate([
-            pill.heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
-            icon.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: HeroPillButton.sidePadding),
-            icon.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
-            icon.heightAnchor.constraint(equalToConstant: 24),
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: HeroPillButton.iconGap),
-            title.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -HeroPillButton.sidePadding),
-            title.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-        ])
-        pill.invertOnFocus = [icon, title]
+        let (pill, _, icon) = FocusableActionButton.pill(title: "Watchlist", systemImage: nil)
 
         if let tmdbID = item.tmdbID {
             let guid = "tmdb://\(tmdbID)"
@@ -490,27 +424,6 @@ final class MediaItemDetailPageViewController: UIViewController {
         row.spacing = HeroPillButton.rowGap
         row.alignment = .center
         return row
-    }
-
-    private func circleButton(systemImage: String) -> FocusableActionButton {
-        let b = FocusableActionButton()
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.layer.cornerRadius = HeroPillButton.buttonHeight / 2
-        let icon = UIImageView(image: UIImage(systemName: systemImage))
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.tintColor = .white
-        icon.contentMode = .scaleAspectFit
-        b.addSubview(icon)
-        NSLayoutConstraint.activate([
-            b.widthAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
-            b.heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
-            icon.centerXAnchor.constraint(equalTo: b.centerXAnchor),
-            icon.centerYAnchor.constraint(equalTo: b.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 30),
-            icon.heightAnchor.constraint(equalToConstant: 30),
-        ])
-        b.invertOnFocus = [icon]
-        return b
     }
 
     // MARK: - Data
@@ -572,10 +485,7 @@ final class MediaItemDetailPageViewController: UIViewController {
     }
 
     private func applyDetail(_ detail: MediaItemDetail, fallbackGenres: [String]) {
-        // This page is seeded from a snapshot that can already be stale on open
-        // (marked watched from a tile menu, then opened before the hub refresh
-        // lands). `detail` is a fresh server read, so spend it on the watch bits
-        // too rather than issuing a second GET for them.
+        // The seed can be stale on open; `detail` is a fresh read, so reuse it.
         applyWatchState(from: detail.item)
         setGenres(detail.genres.isEmpty ? fallbackGenres : detail.genres)
         infoColumns.configure(detail: detail)
@@ -601,7 +511,7 @@ final class MediaItemDetailPageViewController: UIViewController {
         let versions = VersionPicker.versions(in: detail)
         guard !versions.isEmpty, versionsButton == nil, let row = actionRow, let watchlist = watchlistButton,
               let index = row.arrangedSubviews.firstIndex(of: watchlist) else { return }
-        let button = circleButton(systemImage: "square.stack")
+        let button = FocusableActionButton.circle(systemImage: "square.stack")
         button.onPrimaryAction = { [weak self, weak button] in
             guard let self, let button else { return }
             VersionPicker.present(versions, from: self, sourceFrame: button.convert(button.bounds, to: nil)) {
@@ -616,11 +526,8 @@ final class MediaItemDetailPageViewController: UIViewController {
 
     // MARK: - Watch-state refresh (issue #228)
 
-    /// Re-read this item's watch state after playback and repaint the two bits
-    /// that show it: the Watched glyph and the Play / Resume label. Driven by
-    /// `.plexDataNeedsRefresh`, which the player posts only once its final
-    /// progress report has had time to commit server-side — an `onDismiss`
-    /// hook would fire ~2s early and read the stale value.
+    /// Repaints the Watched glyph and Play label on `.plexDataNeedsRefresh`, posted once
+    /// the player's last report has committed (dismiss is about 2 s too early).
     private func refreshWatchState() {
         guard isViewLoaded, !item.isMetadataOnly, let provider else { return }
         watchRefreshToken &+= 1
@@ -643,20 +550,15 @@ final class MediaItemDetailPageViewController: UIViewController {
         item = refreshed
         isWatched = refreshed.isWatched
         resumeOffset = refreshed.userState.viewOffset
-        setCircleIcon(watchedButton, isWatched ? "checkmark.circle.fill" : "checkmark")
+        watchedButton?.setIcon(isWatched ? "checkmark.circle.fill" : "checkmark")
         playTitleLabel?.text = playPillTitle
     }
 
     private var watchRefreshToken: UInt64 = 0
     private var refreshObservers = Set<AnyCancellable>()
 
-    /// Local mirror of the resume point, so the pill can repaint the moment the
-    /// user acts instead of waiting on the server round-trip (the same reason
-    /// `isWatched` is mirrored). Seeded from the item, re-seeded by every
-    /// refresh, zeroed by a Mark as Watched.
-    ///
-    /// A resume point outranks the watched flag (a resumable rewatch reads
-    /// "Resume", not "Play Again"): `EpisodePicker.playTitle` owns that order.
+    /// Local resume point, like `isWatched`, so the pill repaints without a round trip.
+    /// `EpisodePicker.playTitle` ranks it above the watched flag.
     private var resumeOffset: TimeInterval = 0
 
     private var playPillTitle: String {
@@ -667,11 +569,8 @@ final class MediaItemDetailPageViewController: UIViewController {
 
     private func toggleWatched() {
         isWatched.toggle()
-        setCircleIcon(watchedButton, isWatched ? "checkmark.circle.fill" : "checkmark")
-        // Plex drops the resume point on both scrobble and unscrobble (the same
-        // thing `PlexDataStore.updateItemWatchStatus` does locally), so the pill
-        // stops offering a resume that no longer exists. Issue #270: it used to
-        // keep saying "Resume" with nothing left to resume to.
+        watchedButton?.setIcon(isWatched ? "checkmark.circle.fill" : "checkmark")
+        // Plex drops the resume point on scrobble and unscrobble (#270).
         resumeOffset = 0
         playTitleLabel?.text = playPillTitle
         let target = isWatched
@@ -679,10 +578,7 @@ final class MediaItemDetailPageViewController: UIViewController {
             guard let self, let provider = self.provider else { return }
             if target { try? await provider.markPlayed(self.item.ref) }
             else { try? await provider.markUnplayed(self.item.ref) }
-            // Same repaint the player uses on dismissal: every surface showing
-            // this item's watch state re-reads it (this page included, so a
-            // failed mark falls back to server truth), and Home drops or
-            // restores the Continue Watching tile.
+            // Every surface re-reads, this page too, so a failed mark falls back to the server.
             NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
         }
     }
@@ -707,10 +603,7 @@ final class MediaItemDetailPageViewController: UIViewController {
 
     // Distinct active glyphs: watched = filled check, watchlist = saved bookmark.
     private func updateWatchlistIcon() {
-        setCircleIcon(watchlistButton, onWatchlist ? "bookmark.fill" : "plus")
-    }
-    private func setCircleIcon(_ button: FocusableActionButton?, _ name: String) {
-        (button?.subviews.compactMap { $0 as? UIImageView }.first)?.image = UIImage(systemName: name)
+        watchlistButton?.setIcon(onWatchlist ? "bookmark.fill" : "plus")
     }
 
     /// The show above an episode (grandparent) or a season (parent).
@@ -796,10 +689,8 @@ private final class PaddedLabel: UILabel {
 
 // MARK: - Blur-fade transition
 
-/// Present: the carousel behind blurs in while the detail page fades in.
-/// Dismiss: the reverse — page fades out as the carousel sharpens back.
-/// Shared by the episode detail page AND the standalone (no-carousel) expanded
-/// detail mode of PreviewCarouselViewController.
+/// Blurs what is behind while the page fades in, and the reverse on dismiss. Also used
+/// by the carousel's standalone detail.
 final class BlurFadeTransitioningDelegate: NSObject, UIViewControllerTransitioningDelegate {
     func animationController(forPresented presented: UIViewController, presenting: UIViewController, source: UIViewController) -> UIViewControllerAnimatedTransitioning? {
         BlurFadeAnimator(presenting: true)

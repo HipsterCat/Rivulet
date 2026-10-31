@@ -24,45 +24,23 @@ protocol MenuBackHandling: AnyObject {
 /// system never sees half a press. Pure logic, kept out of the swizzle so it
 /// can be tested directly.
 struct MenuPressSwallowState {
-    /// The press whose `.began` was withheld, held until its own terminal
-    /// phase. Identity rather than a bool, because a bool cannot tell a repeat
-    /// `.began` for the SAME press (must not re-ask) from a `.began` for a NEW
-    /// one (must be asked).
-    ///
-    /// That distinction is the whole reason this is not a bool. A consumed
-    /// press whose `.ended` never reaches this window — the handler's own
-    /// navigation can present or dismiss a controller and route the terminal
-    /// phase elsewhere — used to latch the flag on forever. The next real press
-    /// was then withheld whole, without any handler being asked and without the
-    /// system seeing it, and its `.ended` cleared the latch so the press after
-    /// that worked. Every other Menu press did nothing at all, with no way to
-    /// recover. Identity makes the stale pending press self-correcting.
+    /// A `.began` was withheld and its terminal phase is still due. Tracked per
+    /// press, so a press whose `.ended` went to another window cannot latch on
+    /// and eat the next Menu press.
     private(set) var isSwallowing = false
 
-    /// Held WEAKLY, and compared by identity rather than by address. An
-    /// `ObjectIdentifier` of a freed press can alias a brand new press
-    /// allocated at the same address, which would classify it as a repeat and
-    /// swallow it — the very bug this tracking exists to prevent. A weak
-    /// reference to a freed press reads nil instead, so the new press is
-    /// correctly seen as new.
+    /// Weak, not an `ObjectIdentifier`: a new press can reuse a freed press's
+    /// address and would be taken for a repeat.
     private weak var pendingPress: AnyObject?
 
-    /// - Parameters:
-    ///   - press: identity of the Menu press this event carries, if known. A
-    ///     nil identity is always treated as a new press: a missed swallow is
-    ///     recoverable, a dead Menu button is not.
-    ///   - began: the event carries a Menu press in the `.began` phase.
-    ///   - finished: the event carries a Menu press in `.ended` or `.cancelled`.
-    ///   - handle: asked once per press, on `.began`. True means consumed.
-    /// - Returns: true when this event must be withheld from the system.
+    /// Returns true when this event must be withheld. `handle` is asked once per
+    /// press on `.began`. A nil `press` counts as new: a missed swallow is
+    /// recoverable, a dead Menu button is not.
     mutating func shouldWithhold(press: AnyObject?,
                                  began: Bool,
                                  finished: Bool,
                                  handle: () -> Bool) -> Bool {
-        // The ONLY `.began` that must not re-ask is a repeat of the press
-        // already being swallowed. A `.began` for anything else is a new press
-        // and gets a fresh decision, which is what stops a pending press that
-        // never terminated from eating it.
+        // Only a repeat of the press being swallowed skips the handlers.
         let repeatsPendingPress = isSwallowing && press != nil && press === pendingPress
         if began, !repeatsPendingPress {
             let consumed = handle()
@@ -77,6 +55,24 @@ struct MenuPressSwallowState {
             pendingPress = nil
         }
         return true
+    }
+}
+
+// MARK: - Remote gestures
+
+/// Counts remote gestures: a new arrow press or a new touch on the remote's
+/// surface. A held arrow repeats `.began` for the same press; that is not a new one.
+struct RemoteGestureCounter {
+    private(set) var count = 0
+    private var heldArrow: AnyObject?
+
+    mutating func observe(arrowBegan press: AnyObject?, arrowFinished: Bool, touchBegan: Bool) {
+        if let press, press !== heldArrow {
+            count += 1
+            heldArrow = press
+        }
+        if arrowFinished { heldArrow = nil }
+        if touchBegan { count += 1 }
     }
 }
 
@@ -96,22 +92,16 @@ enum StagedMenuBack {
 
 // MARK: - Interceptor
 
-/// Gives the app first refusal on the Menu button.
-///
-/// While focus is in the content area, a Menu press is **not** delivered
-/// through the responder chain: there is no `pressesBegan` on the window or the
-/// focused view controller, no `shouldUpdateFocus`, no `.onExitCommand`, and no
-/// menu-press gesture recognizer anywhere in the hierarchy to intercept — the
-/// `.sidebarAdaptable` sidebar reveal happens above all of it. The one layer
-/// that sees the press first is `UIWindow.sendEvent(_:)`; returning early there
-/// withholds it from the system entirely. (Measured on tvOS 26.5; once focus is
-/// in the sidebar the press does reach the responder chain and `.onExitCommand`,
-/// which is how stage 3 works — see `TVSidebarView.onExitCommand`.)
+/// Gives the app first refusal on the Menu button by swizzling
+/// `UIWindow.sendEvent(_:)`, the only layer that sees the press before any
+/// responder or recognizer; returning early withholds it from the system.
 @MainActor
 enum MenuPressInterceptor {
     private static var swizzledClasses = Set<ObjectIdentifier>()
     private static var handlers: [WeakHandler] = []
     private static var swallowState = MenuPressSwallowState()
+    /// Counted here because this hook sees each gesture before the focus engine acts on it.
+    private(set) static var remoteGestures = RemoteGestureCounter()
 
     private struct WeakHandler {
         weak var value: (any MenuBackHandling)?
@@ -159,10 +149,23 @@ enum MenuPressInterceptor {
 
         let block: @convention(block) (AnyObject, UIEvent) -> Void = { obj, event in
             guard let pressesEvent = event as? UIPressesEvent else {
+                if event.type == .touches, event.allTouches?.contains(where: { $0.phase == .began }) == true {
+                    MainActor.assumeIsolated {
+                        remoteGestures.observe(arrowBegan: nil, arrowFinished: false, touchBegan: true)
+                    }
+                }
                 originalFunc(obj, selector, event)
                 return
             }
             let withhold = MainActor.assumeIsolated { () -> Bool in
+                let arrows = pressesEvent.allPresses.filter {
+                    [.upArrow, .downArrow, .leftArrow, .rightArrow].contains($0.type)
+                }
+                remoteGestures.observe(
+                    arrowBegan: arrows.first { $0.phase == .began },
+                    arrowFinished: arrows.contains { $0.phase == .ended || $0.phase == .cancelled },
+                    touchBegan: false)
+
                 // This is the only layer that sees a press before a responder or
                 // gesture recognizer can consume it, which is exactly what the
                 // input probe needs. No-ops unless Input Diagnostics is on.

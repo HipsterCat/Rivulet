@@ -5,41 +5,14 @@
 //  LiveTVAetherPlayerViewController.swift
 //  Rivulet
 //
-//  Live TV player on Rivulet's own chrome (no AVKit). Video renders through
-//  the engine surface (`AetherPlayerView` → `engine.bind(view:)`), which hosts
-//  whichever layer the active backend uses — AVPlayerLayer on the native /
-//  loopback-HLS paths, AVSampleBufferDisplayLayer on the software path
-//  (MPEG-2, interlaced H.264). Audio is engine-owned: with no AVKit in the
-//  picture the renderer activates the audio session itself, which is what the
-//  multi-stream grid already relies on.
-//
-//  Chrome: the same UIKit glass rail as Aether VOD (PlayerRailView +
-//  PlayerRailPanelView), driven by GUIDE data instead of Plex metadata —
-//  programme title/times from LiveTVDataStore's EPG, subtitle and audio
-//  pickers from the engine's track lists (CardTrackListView), and VOD's
-//  Info card and pane box fed from the guide (Info, LiveChannelsPaneView).
-//  Select shows the rail, Menu hides it (or dismisses the player when it's
-//  already hidden).
-//
-//  Transport (issue #316): the engine keeps a rewind window on every live
-//  load, so the stream can be paused and skipped like a recording. With the
-//  rail hidden, Left/Right skip within that window and Play/Pause pauses; the
-//  whole chrome comes up for both with focus on the bar, which keeps skipping. "Go to Live" on
-//  the rail returns to the edge. Play/Pause is taken through the same
-//  deduping coordinator VOD uses, because it can arrive as a press AND as a
-//  system remote command for one click.
-//
-//  Subtitles (including DVB/teletext decoded engine-side) render through
-//  CaptionOverlayView, the same overlay Aether VOD uses.
-//
-//  Playback routing (inside `AetherPlayer.loadLive`):
-//    - plain HLS (.m3u8 / format=hls) → nativeRemoteHLS: AVPlayer plays the
-//      remote playlist directly, engine re-attaches its layer to the surface.
-//    - raw MPEG-TS and Plex tuned sessions (progressive start.ts remux) →
-//      engine demux/decode.
-//
-//  Failure ladder (each stage re-resolves the URL — fresh Plex tune/session):
-//    0 primary → 1 engine demux → 2 bare AVPlayer on an AVPlayerLayer.
+//  Live TV player on the VOD glass rail (no AVKit), fed from guide data. With no
+//  AVKit the engine activates the audio session itself.
+//  Transport (#316): the engine keeps a rewind window, so Left/Right skip and
+//  Play/Pause pauses. Play/Pause goes through VOD's deduping coordinator because
+//  one click can arrive as a press and as a remote command.
+//  Routing (`AetherPlayer.loadLive`): plain HLS plays natively in AVPlayer, raw TS
+//  and Plex tuned sessions go through engine demux. Failure ladder, each stage on a
+//  re-resolved URL: 0 primary, 1 engine demux, 2 bare AVPlayer on an AVPlayerLayer.
 //
 
 import AVKit
@@ -61,7 +34,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
     /// Shown until the first frame plays; the engine spins up demux + decode
     /// before any picture, so give the user something in the meantime.
-    private let loadingSpinner = UIActivityIndicatorView(style: .large)
+    private let loadingSpinner = LiveJoinSpinner(style: .large)
+
+    /// The programme's guide artwork and summary behind the spinner while joining.
+    private let joinBackdrop = LiveJoinBackdropView()
 
     private let subtitleModel = SubtitleModel()
     private var subtitleOverlay: CaptionOverlayView?
@@ -106,6 +82,8 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     /// The join's one early check for a direct source out of connections.
     private var busyCheckTask: Task<Void, Never>?
     private var watchCreditTask: Task<Void, Never>?
+    /// Asks Dispatcharr whether this channel has other streams to switch to.
+    private var streamChoicesTask: Task<Void, Never>?
 
     /// Measures time-to-first-frame for the in-flight join, split into handshake
     /// / engine load / holdback fill. One per load attempt; a fallback retry
@@ -129,34 +107,17 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
     // MARK: Native HLS legible subtitles (remote WebVTT renditions)
     //
-    // On the nativeRemoteHLS path the engine never demuxes: the stream's WebVTT
-    // renditions live in AVPlayer's legible media selection group, and it
-    // publishes no cues of its own. Selecting a rendition isn't enough either —
-    // a bare AVPlayerLayer doesn't paint legible content (only AVKit does), so
-    // cues are pulled out through an AVPlayerItemLegibleOutput and drawn by the
-    // same overlay every other path uses.
-    //
-    // The engine DOES publish that group as `subtitleTracks` (AE#154), so an
-    // empty engine track list no longer distinguishes this path from the demux
-    // one. Route detection lives below; do not reintroduce that test.
-    /// Whether this session took the `nativeRemoteHLS` bypass.
-    ///
-    /// AE#154 made the engine publish the bypass item's legible options as
-    /// `subtitleTracks`, so "the engine track list is empty" no longer
-    /// identifies the native route — it used to, and every branch keyed off it
-    /// silently started taking the demux path, handing subtitle selection to
-    /// the engine (and rendering to AVPlayer). Branch on the routing decision.
+    // On nativeRemoteHLS the engine never demuxes and a bare AVPlayerLayer paints
+    // no legible content, so cues come out of an AVPlayerItemLegibleOutput.
+
+    /// Whether this session took the `nativeRemoteHLS` bypass. Branch on this, not
+    /// on an empty engine track list: since AE#154 the engine publishes the bypass
+    /// item's legible options as `subtitleTracks`.
     private var isNativeHLSRoute = false
 
-    /// True when AVPlayer is playing the REMOTE playlist itself, so its legible
-    /// renditions are ours to intercept and the engine has no cues of its own.
-    ///
-    /// Confirmed against the item's URL rather than trusting the routing
-    /// decision alone: the engine can move a bypass session onto the
-    /// live-ingest loopback mid-load (#168, a native mount that builds no video
-    /// track), after which it really is demuxing and really does publish cues.
-    /// It exposes no effective-route property to ask, but the loopback item is
-    /// served from its local HTTP server, which is plainly visible here.
+    /// True when AVPlayer plays the remote playlist itself, so its legible
+    /// renditions are ours. Checked on the item URL because the engine can move a
+    /// bypass session onto its loopback mid-load (#168), and then it publishes cues.
     private var isPlayingRemoteHLSDirectly: Bool {
         guard isNativeHLSRoute, let item = aetherPlayer?.currentAVPlayer?.currentItem
         else { return false }
@@ -182,16 +143,13 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     private weak var nativeLegibleItem: AVPlayerItem?
     private var nativeLegibleActive = false
     /// Lines currently on screen. Roll-up WebVTT re-delivers the same block
-    /// every segment; re-emitting it would churn the cue identities (and
-    /// their SwiftUI views) for no visible change.
+    /// every segment; re-emitting it would churn the cue identities.
     private var lastNativeLegibleLines: [StyledLine] = []
     /// Deferred clear: roll-up streams emit an EMPTY legible event at every
     /// cue boundary, and clearing on the spot blinks the overlay between cues.
     private var nativeLegibleClearWorkItem: DispatchWorkItem?
-    /// Nested inside the `$currentAVPlayer` sink rather than stored in
-    /// `cancellables`, so it can be replaced when the player is swapped.
-    /// `startPlayback` builds a fresh `AetherPlayer` per session, so the outer
-    /// sink re-subscribes and re-establishes this on every channel switch.
+    /// Held outside `cancellables` so the `$currentAVPlayer` sink can replace it
+    /// when the player is swapped.
     private var nativeItemObservation: AnyCancellable?
 
     /// Push-delegate shim: `AVPlayerItemLegibleOutput.setDelegate` does not
@@ -351,6 +309,18 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         engineSurfaceView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(engineSurfaceView)
 
+        joinBackdrop.frame = view.bounds
+        joinBackdrop.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(joinBackdrop)
+        loadingSpinner.onChange = { [weak self] spinning in
+            guard let self else { return }
+            if spinning {
+                self.joinBackdrop.show(LiveJoinBackdropContent.make(
+                    program: LiveTVDataStore.shared.getCurrentProgram(for: self.channel)))
+            } else {
+                self.joinBackdrop.hide()
+            }
+        }
         loadingSpinner.color = .white
         loadingSpinner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(loadingSpinner)
@@ -374,6 +344,12 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         // screensaver must not take over mid-programme.
         UIApplication.shared.isIdleTimerDisabled = true
 
+        // Backgrounding or sleep ends the session: the engine tears its
+        // pipeline down and the tune expires, so resuming only showed black (#390).
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification, object: nil)
+
         startPlayback()
 
         // What is already set to record, for the rail's record button.
@@ -385,8 +361,8 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
     /// Builds the player for `channel` and starts the join. Called on load and
     /// again for every in-place channel switch, so it must assume NOTHING is
-    /// left over from a previous session — `teardownPlaybackSession()` is the
-    /// matching half.
+    /// left over from a previous session except a kept, stopped player —
+    /// `teardownPlaybackSession()` is the matching half.
     private func startPlayback() {
         loadingSpinner.startAnimating()
         isUserPaused = false
@@ -399,13 +375,16 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
         let adopted = pendingAdoption
         pendingAdoption = nil
-        let aether = adopted?.player ?? AetherPlayer()
+        let aether = adopted?.player ?? aetherPlayer ?? AetherPlayer()
         if let adopted {
             liveKeepalive = adopted.keepalive
             isNativeHLSRoute = adopted.isNativeHLSRoute
         }
-        aetherPlayer = aether
-        aether.bind(view: engineSurfaceView)
+        if aetherPlayer !== aether {
+            aetherPlayer = aether
+            aether.bind(view: engineSurfaceView)
+        }
+        checkStreamChoices()
         bindAetherSubtitles(aether)
         captionsOnMute = CaptionsOnMuteLogic()
         aether.$subtitleTracks
@@ -537,6 +516,13 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         }
     }
 
+    /// Leaves the player so the host screen is what the user returns to. The
+    /// normal dismissal path (`viewDidDisappear`) releases the tuner.
+    @objc func appDidEnterBackground() {
+        guard presentingViewController != nil, !isBeingDismissed else { return }
+        dismissPlayer(animated: false)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         // Multiview's full-screen hand-off left a cover behind this screen.
@@ -615,7 +601,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         guard retuneTask == nil else { retunePending = true; return }
         // Let the dead session go now: its tuner is free while this waits,
         // and its player can't start the fallback ladder alongside.
-        teardownPlaybackSession()
+        teardownPlaybackSession(keepingPlayer: true)
         guard let delay = retuneBudget.reserve(now: ProcessInfo.processInfo.systemUptime) else {
             streamLoadTask = Task { @MainActor in await self.endJoin(notice: Self.sourceLostNotice) }
             return
@@ -691,7 +677,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         watchCreditTask = LiveTVDataStore.shared.beganWatching(channel)
     }
 
-    private func teardownPlaybackSession() {
+    private func teardownPlaybackSession(keepingPlayer: Bool = false) {
         endScrub()
         streamLoadTask?.cancel()
         streamLoadTask = nil
@@ -699,6 +685,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         busyCheckTask = nil
         watchCreditTask?.cancel()
         watchCreditTask = nil
+        streamChoicesTask?.cancel()
+        streamChoicesTask = nil
+        railView.setQualityAvailable(false)
         // Backing out before first frame still ends the transaction. An
         // unfinished one would otherwise hang until the SDK times it out and
         // land as a bogus outlier.
@@ -722,9 +711,15 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         // Drop the outgoing channel's cues: on a switch the overlay would
         // otherwise keep painting them until the new session publishes.
         subtitleModel.update(cues: [])
-        aetherPlayer?.stop()
-        aetherPlayer?.unbind(view: engineSurfaceView)
-        aetherPlayer = nil
+        if keepingPlayer {
+            // The next join loads on this engine, which skips the display
+            // mode write when the format is unchanged (#419).
+            aetherPlayer?.stop(resetDisplayCriteria: false)
+        } else {
+            aetherPlayer?.stop()
+            aetherPlayer?.unbind(view: engineSurfaceView)
+            aetherPlayer = nil
+        }
         // Every subscription in this set is bound to the player built by
         // startPlayback(); a stale one would feed the next session's UI from
         // the dead player.
@@ -824,7 +819,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         ])
 
         railView.onSubtitles = { [weak self] in self?.presentSubtitlePanel() }
+        railView.onSubtitlesHold = { [weak self] in self?.toggleSubtitles() }
         railView.onAudio = { [weak self] in self?.presentAudioPanel() }
+        railView.onQuality = { [weak self] in self?.presentStreamPanel() }
         railView.onInfo = { [weak self] in self?.presentInfoPanel() }
         railView.onUpNext = { [weak self] in self?.presentChannelListPanel() }
         railView.onScores = { [weak self] in self?.presentScoresPanel() }
@@ -983,12 +980,21 @@ final class LiveTVAetherPlayerViewController: UIViewController {
 
     /// Chrome auto-hides after a few idle seconds, same spirit as the VOD
     /// container. Any focus movement inside the rail restarts the clock; an
-    /// open panel suspends it.
+    /// open menu suspends it. An untouched info pane closes, as in AVKit (#411).
     private func restartAutoHide() {
         autoHideTimer?.invalidate()
-        autoHideTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
+        // Measured in AVKit: a pane waits 20s while focus is inside its content.
+        let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
+        let inPane = activePanel.map { $0.isPane && focused?.isDescendant(of: $0) == true } ?? false
+        autoHideTimer = Timer.scheduledTimer(withTimeInterval: inPane ? 20 : 8, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, self.activePanel == nil, self.descriptionOverlay == nil, !self.isUserPaused else { return }
+                guard let self, self.descriptionOverlay == nil else { return }
+                if let pane = self.activePanel, pane.isPane {
+                    pane.dismissPanel()
+                } else if self.activePanel != nil {
+                    return
+                }
+                guard !self.isUserPaused else { return }
                 self.hideRail()
             }
         }
@@ -1077,7 +1083,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         if let next = context.nextFocusedView {
             progressBar.setFocusDimmed(next !== scrubberProxy && next.isDescendant(of: railView), coordinator: coordinator)
         }
-        if railVisible, activePanel == nil,
+        if activePanel?.isPane == true {
+            restartAutoHide()
+        } else if railVisible, activePanel == nil,
            let next = context.nextFocusedView, next.isDescendant(of: railView) {
             restartAutoHide()
         }
@@ -1122,8 +1130,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     private func presentPane(content: UIView, pill: PlayerInfoPillButton) {
         let openPane = activePanel?.isPane == true ? activePanel : nil
         guard openPane != nil || activePanel == nil else { return }
-        autoHideTimer?.invalidate()
-        autoHideTimer = nil
+        restartAutoHide()
         let panel = PlayerRailPanelView.presentPane(
             content: content, cardWidth: nil, in: view, rail: railView, pill: pill,
             riders: [progressBar, timeshiftBadge], replacing: openPane)
@@ -1147,12 +1154,14 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                 self.progressBar.alpha = barVisible ? 1 : 0
                 self.timeshiftBadge.alpha = barVisible ? 1 : 0
             }
+            self.syncSubtitleOverlay(animated: true)
             self.setNeedsFocusUpdate()
             self.updateFocusIfNeeded()
             self.restartAutoHide()
         }
         panel.onMenuHandled = { [weak self] in self?.armDismissEchoBlock() }
         activePanel = panel
+        syncSubtitleOverlay(animated: true)
         updateScrubberFocus()
         UIView.animate(withDuration: 0.167) {
             self.progressBar.alpha = 0
@@ -1185,11 +1194,11 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             if aether.subtitleTracks.contains(where: { ($0.codec ?? "").lowercased().contains("teletext") }) {
                 steppers.append(teletextPageStepper())
             }
-            let list = CardTrackListView(
-                header: "Subtitles",
-                tracks: aether.subtitleTracks,
+            let tracks = aether.subtitleTracks
+            let list = CardTrackListView.subtitleMenu(
+                tracks: tracks,
                 selectedTrackId: aether.currentSubtitleTrackId,
-                showsOffRow: true,
+                onTrackId: aether.currentSubtitleTrackId ?? (tracks.first { !$0.isForced } ?? tracks.first)?.id,
                 steppers: steppers
             ) { [weak self] trackId in
                 guard let self else { return }
@@ -1221,11 +1230,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                     codec: "webvtt"
                 )
             }
-            let list = CardTrackListView(
-                header: "Subtitles",
+            let list = CardTrackListView.subtitleMenu(
                 tracks: tracks,
                 selectedTrackId: selectedIndex,
-                showsOffRow: true,
+                onTrackId: selectedIndex ?? tracks.first?.id,
                 steppers: self.subtitleAdjustmentSteppers()
             ) { [weak self] trackId in
                 self?.selectNativeLegible(trackId)
@@ -1235,18 +1243,28 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         }
     }
 
+    /// AVKit's hold on Subtitles: off if showing, else the first full track. Engine-demuxed channels only.
+    private func toggleSubtitles() {
+        guard let aether = aetherPlayer, !aether.subtitleTracks.isEmpty else { return }
+        if systemCaptionsOnMute.isActive { captionsOnMute.userPicked() }
+        if aether.currentSubtitleTrackId != nil {
+            aether.selectSubtitleTrack(id: nil)
+            railView.showNote("Subtitles off")
+        } else if let track = aether.subtitleTracks.first(where: { !$0.isForced }) ?? aether.subtitleTracks.first {
+            aether.selectSubtitleTrack(id: track.id)
+            railView.showNote("Subtitles on")
+        }
+    }
+
     private func presentAudioPanel() {
         guard let aether = aetherPlayer else { return }
 
         // Engine demux path: tracks come from the engine.
         if !aether.audioTracks.isEmpty {
-            let list = CardTrackListView(
-                header: "Audio",
+            let list = CardTrackListView.audioMenu(
                 tracks: aether.audioTracks,
                 selectedTrackId: aether.currentAudioTrackId,
-                showsOffRow: false,
-                choices: SystemAudioAdjustment.menuChoices,
-                toggles: SystemAudioAdjustment.menuToggles
+                syncing: aether
             ) { [weak self] trackId in
                 if let trackId { self?.aetherPlayer?.selectAudioTrack(id: trackId) }
                 self?.activePanel?.dismissPanel()
@@ -1273,19 +1291,62 @@ final class LiveTVAetherPlayerViewController: UIViewController {
                     languageCode: option.locale?.identifier
                 )
             }
-            let list = CardTrackListView(
-                header: "Audio",
+            let list = CardTrackListView.audioMenu(
                 tracks: tracks,
-                selectedTrackId: selectedIndex,
-                showsOffRow: false,
-                choices: SystemAudioAdjustment.menuChoices,
-                toggles: SystemAudioAdjustment.menuToggles
+                selectedTrackId: selectedIndex
             ) { [weak self] trackId in
                 if let trackId, trackId < group.options.count {
                     item.select(group.options[trackId], in: group)
                 }
                 self?.activePanel?.dismissPanel()
                 self?.updateRailContent()
+            }
+            self.presentPanel(content: list, width: 520)
+        }
+    }
+
+    // MARK: - Dispatcharr streams (#369)
+
+    /// Shows the stream button when Dispatcharr lists more than one stream for
+    /// the channel and the key may switch them (admin only, else 403).
+    private func checkStreamChoices() {
+        streamChoicesTask?.cancel()
+        railView.setQualityAvailable(false)
+        guard let target = LiveTVDataStore.shared.dispatcharrChannel(for: channel) else { return }
+        streamChoicesTask = Task { @MainActor [weak self] in
+            guard let choices = try? await target.service.channelStreams(channelUUID: target.uuid),
+                  !Task.isCancelled else { return }
+            self?.railView.setQualityAvailable(choices.streams.count > 1)
+        }
+    }
+
+    /// Lists the channel's streams, fetched fresh so a failover since the join
+    /// shows. A switch moves everyone watching this channel on the server.
+    private func presentStreamPanel() {
+        guard let target = LiveTVDataStore.shared.dispatcharrChannel(for: channel) else { return }
+        Task { @MainActor [weak self] in
+            guard let choices = try? await target.service.channelStreams(channelUUID: target.uuid),
+                  let self, self.activePanel == nil else { return }
+            let rows = choices.streams.map { stream in
+                CardTrackListView.Row(title: stream.name, subtitle: choices.detail(for: stream),
+                                      trackId: stream.id, isSelected: stream.id == choices.currentStreamID)
+            }
+            let list = CardTrackListView(header: "Stream", rows: rows) { [weak self] streamID in
+                self?.activePanel?.dismissPanel()
+                guard let streamID, streamID != choices.currentStreamID,
+                      let stream = choices.streams.first(where: { $0.id == streamID }) else { return }
+                // Dispatcharr swaps the source under the open connection: no reload
+                // shows it, and the new picture arrives after a few seconds.
+                let label = choices.detail(for: stream) ?? stream.name
+                self?.noticeView.show("Switching to \(label)…", for: 30)
+                Task { @MainActor [weak self] in
+                    do {
+                        try await target.service.switchStream(channelUUID: target.uuid, to: streamID)
+                        self?.noticeView.show("Switched to \(label).")
+                    } catch {
+                        self?.noticeView.show("Couldn't switch streams.")
+                    }
+                }
             }
             self.presentPanel(content: list, width: 520)
         }
@@ -1313,22 +1374,11 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         }
     }
 
-    /// Attach the legible output to every native item, as soon as it exists.
-    ///
-    /// Two things this deliberately does NOT do, both of which broke it before:
-    ///
-    /// It does not run once after `loadLive` returns. `engine.load` returns
-    /// when the native host is mounted, several seconds before the item is
-    /// ready (device: `readyToPlay` at t+4.5s), so a one-shot attach races
-    /// AVFoundation's automatic selection and loses.
-    ///
-    /// It does not wait for a selection to exist, or adopt one.
-    /// `suppressesPlayerRendering` applies to whatever legible option is or
-    /// LATER BECOMES selected, so the output only has to be on the item before
-    /// the first cue is drawn. Gating on a current selection just reintroduced
-    /// the race. Automatic selection is left alone on purpose: it honours the
-    /// system captioning preference and the preferred languages `loadLive`
-    /// passes, and disabling it would mean nothing is ever selected at all.
+    /// Attach the legible output to every native item as soon as it exists.
+    /// Do not attach once after `loadLive` or wait for a selection: the item is
+    /// ready several seconds after `load` returns (device: t+4.5s), and a late
+    /// attach loses to AVFoundation's automatic selection, which stays on so the
+    /// system caption preference and `loadLive`'s languages apply.
     private func bindNativeLegibleAttachment(_ aether: AetherPlayer) {
         aether.$currentAVPlayer
             .receive(on: DispatchQueue.main)
@@ -1349,28 +1399,15 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     private func attachNativeLegible(to item: AVPlayerItem) {
         guard isNativeHLSRoute, Self.isRemoteItem(item), nativeLegibleItem !== item else { return }
 
-        // Attached NOW, not after readiness. AVFoundation makes its automatic
-        // legible selection around `readyToPlay` (t+4.5s on device) and renders
-        // that option natively from the very first cue. An output attached
-        // after has already lost the first pass — which is why captions came up
-        // in AVPlayer's own rendering on a live HLS channel until the user
-        // toggled them off and on, at which point the now-attached output took
-        // over and they became ours.
-        //
-        // Being early is free: `suppressesPlayerRendering` applies to whatever
-        // option is or later becomes selected, so the output does not need a
-        // selection to exist yet. Waiting was defensive — "nothing attached
-        // until the item loads, so this can never be why a stream fails" — but
-        // an AVPlayerItemLegibleOutput is a passive attachment, and the cost of
-        // the caution was a wrong first render on every channel.
+        // Attach before readiness: AVFoundation selects around `readyToPlay` and
+        // renders natively from the first cue, and `suppressesPlayerRendering`
+        // covers options selected later, so attaching early is free.
         ensureNativeLegibleOutput(on: item)
         nativeLegibleActive = true
 
         Task { @MainActor [weak self] in
-            // The GROUP is only needed so the subtitle panel can list and switch
-            // renditions, and it genuinely does need a loaded asset. Cue
-            // delivery does not depend on it: the output is already on the item
-            // and receives whatever automatic selection settles on.
+            // The group, which needs a loaded asset, only feeds the subtitle
+            // panel's list. Cue delivery does not wait for it.
             guard await Self.itemBecameReady(item) else { return }
             guard let self,
                   self.isNativeHLSRoute,
@@ -1410,17 +1447,12 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             self?.handleNativeLegible(strings: strings, at: itemTime)
         }
         let output = AVPlayerItemLegibleOutput()
-        // The engine's surface hosts a REAL AVPlayerLayer on the
-        // nativeRemoteHLS path, and AVPlayerLayer paints selected legible
-        // content itself. This defaults to FALSE, so without it the native
-        // render stacks on top of our overlay: double captions, and the
-        // native roll-up repaint reads as constant blinking.
+        // The engine surface hosts a real AVPlayerLayer here, which paints
+        // selected legible content itself: without this, double captions.
         output.suppressesPlayerRendering = true
-        // Content-specified styling ONLY. `.default` bakes the user's caption
-        // appearance into every run, which would make every cue look
-        // "content-coloured" and defeat the Video Override gate in the overlay
-        // (CaptionStyle.allowsContentColor). With .sourceAndRulesOnly a colour
-        // attribute is present iff the WebVTT actually specified one.
+        // `.default` bakes the user's caption style into every run and defeats
+        // the Video Override gate; this way a colour is present only if the
+        // WebVTT set one.
         output.textStylingResolution = .sourceAndRulesOnly
         output.setDelegate(bridge, queue: .main)
         item.add(output)
@@ -1429,20 +1461,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         nativeLegibleItem = item
     }
 
-    /// Each legible-output event replaces the on-screen text wholesale (open
-    /// ended: valid until the next event, mirroring how the engine's teletext
-    /// cues behave). Anti-blink measures for roll-up WebVTT:
-    ///  - EMPTY events fire at every cue boundary, so the clear is deferred
-    ///    ~0.5s and cancelled when the next cue arrives.
-    ///  - Identical re-emissions (the same block re-delivered each segment)
-    ///    are ignored so cue identities — and their SwiftUI views — survive.
-    ///  - Cues are TIMELESS (startTime 0, endTime huge). This pipeline is
-    ///    event-driven — whatever the last event delivered IS what's on screen
-    ///    — so cues must never be gated by SubtitleModel's clock: the legible
-    ///    output's itemTime is on the AVPlayerItem axis while the model runs
-    ///    on the engine's sourceTime axis (different on live HLS), and legible
-    ///    events can arrive AHEAD of display time. Either mismatch would make
-    ///    time-stamped cues flicker around the clock boundary.
+    /// Each event replaces the on-screen text until the next one. Empty events
+    /// fire at every cue boundary, so the clear waits ~0.5s; identical
+    /// re-emissions are ignored. Cues are timeless because itemTime is on the
+    /// item's axis and SubtitleModel runs on the engine's sourceTime.
     private func handleNativeLegible(strings: [NSAttributedString], at itemTime: CMTime) {
         let lines = strings.compactMap(Self.styledLine(from:))
 
@@ -1557,18 +1579,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         var placement: AetherSubtitleCue.TextPlacement?
     }
 
-    /// Converts a legible-output attributed string into styled runs.
-    ///
-    /// This is the ONLY way styling reaches the overlay on the remote-HLS
-    /// path: the rendition belongs to AVPlayer, the engine never demuxes it,
-    /// so nothing arrives on `subtitleCues` and the 5.26.0 / 5.27.0 engine
-    /// styling does not apply here. AVFoundation does surface the full
-    /// text-markup set on the legible output, so the same attributes are
-    /// recovered from it instead — every one present iff the WebVTT actually
-    /// specified it, thanks to `.sourceAndRulesOnly`.
-    ///
-    /// Whitespace-only strings return nil; edge whitespace is trimmed so
-    /// placement matches the plain-text path.
+    /// Converts a legible-output attributed string into styled runs, the only
+    /// source of styling on the remote-HLS path since the engine never sees the
+    /// rendition. Whitespace-only strings return nil; edges are trimmed.
     private static func styledLine(from attr: NSAttributedString) -> StyledLine? {
         guard !attr.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 
@@ -1623,20 +1636,10 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         return StyledLine(runs: runs, placement: cuePlacement(from: attr))
     }
 
-    /// The cue's own placement, from the cue-level markup attributes (uniform
-    /// across the string, so read at index 0).
-    ///
-    /// WebVTT `line` is a percentage down the frame and `position` a
-    /// percentage across; `align` gives the column. Mapped to the same ASS
-    /// numpad + normalized-anchor model the engine uses on its own demux
-    /// path, so the overlay places an engine cue and an AVPlayer cue the same
-    /// way. Anchored to the frame edge the line is nearer, matching how the
-    /// engine resolves it (AE 5.27.0) — the spec's default line alignment
-    /// pins the box top, which would hang a two-line cue off the bottom at
-    /// `line:90%`.
-    ///
-    /// nil when the cue asked for nothing, which is the common case and puts
-    /// it in the overlay's default band.
+    /// Maps WebVTT `line`/`position`/`align` (read at index 0) onto the engine's
+    /// ASS numpad model, anchored to the nearer frame edge as the engine does.
+    /// The spec's top anchor would hang a two-line cue off the bottom at 90%.
+    /// nil when the cue asked for nothing.
     private static func cuePlacement(from attr: NSAttributedString) -> AetherSubtitleCue.TextPlacement? {
         guard attr.length > 0 else { return nil }
         let attrs = attr.attributes(at: 0, effectiveRange: nil)
@@ -1698,23 +1701,14 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         presentPane(content: list, pill: railView.upNextButton)
     }
 
-    /// Switches channels IN PLACE: tear the current session down, adopt the
-    /// new channel, start again. The VC, its chrome, and the render surface
-    /// all survive.
-    ///
-    /// Deliberately not "dismiss self and present a fresh player": this VC is
-    /// presented from a SwiftUI host whose view leaves the window hierarchy
-    /// while the player covers it, so the re-present landed on a detached
-    /// controller ("whose view is not in the window hierarchy") — the new
-    /// player loaded its stream but never appeared, and the outgoing one kept
-    /// running because its teardown is driven by `viewDidDisappear`, which
-    /// never came. Reloading in place has no such dependency, and skips a
-    /// full modal transition per channel change.
+    /// Switches channels in place; the VC, chrome and render surface survive.
+    /// Do not dismiss and re-present: the presenting SwiftUI host is out of the
+    /// window while the player covers it, so a new player never appears.
     private func switchChannel(to newChannel: UnifiedChannel) {
         guard newChannel.id != channel.id else { return }
         cancelRetune()
         retuneBudget = LiveRetuneBudget()
-        teardownPlaybackSession()
+        teardownPlaybackSession(keepingPlayer: true)
         channel = newChannel
         // Rail must not keep showing the old channel's programme while the
         // new one resolves.
@@ -1915,6 +1909,7 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     // MARK: - Remote handling
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if activePanel?.isPane == true { restartAutoHide() }
         for press in presses {
             switch press.type {
             case .menu:
@@ -2212,7 +2207,8 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     /// Plex answers a tune with no free tuner the same way as other tuner
     /// faults, so busy is the likely reason, not a certain one.
     private static func notice(forResolveError error: Error) -> String? {
-        error is PlexLiveTuneError ? "Couldn't tune this channel. All tuners may be busy." : nil
+        if error is PlexLiveTuneError { return "Couldn't tune this channel. All tuners may be busy." }
+        return (error as? TvheadendError)?.errorDescription
     }
 
     private static let tunersBusyNotice = "All tuners are busy. Stop another stream and try again."
@@ -2278,17 +2274,9 @@ final class LiveTVAetherPlayerViewController: UIViewController {
             startLiveSessionKeepAlive(for: freshURL)
 
             if stage == 1 {
-                // Retry through the engine's own demuxer (no native-HLS
-                // shortcut). Plex URLs also drop directPlay → 0 here: if the
-                // server refused raw passthrough on the first attempt, the
-                // fresh session retries as a pure direct-stream remux.
-                //
-                // Only a raw source can take the demuxer. Forcing it on a
-                // playlist hands an m3u8 body to the engine's raw path, which
-                // fails closed by design, so the retry would be spent before
-                // it ran. A re-resolve that lands on the start.m3u8 consensus
-                // leg therefore retries natively: a fresh tune is still a real
-                // second chance at a session that died server-side.
+                // Retry through the engine demuxer, with Plex dropping to
+                // directPlay=0. A playlist cannot take the demuxer (its raw path
+                // refuses m3u8), so a start.m3u8 re-resolve retries natively.
                 let retryURL = Self.forcingDirectStream(freshURL)
                 let isPlaylist = AetherPlayer.liveRoute(for: retryURL,
                                                         forceEngineDemux: false) == .nativeHLS
@@ -2360,11 +2348,8 @@ final class LiveTVAetherPlayerViewController: UIViewController {
     // MARK: - Subtitle overlay (same overlay as Aether VOD)
 
     private func mountSubtitleOverlay() {
-        // A plain subview, not a hosting controller. That removes the safe-area
-        // problem this used to need a workaround for: a hosting controller
-        // applies the tvOS ~60pt title-safe inset to its content, so the overlay
-        // measured against the inset box and every bottom margin came out that
-        // much too high (the rail gap measured about double its intended 5%).
+        // A plain subview: a hosting controller applies the ~60pt title-safe
+        // inset, which pushes every caption margin that much too high.
         let overlay = CaptionOverlayView(
             model: subtitleModel,
             style: captionStyle,
@@ -2398,6 +2383,11 @@ final class LiveTVAetherPlayerViewController: UIViewController {
         overlay.videoSize = aetherPlayer?.videoSize ?? .zero
         // Height is sticky per channel, like the delay stepper.
         overlay.heightUnits = subtitleHeightUnits
+        let pane = activePanel?.isPane == true
+        if overlay.paneOpen != pane {
+            overlay.paneOpen = pane
+            if animated { UIView.animate(withDuration: 0.25) { overlay.layoutIfNeeded() } }
+        }
         overlay.setControlsVisible(railVisible || timelineVisible, animated: animated)
     }
 

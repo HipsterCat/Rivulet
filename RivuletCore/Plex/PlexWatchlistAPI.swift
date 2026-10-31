@@ -5,19 +5,10 @@
 //  PlexWatchlistAPI.swift
 //  Rivulet
 //
-//  HTTP layer for the Plex Discover Watchlist.
-//
-//  Two host families are involved:
-//
-//  - `discover.provider.plex.tv` serves the watchlist itself
-//    (`/library/sections/watchlist/all`) AND the actions
-//    (`/actions/addToWatchlist`, `/actions/removeFromWatchlist`).
-//    Container pagination headers are NOT accepted on the watchlist endpoint.
-//
-//  - `metadata.provider.plex.tv` serves the discover-side metadata, including
-//    the matches lookup needed to resolve an external GUID (tmdb://, imdb://,
-//    tvdb://) to a Plex Discover ratingKey. The action endpoints want THAT
-//    ratingKey, not the external GUID.
+//  HTTP layer for the Plex Discover Watchlist. `discover.provider.plex.tv` serves
+//  the list and the add/remove actions (no container paging headers);
+//  `metadata.provider.plex.tv` resolves an external GUID to the Discover
+//  ratingKey the actions want.
 //
 
 import Foundation
@@ -39,6 +30,9 @@ struct PlexWatchlistHTTPError: Error, LocalizedError {
 
 protocol PlexWatchlistAPIProtocol: Sendable {
     func fetchAll(token: String) async throws -> [PlexWatchlistItem]
+    /// The list's size and newest entry in one 1-item request (about 2.4 KB): an add moves
+    /// the newest entry, a removal moves the count.
+    func head(token: String) async throws -> (totalSize: Int, newestID: String?)
     /// `type` disambiguates the Discover match. Pass it whenever it's known:
     /// tmdb movie ids and tmdb TV ids are separate namespaces that collide on
     /// the same number, so probing movie-first can match a completely
@@ -87,28 +81,31 @@ final class PlexWatchlistAPI: PlexWatchlistAPIProtocol, Sendable {
         return items
     }
 
+    func head(token: String) async throws -> (totalSize: Int, newestID: String?) {
+        let page = try await fetchPage(token: token, start: 0, size: 1)
+        return (page.totalSize, page.newestRawID)
+    }
+
     private struct WatchlistPage {
         let items: [PlexWatchlistItem]
         /// Entries Plex returned, before movie/show filtering.
         let rawCount: Int
+        let newestRawID: String?
         let totalSize: Int
         let pageSize: Int
     }
 
-    private func fetchPage(token: String, start: Int) async throws -> WatchlistPage {
+    private func fetchPage(token: String, start: Int, size: Int = pageSize) async throws -> WatchlistPage {
         let url = discoverHost.appendingPathComponent("library/sections/watchlist/all")
         var components = URLComponents(url: url, resolvingAgainstBaseURL: true)!
-        // Container-Start is what makes Container-Size stick on Plex (the same
-        // pairing rule the PMS endpoints follow); size alone is honoured here
-        // too, but both are sent so the offset is never ambiguous.
-        //
-        // includeGuids=1 is required — without it, the `Guid` array is
-        // omitted from the response and we can't resolve items to tmdb:// for
-        // library matching or context-menu navigation.
+        // Container-Start makes Container-Size stick. includeGuids=1, or the
+        // `Guid` array is omitted and items can't be matched by tmdb://.
         components.queryItems = [
             URLQueryItem(name: "includeGuids", value: "1"),
             URLQueryItem(name: "X-Plex-Container-Start", value: "\(start)"),
-            URLQueryItem(name: "X-Plex-Container-Size", value: "\(Self.pageSize)"),
+            URLQueryItem(name: "X-Plex-Container-Size", value: "\(size)"),
+            // The parser reads none of these; Image alone is half of each entry (measured).
+            URLQueryItem(name: "excludeElements", value: "Image,Role,Genre,Country,Director,Writer"),
             URLQueryItem(name: "X-Plex-Token", value: token)
         ]
 
@@ -180,8 +177,9 @@ final class PlexWatchlistAPI: PlexWatchlistAPIProtocol, Sendable {
         }
         return WatchlistPage(items: items,
                              rawCount: raws.count,
+                             newestRawID: raws.first?.ratingKey,
                              totalSize: decoded.MediaContainer.totalSize ?? raws.count,
-                             pageSize: Self.pageSize)
+                             pageSize: size)
     }
 
     func add(guids: [String], type: PlexWatchlistItem.WatchlistType?, token: String) async throws {

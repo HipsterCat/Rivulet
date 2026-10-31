@@ -1,21 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  ConfirmationPopupViewController.swift
-//  Rivulet
-//
-//  The canonical Yes/No confirmation popup. Shares the exact card chrome of
-//  `InfoPopupViewController` (centered frosted Liquid-Glass card, corner 38,
-//  dim 0.4 backdrop) with two focusable pill buttons at the bottom. Use this
-//  for every confirm/cancel prompt so popups stay consistent app-wide. With
-//  `cancelTitle: nil` it is a notice: one button (an error, say).
-//
-//  tvOS focus: each button is the focus target and owns Select via a press-typed
-//  tap recognizer (a bare control's primaryAction doesn't fire on Select). Menu
-//  cancels. The confirm button takes initial focus (cancel, for destructive
-//  prompts).
-//
+//  The app's one Yes/No popup, on `InfoPopupViewController`'s card; `cancelTitle: nil`
+//  makes it a one-button notice. Buttons own Select through press recognizers, and Menu cancels.
+//  Confirm takes initial focus, or cancel for a destructive prompt.
 
 import UIKit
 
@@ -31,8 +19,8 @@ final class ConfirmationPopupViewController: UIViewController {
     private let onCancel: (() -> Void)?
 
     private let card = UIView()
-    private var confirmButton: PillButton!
-    private var cancelButton: PillButton?
+    private var confirmButton: PopupPillButton!
+    private var cancelButton: PopupPillButton?
 
     init(title: String,
          message: String,
@@ -82,11 +70,11 @@ final class ConfirmationPopupViewController: UIViewController {
                                  color: .white.withAlphaComponent(0.85), lines: 0)
         messageLabel.textAlignment = .center
 
-        confirmButton = PillButton(title: confirmTitle, destructive: destructive) { [weak self] in
+        confirmButton = PopupPillButton(title: confirmTitle, destructive: destructive) { [weak self] in
             self?.dismiss(animated: true) { self?.onConfirm() }
         }
         cancelButton = cancelTitle.map { title in
-            PillButton(title: title, destructive: false) { [weak self] in self?.cancel() }
+            PopupPillButton(title: title, destructive: false) { [weak self] in self?.cancel() }
         }
 
         let buttonRow = UIStackView(arrangedSubviews: [cancelButton, confirmButton].compactMap { $0 })
@@ -160,7 +148,7 @@ final class ConfirmationPopupViewController: UIViewController {
 /// A focusable pill: bright white + dark text on focus, translucent glass
 /// otherwise (destructive turns red on focus). Owns Select via a press-typed
 /// tap recognizer, since a bare control's primaryAction doesn't fire on tvOS.
-private final class PillButton: UIView {
+final class PopupPillButton: UIView {
 
     private let labelView = UILabel()
     private let onPress: () -> Void
@@ -199,6 +187,9 @@ private final class PillButton: UIView {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func pressed() { onPress() }
+
+    /// Replaces the label, e.g. with a symbol attachment; it keeps the focus colour.
+    func setTitle(_ title: NSAttributedString) { labelView.attributedText = title }
 
     private func applyUnfocusedStyle() {
         backgroundColor = UIColor.white.withAlphaComponent(0.12)

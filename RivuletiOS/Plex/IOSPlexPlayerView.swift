@@ -17,6 +17,10 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     @Published private(set) var chosenAudioID: Int?
     @Published private(set) var chosenSubtitleID: Int?
     var onItemChange: (() -> Void)?
+    /// A playlist plays through this instead of the show's next episode.
+    @Published private(set) var queue: PlayQueue<PlexMetadata>?
+    /// The server's reason when it ended this play session (dashboard Stop, paused too long; #403).
+    @Published private(set) var serverStopReason: String?
 
     private let plex: IOSPlexSession
     private var skippedMarkerIDs: Set<String> = []
@@ -27,6 +31,8 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     private var nextTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
     private var longStallTask: Task<Void, Never>?
+    /// Paused timelines every 10 s, as Plex clients send, so the server can end a paused session.
+    private var pausedTimelineTask: Task<Void, Never>?
     private var stallTracker = StallTracker()
     /// The player-menu pick; nil follows the Home or Away setting, item by item.
     private var sessionQuality: StreamingQuality?
@@ -35,11 +41,16 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     private var pendingEngineSubtitle: Int?
     private var hasPlayed = false
     private var didFallBack = false
+    /// Subtitles turned off in the player hold for this title, whatever the saved mode.
+    private var subtitlesPickedOff = false
+    /// A direct-play title still to pick its starting tracks once the engine lists them.
+    private var needsStartingTracks = false
     private var cancellables = Set<AnyCancellable>()
 
-    init(request: IOSPlexPlaybackRequest, plex: IOSPlexSession) {
+    init(request: IOSPlexPlaybackRequest, plex: IOSPlexSession, queue: PlayQueue<PlexMetadata>? = nil) {
         self.request = request
         self.plex = plex
+        self.queue = queue
         observePlayer()
     }
 
@@ -54,7 +65,7 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     func begin() async {
         lookUpNextEpisode()
-        await load()
+        await load(startsItem: true)
     }
 
     func end() {
@@ -63,6 +74,7 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
         nextTask?.cancel()
         reloadTask?.cancel()
         longStallTask?.cancel()
+        pausedTimelineTask?.cancel()
         let finish = finishItem(at: player.currentTime)
         let plex = plex
         let request = request
@@ -80,14 +92,29 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     // MARK: - Loading
 
-    private func load(keepingTransport: Bool = false) async {
+    /// `startsItem` picks the title's starting tracks from Plex's per-item picks and the saved intents.
+    private func load(keepingTransport: Bool = false, startsItem: Bool = false) async {
         hasPlayed = false
         stallTracker.noteSeekOrLoad(at: .now)
+        if startsItem {
+            subtitlesPickedOff = false
+            needsStartingTracks = !isTranscoding
+            // Plex reads the part's selection when a transcode session starts.
+            if isTranscoding {
+                let start = TrackIntentResolver.startingPlexSelection(streams: plexStreams)
+                if start.audio != request.selectedPlexStreamID(streamType: 2)
+                    || start.subtitle != request.selectedPlexStreamID(streamType: 3) ?? 0 {
+                    await plex.selectStream(audioID: start.audio, subtitleID: start.subtitle, in: request)
+                }
+                chosenAudioID = start.audio
+                chosenSubtitleID = start.subtitle
+            }
+        }
         // A transcode's text subtitle arrives as a WebVTT rendition nothing selects; the file
         // opens on its default tracks, so picks made on a transcode carry back.
         pendingEngineAudio = isTranscoding ? nil : chosenAudioID
         pendingEngineSubtitle = isTranscoding ? selectedSubtitleID : chosenSubtitleID
-        await plex.openTranscode(request)
+        await plex.openPlaySession(request)
         try? await player.load(
             url: request.url,
             headers: request.headers,
@@ -194,9 +221,35 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     private var isTranscoding: Bool { request.plan != .original }
 
-    /// A transcode lists the part's Plex streams; the file's own tracks otherwise.
+    /// By language over "TrueHD 7.1 Atmos • Commentary", never the file's own track titles.
     var audioTracks: [AetherPlayer.Track] {
-        isTranscoding ? request.plexTracks(streamType: 2) : player.audioTracks
+        mediaAudio.map { track in
+            AetherPlayer.Track(id: track.id, name: track.audioMenuTitle, codec: "", language: nil, channels: 0,
+                               isDefault: track.isDefault, isForced: false, isHearingImpaired: false,
+                               menuDetail: track.audioMenuSubtitle)
+        }
+    }
+
+    /// The tracks the menu and the saved intents read: Plex's streams on a transcode,
+    /// the engine's joined to them otherwise (ids are the engine's there).
+    private var mediaAudio: [MediaTrack] {
+        let plexAudio = plexStreams.filter(\.isAudio).map { MediaTrack(from: $0) }
+        return isTranscoding ? plexAudio : TrackMerge.mergeAudio(engine: player.audioTracks.map(Self.mediaTrack), plex: plexAudio)
+    }
+
+    private var mediaSubtitles: [MediaTrack] {
+        let plexSubtitles = plexStreams.filter(\.isSubtitle).map { MediaTrack(from: $0) }
+        return isTranscoding
+            ? plexSubtitles
+            : TrackMerge.mergeSubtitles(engine: player.subtitleTracks.map(Self.mediaTrack), plex: plexSubtitles)
+    }
+
+    private static func mediaTrack(_ track: AetherPlayer.Track) -> MediaTrack {
+        MediaTrack(id: track.id, name: track.name, language: track.language, languageCode: track.language,
+                   codec: track.codec, isDefault: track.isDefault, isForced: track.isForced,
+                   isHearingImpaired: track.isHearingImpaired, isCommentary: track.isCommentary,
+                   isAudioDescription: track.isAudioDescription, channels: track.channels > 0 ? track.channels : nil,
+                   streamIndex: track.isExternal ? nil : track.id, isExternal: track.isExternal)
     }
 
     var selectedAudioID: Int? {
@@ -214,13 +267,40 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     }
 
     /// On a transcode the server renders the tracks, so a change restarts it at the playhead.
+    /// A pick other than what the saved intent resolves to becomes the new intent.
     func selectAudio(_ id: Int) {
-        guard isTranscoding else { return player.selectAudioTrack(id: id) }
+        let tracks = mediaAudio
+        if let track = tracks.first(where: { $0.id == id }),
+           TrackIntentResolver.resolveAudio(intent: TrackIntentStore.effectiveAudioIntent, in: tracks)?.id != id {
+            TrackIntentStore.audioIntent = AudioIntent(from: track)
+        }
+        let subtitle = foreignAudioSubtitle(forAudio: tracks.first { $0.id == id })
+        guard isTranscoding else {
+            player.selectAudioTrack(id: id)
+            if let subtitle { player.selectSubtitleTrack(id: subtitle == 0 ? nil : subtitle) }
+            return
+        }
         chosenAudioID = id
-        reload(quality: request.quality, plan: request.plan, streams: (id, nil))
+        if let subtitle { chosenSubtitleID = subtitle }
+        reload(quality: request.quality, plan: request.plan, streams: (id, subtitle))
+    }
+
+    /// Foreign Audio follows a new audio language unless subtitles were turned off for this
+    /// title: the subtitle to switch to, 0 for off, nil to leave them.
+    private func foreignAudioSubtitle(forAudio audio: MediaTrack?) -> Int? {
+        let intent = TrackIntentStore.effectiveSubtitleIntent
+        guard case .foreignAudio = intent, !subtitlesPickedOff, let audio else { return nil }
+        return TrackIntentResolver.resolveSubtitle(intent: intent, in: mediaSubtitles,
+                                                   audioLanguage: audio.languageCode ?? audio.language)?.id ?? 0
     }
 
     func selectSubtitle(_ id: Int?) {
+        subtitlesPickedOff = id == nil
+        let audio = mediaAudio.first { $0.id == selectedAudioID }
+        TrackIntentStore.subtitleIntent = .afterPick(
+            id.flatMap { id in mediaSubtitles.first { $0.id == id } },
+            replacing: TrackIntentStore.effectiveSubtitleIntent,
+            audioLanguage: audio?.languageCode ?? audio?.language)
         guard isTranscoding else { return player.selectSubtitleTrack(id: id) }
         chosenSubtitleID = id ?? 0
         reload(quality: request.quality, plan: request.plan, streams: (nil, id ?? 0))
@@ -244,6 +324,7 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     /// Selects the pending Plex picks once the engine lists tracks they can map to.
     private func applyPendingEngineTracks() {
+        if needsStartingTracks, !player.audioTracks.isEmpty { pickStartingTracks() }
         let streams = plexStreams
         if let id = pendingEngineAudio, let index = streams.first(where: { $0.id == id })?.index,
            player.audioTracks.contains(where: { $0.id == index }) {
@@ -266,6 +347,29 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
         guard let match else { return }
         pendingEngineSubtitle = nil
         player.selectSubtitleTrack(id: match.id)
+    }
+
+    /// Direct play: Plex's per-item picks, else the saved intents, resolved on the engine's
+    /// tracks so its audio-description and commentary flags count.
+    private func pickStartingTracks() {
+        needsStartingTracks = false
+        let streams = plexStreams
+        let audio = mediaAudio
+        let chosenIndex = TrackIntentResolver.plexChosenAudioStreamID(
+            in: streams, hasAudioIntent: TrackIntentStore.audioIntent != nil
+        ).flatMap { id in streams.first { $0.id == id }?.index }
+        let audioTrack = audio.first { chosenIndex != nil && $0.streamIndex == chosenIndex }
+            ?? TrackIntentResolver.resolveAudio(intent: TrackIntentStore.effectiveAudioIntent, in: audio)
+        if let audioTrack, audioTrack.id != player.currentAudioTrackId { player.selectAudioTrack(id: audioTrack.id) }
+
+        let intent = TrackIntentStore.effectiveSubtitleIntent
+        if let chosen = TrackIntentResolver.plexChosenSubtitleStreamID(in: streams, intent: intent) {
+            pendingEngineSubtitle = chosen
+            return
+        }
+        let subtitle = TrackIntentResolver.resolveSubtitle(
+            intent: intent, in: mediaSubtitles, audioLanguage: audioTrack?.languageCode ?? audioTrack?.language)
+        if subtitle?.id != player.currentSubtitleTrackId { player.selectSubtitleTrack(id: subtitle?.id) }
     }
 
     /// "eng" and "en" are the same language.
@@ -326,6 +430,7 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     }
 
     private func stateChanged(_ state: AetherPlayer.State) {
+        pausedTimelineTask?.cancel()
         switch state {
         case .playing:
             hasPlayed = true
@@ -333,6 +438,13 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
             report("playing")
         case .paused:
             report("paused")
+            pausedTimelineTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(10))
+                    guard !Task.isCancelled else { return }
+                    self?.report("paused")
+                }
+            }
         case .ended:
             finishItem(at: max(player.duration, player.currentTime))
             startUpNextCountdown()
@@ -355,11 +467,27 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     }
 
     private func report(_ state: String) {
-        guard !reportedStopped else { return }
+        // A session must open with "playing": the engine holds paused while loading, and a
+        // "paused" first makes Plex fire media.pause and never media.play (#433).
+        guard !reportedStopped, state != "paused" || hasPlayed else { return }
         let request = request
         let time = player.currentTime
         let plex = plex
-        Task { await plex.reportProgress(for: request, time: time, state: state) }
+        Task { [weak self] in
+            guard let reason = await plex.reportProgress(for: request, time: time, state: state),
+                  let self, self.request.id == request.id, !self.reportedStopped else { return }
+            self.endForServerTermination(reason)
+        }
+    }
+
+    /// The server stopped this stream: stop and show its reason, with nothing to retry.
+    private func endForServerTermination(_ reason: String) {
+        reportedStopped = true
+        pausedTimelineTask?.cancel()
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        player.stop()
+        serverStopReason = reason
     }
 
     /// Stopped, then a scrobble when the viewer got past the watched ceiling.
@@ -388,21 +516,37 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
     }
 
     private func evaluateAutoSkip(at time: TimeInterval) {
-        guard let marker = activeMarker else { return }
-        let key: String? = switch marker.type {
-        case "intro": "autoSkipIntro"
-        case "recap": "autoSkipRecap"
-        case "commercial": "autoSkipAds"
-        case "credits": "autoSkipCredits"
-        default: nil
-        }
-        if let key, UserDefaults.standard.bool(forKey: key) { skip(marker) }
+        guard let marker = activeMarker,
+              MarkerSkipMode.current(for: marker.type ?? "") == .automatic else { return }
+        skip(marker)
     }
 
     func skip(_ marker: PlexMarker) {
         skippedMarkerIDs.insert(marker.stableID)
         objectWillChange.send()
         Task { await player.seek(to: marker.end) }
+    }
+
+    // MARK: - Chapters
+
+    var chapters: [PlexChapter] { (request.item.Chapter ?? []).filter { $0.startTimeOffset != nil } }
+
+    /// The server's chapter image, sized for a `width`-point row.
+    func chapterImageURL(_ chapter: PlexChapter, width: Int) -> URL? {
+        guard !request.isLocal else { return nil }
+        return plex.imageURL(path: chapter.thumb, width: width, height: width * 9 / 16, serverID: request.item.serverID)
+    }
+
+    /// A frame from the file for a chapter the server has no image for. Not on a transcode,
+    /// where a second reader would open another server session.
+    func chapterStill(at seconds: TimeInterval) async -> UIImage? {
+        guard !isTranscoding, let frame = await player.still(atSeconds: seconds) else { return nil }
+        return UIImage(cgImage: frame)
+    }
+
+    func seekToChapter(_ chapter: PlexChapter) {
+        guard let start = chapter.startTimeOffset else { return }
+        Task { await player.seek(to: TimeInterval(start) / 1000) }
     }
 
     // MARK: - Up Next
@@ -416,6 +560,10 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     private func lookUpNextEpisode() {
         nextLookupTask?.cancel()
+        if let queue {
+            nextEpisode = queue.next
+            return
+        }
         let episode = request.item
         let request = request
         let plex = plex
@@ -449,8 +597,19 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
 
     func playNext() {
         guard let next = nextEpisode else { return }
+        switchItem(to: next, queueIndex: queue.map { $0.index + 1 })
+    }
+
+    /// The Playlist pane's pick, by position: a title can be in the list twice.
+    func playEntry(at index: Int) {
+        guard let queue, queue.entries.indices.contains(index), index != queue.index else { return }
+        switchItem(to: queue.entries[index], queueIndex: index)
+    }
+
+    private func switchItem(to next: PlexMetadata, queueIndex: Int?) {
         countdownTask?.cancel()
         upNextCountdown = nil
+        pausedTimelineTask?.cancel()
         finishItem(at: player.currentTime)
         nextTask?.cancel()
         reloadTask?.cancel()
@@ -464,6 +623,7 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
             let plex = plex
             Task { await plex.stopTranscode(previous) }
             request = nextRequest
+            if let queueIndex { queue?.jump(to: queueIndex) }
             chosenAudioID = nil
             chosenSubtitleID = nil
             didFallBack = false
@@ -473,9 +633,10 @@ final class IOSPlexPlayback: ObservableObject, IOSPlaybackSession {
             skippedMarkerIDs = []
             lastReportBucket = -1
             reportedStopped = false
+            serverStopReason = nil
             onItemChange?()
             lookUpNextEpisode()
-            await load()
+            await load(startsItem: true)
         }
     }
 }
@@ -485,6 +646,8 @@ private struct IOSPlexPlayerScreen: View {
     @ObservedObject var player: AetherPlayer
     @ObservedObject var controller: IOSPlaybackController
     @State private var captionStyle = CaptionAppearance.current()
+    @State private var showsPlaylist = false
+    @State private var showsChapters = false
 
     var body: some View {
         let item = session.request.item
@@ -492,8 +655,8 @@ private struct IOSPlexPlayerScreen: View {
             title: item.displayTitle,
             subtitle: item.subtitle,
             isPlaying: player.state == .playing,
-            isBusy: player.state == .idle || player.state == .loading || player.isBuffering
-                || (player.isStarting && player.state == .playing),
+            isBusy: session.serverStopReason == nil && (player.state == .idle || player.state == .loading
+                || player.isBuffering || (player.isStarting && player.state == .playing)),
             timeline: .vod(
                 position: player.pendingSeekTarget ?? player.currentTime,
                 duration: player.duration > 0 ? player.duration : item.durationSeconds
@@ -522,6 +685,7 @@ private struct IOSPlexPlayerScreen: View {
                 selectQuality: session.switchQuality,
                 selectAudio: session.selectAudio,
                 selectSubtitle: session.selectSubtitle,
+                stepAudioDelay: player.stepAudioDelay,
                 pictureInPicture: controller.startPictureInPicture,
                 toggleMute: { player.setMuted(!player.isMuted) },
                 setFillsScreen: { player.fillsScreen = $0 },
@@ -540,6 +704,36 @@ private struct IOSPlexPlayerScreen: View {
                     fillsScreen: player.fillsScreen
                 )
             }
+        } trailing: {
+            if !session.chapters.isEmpty {
+                Button { showsChapters = true } label: {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 44, height: 44)
+                        .glassEffect(.regular.interactive(), in: .circle)
+                }
+                .accessibilityLabel("Chapters")
+            }
+            if session.queue != nil {
+                Button { showsPlaylist = true } label: {
+                    Image(systemName: "list.bullet")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 44, height: 44)
+                        .glassEffect(.regular.interactive(), in: .circle)
+                }
+                .accessibilityLabel("Playlist")
+            }
+        }
+        .sheet(isPresented: $showsChapters) {
+            IOSPlayerChaptersPane(session: session, currentTime: player.currentTime)
+        }
+        .sheet(isPresented: $showsPlaylist) {
+            if let queue = session.queue {
+                IOSPlayerPlaylistPane(queue: queue) { index in
+                    showsPlaylist = false
+                    session.playEntry(at: index)
+                }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: CaptionAppearance.changedNotification)) { _ in
             captionStyle = CaptionAppearance.current()
@@ -547,23 +741,27 @@ private struct IOSPlexPlayerScreen: View {
     }
 
     private var failure: IOSPlayerFailure? {
+        if let reason = session.serverStopReason {
+            return IOSPlayerFailure(message: reason, canRetry: false, title: "Playback Stopped", systemImage: "stop.circle.fill")
+        }
         guard case .failed(let message) = player.state else { return nil }
         return IOSPlayerFailure(message: message, canRetry: player.canRetry)
     }
 
     private var contextualAction: IOSPlayerContextualAction? {
+        let next = session.queue == nil ? "Next Episode" : "Next"
         if let countdown = session.upNextCountdown {
             return IOSPlayerContextualAction(
-                title: "Next Episode in \(countdown)",
+                title: "\(next) in \(countdown)",
                 systemImage: "forward.end.fill",
                 action: session.playNext,
                 cancel: session.cancelUpNext
             )
         }
         if session.nextEpisode != nil, !session.upNextDismissed, session.isNearEnd {
-            return IOSPlayerContextualAction(title: "Next Episode", systemImage: "forward.end.fill", action: session.playNext)
+            return IOSPlayerContextualAction(title: next, systemImage: "forward.end.fill", action: session.playNext)
         }
-        if let marker = session.activeMarker {
+        if let marker = session.activeMarker, MarkerSkipMode.current(for: marker.type ?? "") != .off {
             return IOSPlayerContextualAction(
                 title: "Skip \(marker.displayName)",
                 systemImage: marker.isCommunity ? "person.3.fill" : nil,
@@ -571,5 +769,138 @@ private struct IOSPlexPlayerScreen: View {
             )
         }
         return nil
+    }
+}
+
+/// The playlist around the playing entry: 5 before it and 30 after, as on tvOS.
+private struct IOSPlayerPlaylistPane: View {
+    let queue: PlayQueue<PlexMetadata>
+    let onPick: (Int) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(Array(window), id: \.self) { index in
+                        let item = queue.entries[index]
+                        Button { onPick(index) } label: {
+                            HStack(spacing: 12) {
+                                IOSPlexArtwork(item: item, kind: item.type == "episode" ? .thumb : .backdrop,
+                                               width: 96, aspectRatio: 16 / 9)
+                                    .frame(width: 96, height: 54)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.displayTitle).font(.headline).lineLimit(2)
+                                    if let subtitle = item.subtitle {
+                                        Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                                if index == queue.index {
+                                    Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
+                                        .accessibilityLabel("Now Playing")
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(index == queue.index)
+                        .id(index)
+                    }
+                }
+                .listStyle(.plain)
+                .onAppear { proxy.scrollTo(queue.index, anchor: .top) }
+            }
+            .navigationTitle("Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(role: .confirm) { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private var window: Range<Int> {
+        max(0, queue.index - 5)..<min(queue.entries.count, queue.index + 31)
+    }
+}
+
+/// The title's chapters, opened on the one playing: the server's image, else a frame from the file.
+private struct IOSPlayerChaptersPane: View {
+    let session: IOSPlexPlayback
+    let currentTime: TimeInterval
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let chapters = session.chapters
+        let current = chapters.lastIndex { TimeInterval($0.startTimeOffset ?? 0) / 1000 <= currentTime }
+        NavigationStack {
+            ScrollViewReader { proxy in
+                List {
+                    ForEach(Array(chapters.enumerated()), id: \.offset) { index, chapter in
+                        Button {
+                            session.seekToChapter(chapter)
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 12) {
+                                ChapterThumbnail(session: session, chapter: chapter)
+                                    .frame(width: 96, height: 54)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(chapter.tag ?? "Chapter \(index + 1)").font(.headline).lineLimit(2)
+                                    Text(Self.time(chapter.startTimeOffset ?? 0))
+                                        .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                                if index == current {
+                                    Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
+                                        .accessibilityLabel("Now Playing")
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .id(index)
+                    }
+                }
+                .listStyle(.plain)
+                .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
+            }
+            .navigationTitle("Chapters")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(role: .confirm) { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private static func time(_ ms: Int) -> String {
+        let duration = Duration.milliseconds(ms)
+        return duration.formatted(.time(pattern: ms >= 3_600_000 ? .hourMinuteSecond : .minuteSecond))
+    }
+}
+
+private struct ChapterThumbnail: View {
+    let session: IOSPlexPlayback
+    let chapter: PlexChapter
+    @Environment(\.displayScale) private var displayScale
+    @State private var still: UIImage?
+
+    var body: some View {
+        if let url = session.chapterImageURL(chapter, width: Int(96 * displayScale)) {
+            IOSPlexImage(url: url)
+        } else {
+            Rectangle()
+                .fill(.quaternary)
+                .overlay { if let still { Image(uiImage: still).resizable().scaledToFill() } }
+                .clipped()
+                .task { still = await session.chapterStill(at: TimeInterval(chapter.startTimeOffset ?? 0) / 1000) }
+        }
     }
 }

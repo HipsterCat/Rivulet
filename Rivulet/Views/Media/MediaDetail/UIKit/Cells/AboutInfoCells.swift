@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//
-//  AboutInfoCells.swift
-//  Rivulet
-//
-//  The two static info blocks at the bottom of the UIKit expanded detail,
-//  matching the Apple TV+ show-detail reference (Docs/atv_ref/carousel_details_ref_about
-//  + _information):
-//
-//   - AboutCollectionCell  — "About" header + two cards: left = title / genres /
-//     synopsis, right = the content-rating block.
-//   - InfoColumnsCollectionCell — three columns: Information / Languages /
-//     Accessibility, the latter two derived from the item's media streams.
-//
-//  Both are single full-width cells in the below-fold compositional collection.
-//  Neither cell is focusable: each hosts focusable cards, which is what the
-//  focus-driven below-fold (FocusScrollControlledCollectionView) scrolls to.
-//
+//  The detail's About cards and Information / Languages / Accessibility columns
+//  (Docs/atv_ref/carousel_details_ref_about, _information). The cells are not focusable; their cards are.
 
 import UIKit
 
@@ -52,6 +37,10 @@ final class AboutCollectionCell: UICollectionViewCell {
     private let paragraphLabel = UILabel()
     private let fallbackCaption = UILabel()
 
+    // Review scores beside the advisory: two columns of three; select → ratings popup.
+    private let ratingsCard = AboutCardControl()
+    private let ratingsGrid = RatingsGridView()
+
     override init(frame: CGRect) {
         super.init(frame: frame)
 
@@ -62,6 +51,7 @@ final class AboutCollectionCell: UICollectionViewCell {
             card.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(card)
         }
+        for card in [leftCard, rightCard, ratingsCard] { card.focusScale = 1.02 }
         leftCard.onSelect = { [weak self] in
             guard let self, let d = self.currentDetail, !(d.item.overview ?? "").isEmpty else { return }
             self.onSelectSynopsis?(d)
@@ -95,6 +85,12 @@ final class AboutCollectionCell: UICollectionViewCell {
         advisoryStack.alignment = .leading
         advisoryStack.spacing = 12
         rightCard.addSubview(advisoryStack)
+
+        ratingsCard.onSelect = { [weak self] in self?.presentRatings() }
+        ratingsCard.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(ratingsCard)
+        ratingsGrid.translatesAutoresizingMaskIntoConstraints = false
+        ratingsCard.addSubview(ratingsGrid)
 
         ageLabel.font = .systemFont(ofSize: 58, weight: .bold)
         ageLabel.textColor = .white
@@ -139,14 +135,21 @@ final class AboutCollectionCell: UICollectionViewCell {
             leftCard.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
             leftCard.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             leftCard.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            // On the six-column grid: the synopsis spans two columns, the
-            // advisory one.
-            leftCard.widthAnchor.constraint(equalToConstant: MediaRowMetrics.gridWidth(columns: 6, span: 2)),
+            leftCard.widthAnchor.constraint(equalToConstant: Self.wideCard),
 
             rightCard.topAnchor.constraint(equalTo: leftCard.topAnchor),
             rightCard.leadingAnchor.constraint(equalTo: leftCard.trailingAnchor, constant: MediaRowMetrics.tileGap),
             rightCard.bottomAnchor.constraint(equalTo: leftCard.bottomAnchor),
-            rightCard.widthAnchor.constraint(equalToConstant: MediaRowMetrics.gridWidth(columns: 6)),
+            rightCard.widthAnchor.constraint(equalToConstant: Self.narrowCard),
+
+            ratingsCard.topAnchor.constraint(equalTo: leftCard.topAnchor),
+            ratingsCard.leadingAnchor.constraint(equalTo: rightCard.trailingAnchor, constant: MediaRowMetrics.tileGap),
+            ratingsCard.bottomAnchor.constraint(equalTo: leftCard.bottomAnchor),
+            ratingsCard.widthAnchor.constraint(equalToConstant: Self.wideCard),
+            ratingsGrid.topAnchor.constraint(equalTo: ratingsCard.topAnchor, constant: 22),
+            ratingsGrid.leadingAnchor.constraint(equalTo: ratingsCard.leadingAnchor, constant: 24),
+            ratingsGrid.trailingAnchor.constraint(equalTo: ratingsCard.trailingAnchor, constant: -24),
+            ratingsGrid.bottomAnchor.constraint(equalTo: ratingsCard.bottomAnchor, constant: -22),
 
             titleLabel.topAnchor.constraint(equalTo: leftCard.topAnchor, constant: 22),
             titleLabel.leadingAnchor.constraint(equalTo: leftCard.leadingAnchor, constant: 24),
@@ -177,6 +180,12 @@ final class AboutCollectionCell: UICollectionViewCell {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    // Synopsis, advisory and ratings split the full row 2:1:2, so Common Sense
+    // sits centred (Apple's cards are 2 and 1 grid columns, left-aligned).
+    private static let cardsWidth = 1920 - 2 * MediaRowMetrics.rowLeading - 2 * MediaRowMetrics.tileGap
+    private static let wideCard = (cardsWidth * 2 / 5).rounded(.down)
+    private static let narrowCard = (cardsWidth / 5).rounded(.down)
+
     func configure(detail: MediaItemDetail) {
         currentDetail = detail
         titleLabel.text = detail.item.title
@@ -194,15 +203,11 @@ final class AboutCollectionCell: UICollectionViewCell {
             oneLinerLabel.isHidden = (a.oneLiner ?? "").isEmpty
             fallbackCaption.isHidden = true
         } else {
-            // Fallback: content rating + numeric score (no CSM available).
+            // Fallback: content rating only (no CSM available).
             ageLabel.text = detail.contentRating ?? "NR"
             sealRow.isHidden = true
             oneLinerLabel.isHidden = true
-            if let rating = detail.rating {
-                fallbackCaption.text = "Rated · " + rating.summary
-            } else {
-                fallbackCaption.text = "Rated"
-            }
+            fallbackCaption.text = "Rated"
             fallbackCaption.isHidden = false
         }
         // Topics + paragraph are popup-only; never shown inline.
@@ -213,9 +218,41 @@ final class AboutCollectionCell: UICollectionViewCell {
         // when there's rich CSM (topics/paragraph worth a popup).
         leftCard.selectable = !(detail.item.overview ?? "").isEmpty
         rightCard.selectable = advisory?.hasRichDetail ?? false
+
+        ratingsGrid.configure(detail.ratings)
+        ratingsCard.isHidden = detail.ratings.isEmpty
+        ratingsCard.selectable = !detail.ratings.isEmpty
     }
-    // Focus lives on the two cards (AboutCardControl), not the cell itself.
+
+    private func presentRatings() {
+        guard let ratings = currentDetail?.ratings, !ratings.isEmpty,
+              var top = window?.rootViewController else { return }
+        while let presented = top.presentedViewController { top = presented }
+        top.present(InfoPopupViewController(content: InfoPopupContent.ratings(ratings), width: 720), animated: true)
+    }
+    // Focus lives on the cards (AboutCardControl), not the cell itself.
     override var canBecomeFocused: Bool { false }
+
+    /// The card focus left from, so returning from its popup lands back on it
+    /// instead of the first card.
+    private weak var lastFocusedCard: AboutCardControl?
+
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        if let card = lastFocusedCard, card.canBecomeFocused, !card.isHidden { return [card] }
+        return super.preferredFocusEnvironments
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        if let card = context.nextFocusedView as? AboutCardControl, card.isDescendant(of: contentView) {
+            lastFocusedCard = card
+        }
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        lastFocusedCard = nil
+    }
 }
 
 // MARK: - Information / Languages / Accessibility columns
@@ -243,7 +280,7 @@ final class InfoColumnsCollectionCell: UICollectionViewCell {
         ])
     }
 
-    /// 14 puts the 38 pt header's baseline 50 below the band top.
+    /// 14 puts the 36 pt header's baseline 48 below the band top.
     private static let topInset: CGFloat = 14
     private static let bottomInset: CGFloat = 56
 
@@ -266,11 +303,16 @@ final class InfoColumnsCollectionCell: UICollectionViewCell {
 
     /// Select on a column opens the same full-info popup as the hero Info button.
     private func presentFullInfo() {
-        guard let detail, var top = window?.rootViewController else { return }
-        while let presented = top.presentedViewController { top = presented }
-        let popup = InfoPopupViewController(content: InfoPopupContent.fullInfo(detail: detail),
-                                            width: 900, height: 900, scrollable: true)
-        top.present(popup, animated: true)
+        guard var detail else { return }
+        Task { [weak self] in
+            let extra = await RatingsClient.shared.ratings(for: detail, within: 1)
+            if !extra.isEmpty { detail.ratings = MediaRating.ordered(detail.ratings + extra) }
+            guard var top = self?.window?.rootViewController else { return }
+            while let presented = top.presentedViewController { top = presented }
+            let popup = InfoPopupViewController(content: InfoPopupContent.fullInfo(detail: detail),
+                                                width: InfoPopupViewController.infoWidth, height: 900, scrollable: true)
+            top.present(popup, animated: true)
+        }
     }
 }
 
@@ -372,24 +414,40 @@ final class InfoColumnView: UIView {
     /// Type and spacing for one use of the column. `standard` is the Info popup
     /// and the episode page; `footer` is the movie/show page's bottom band.
     nonisolated struct Style {
-        var headerFont = UIFont.systemFont(ofSize: 40, weight: .bold)
-        var headerColor = UIColor.white
+        // Measured on device (tvOS 27): 29 pt header, 23 pt label and value, 80 pt row pitch.
+        var headerFont = UIFont.systemFont(ofSize: 29, weight: .bold)
+        var headerColor = UIColor.white.withAlphaComponent(0.7)
         var headerGap: CGFloat = 20
-        var labelFont = UIFont.systemFont(ofSize: 21, weight: .semibold)
-        var labelColor = UIColor.white.withAlphaComponent(0.5)
-        var valueFont = UIFont.systemFont(ofSize: 26, weight: .semibold)
-        var valueColor = UIColor.white.withAlphaComponent(0.9)
+        var labelFont = UIFont.systemFont(ofSize: 23, weight: .medium)
+        var labelColor = UIColor.white.withAlphaComponent(0.31)
+        var valueFont = UIFont.systemFont(ofSize: 23, weight: .medium)
+        var valueColor = UIColor.white.withAlphaComponent(0.7)
         var valueLines = 0
         var valueLineSpacing: CGFloat = 0
-        var pairGap: CGFloat = 2
-        var rowGap: CGFloat = 14
+        var pairGap: CGFloat = 1
+        var rowGap: CGFloat = 24
         var columnGap: CGFloat = 48
         /// Wraps the rows (not the header) in a focusable card.
         var focusCard = false
 
-        static let standard = Style()
-        static let footer = Style(
+        /// The info popup (the defaults above).
+        static let popup = Style()
+        /// The episode page's columns: the footer's type with a 38 pt header, no card.
+        static let standard = Style(
             headerFont: .systemFont(ofSize: 38, weight: .bold),
+            headerColor: UIColor.white.withAlphaComponent(0.7),
+            headerGap: 30,
+            labelFont: .systemFont(ofSize: 23, weight: .medium),
+            labelColor: UIColor.white.withAlphaComponent(0.3),
+            valueFont: .systemFont(ofSize: 23, weight: .medium),
+            valueColor: UIColor.white.withAlphaComponent(0.7),
+            valueLines: 5,
+            valueLineSpacing: 2,
+            pairGap: 9,
+            rowGap: 30,
+            columnGap: 50)
+        static let footer = Style(
+            headerFont: .systemFont(ofSize: 36, weight: .bold),
             headerColor: UIColor.white.withAlphaComponent(0.7),
             headerGap: 30,
             labelFont: .systemFont(ofSize: 23, weight: .medium),
@@ -419,10 +477,8 @@ final class InfoColumnView: UIView {
         stack.axis = .vertical
         stack.alignment = .fill
         addSubview(stack)
-        // Bottom pinned with `=` at high (not required) priority so the column
-        // HUGS its content when nothing else drives its height (the vertically-
-        // stacked Info popup). In the below-fold's horizontal `.fill` row, the
-        // required equal-height stretch outranks this and still wins.
+        // High, not required: the column hugs its content in the Info popup, and the
+        // below-fold row's required equal-height stretch still wins.
         let bottom = stack.bottomAnchor.constraint(equalTo: bottomAnchor)
         bottom.priority = .defaultHigh
         stackLeading = stack.leadingAnchor.constraint(equalTo: leadingAnchor)
@@ -458,6 +514,7 @@ final class InfoColumnView: UIView {
             let card = AboutCardControl()
             card.restAlpha = 0
             card.layer.cornerRadius = 24
+            card.focusScale = 1.054
             card.onSelect = { [weak self] in self?.onSelect?() }
             rowStack.translatesAutoresizingMaskIntoConstraints = false
             card.addSubview(rowStack)
@@ -529,6 +586,91 @@ private func sectionHeaderLabel(_ text: String) -> UILabel {
     return l
 }
 
+// MARK: - Ratings grid
+
+/// Up to six scores, two per row in display order, each in its source's own
+/// format ("83%", "8.7/10", "4.2/5").
+final class RatingsGridView: UIView {
+    private let rows = UIStackView()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        rows.axis = .vertical
+        rows.distribution = .fillEqually
+        rows.spacing = 12
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.topAnchor.constraint(equalTo: topAnchor),
+            rows.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rows.trailingAnchor.constraint(equalTo: trailingAnchor),
+            rows.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
+        ])
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(_ ratings: [MediaRating]) {
+        rows.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        let shown = Array(ratings.prefix(6))
+        for start in stride(from: 0, to: shown.count, by: 2) {
+            let row = UIStackView()
+            row.axis = .horizontal
+            row.distribution = .fillEqually
+            row.spacing = MediaRowMetrics.tileGap
+            for rating in shown[start..<min(start + 2, shown.count)] {
+                row.addArrangedSubview(Self.entry(rating))
+            }
+            if row.arrangedSubviews.count == 1 { row.addArrangedSubview(UIView()) }
+            rows.addArrangedSubview(row)
+        }
+    }
+
+    /// Every score on one line, each over its source's name (the info popup's row).
+    static func row(_ ratings: [MediaRating]) -> UIView {
+        let row = UIStackView(arrangedSubviews: ratings.prefix(6).map { entry($0, score: 29, scale: 19, name: 16) })
+        row.axis = .horizontal
+        row.alignment = .top
+        // Five or six spread across the popup's width (six need about 600 of its 660); fewer sit left.
+        if row.arrangedSubviews.count >= 5 {
+            row.distribution = .equalSpacing
+            row.spacing = 16
+        } else {
+            row.spacing = 40
+            let spacer = UIView()
+            spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+            row.addArrangedSubview(spacer)
+        }
+        return row
+    }
+
+    static func entry(_ rating: MediaRating, score scoreSize: CGFloat = 38, scale scaleSize: CGFloat = 23,
+                      name nameSize: CGFloat = 19) -> UIView {
+        let score = UILabel()
+        let text = NSMutableAttributedString(
+            string: rating.badgeText,
+            attributes: [.font: UIFont.systemFont(ofSize: scoreSize, weight: .bold), .foregroundColor: UIColor.white])
+        if let scale = rating.scale {
+            text.append(NSAttributedString(
+                string: scale,
+                attributes: [.font: UIFont.systemFont(ofSize: scaleSize, weight: .semibold),
+                             .foregroundColor: UIColor.white.withAlphaComponent(0.6)]))
+        }
+        score.attributedText = text
+
+        let name = UILabel()
+        name.text = rating.name
+        name.font = .systemFont(ofSize: nameSize, weight: .semibold)
+        name.textColor = UIColor.white.withAlphaComponent(0.6)
+
+        let stack = UIStackView(arrangedSubviews: [score, name])
+        stack.axis = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        return stack
+    }
+}
+
 // MARK: - Focusable About card
 
 /// A focusable About card (synopsis or advisory). Selecting it opens the matching
@@ -540,6 +682,13 @@ final class AboutCardControl: UIControl {
         didSet { if selectable != oldValue { setNeedsFocusUpdate() } }
     }
     override var canBecomeFocused: Bool { selectable }
+    /// Focus scale; nil derives it from the card's width (1.134 at 260 down to 1.073 at 560).
+    var focusScale: CGFloat?
+    private func scale(forWidth width: CGFloat) -> CGFloat {
+        if let focusScale { return focusScale }
+        let t = min(max((width - 260) / 300, 0), 1)
+        return 1.134 - t * (1.134 - 1.073)
+    }
     /// Fill alpha when not focused. 0 = no card at rest (the footer columns).
     var restAlpha: CGFloat = 0.06 {
         didSet { backgroundColor = UIColor(white: 1, alpha: restAlpha) }
@@ -577,7 +726,8 @@ final class AboutCardControl: UIControl {
         coordinator.addCoordinatedAnimations { [weak self] in
             guard let self else { return }
             self.backgroundColor = UIColor(white: 1, alpha: focused ? 0.14 : self.restAlpha)
-            self.transform = focused ? CGAffineTransform(scaleX: 1.02, y: 1.02) : .identity
+            let s = self.scale(forWidth: self.bounds.width)
+            self.transform = focused ? CGAffineTransform(scaleX: s, y: s) : .identity
         }
     }
 }

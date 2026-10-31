@@ -9,6 +9,7 @@
 //
 
 import Foundation
+import TVServices
 
 /// Manages read/write access to Top Shelf data in the shared App Group container
 /// Used by both the main app (write) and TV Services Extension (read)
@@ -42,7 +43,8 @@ final class TopShelfCache: Sendable {
 
     /// Write Top Shelf items to the shared container
     /// Called by PlexDataStore when Continue Watching data is refreshed
-    func writeItems(_ items: [TopShelfItem]) {
+    /// `recent` is the poster row's second group, Recently Added after Continue Watching.
+    func writeItems(_ items: [TopShelfItem], sectionTitle: String, recent: [TopShelfItem]) {
 
         guard let defaults = sharedDefaults else {
             return
@@ -51,9 +53,19 @@ final class TopShelfCache: Sendable {
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = .sortedKeys
             let data = try encoder.encode(items)
+            let recentData = try encoder.encode(recent)
+            guard defaults.data(forKey: userDefaultsKey) != data
+                    || defaults.data(forKey: "topShelfRecentItems") != recentData
+                    || defaults.string(forKey: "topShelfSectionTitle") != sectionTitle else { return }
             defaults.set(data, forKey: userDefaultsKey)
+            defaults.set(recentData, forKey: "topShelfRecentItems")
+            defaults.set(sectionTitle, forKey: "topShelfSectionTitle")
+            defaults.set(Date().timeIntervalSince1970, forKey: "topShelfWrittenAt")
             defaults.synchronize()
+            // Without this tvOS keeps whatever the extension last returned, nil before first sign-in (#364).
+            TVTopShelfContentProvider.topShelfContentDidChange()
 
             // Debug: print first item
         } catch {
@@ -83,20 +95,58 @@ final class TopShelfCache: Sendable {
         }
     }
 
+    // MARK: - Style
+
+    /// Full screen carousel instead of the default poster row. The extension reads the same key.
+    var fullScreen: Bool {
+        get { sharedDefaults?.bool(forKey: "topShelfFullScreen") ?? false }
+        set {
+            sharedDefaults?.set(newValue, forKey: "topShelfFullScreen")
+            TVTopShelfContentProvider.topShelfContentDidChange()
+        }
+    }
+
     // MARK: - Clear
 
     /// Remove all cached Top Shelf items
     func clear() {
+        guard sharedDefaults?.data(forKey: userDefaultsKey) != nil else { return }
         sharedDefaults?.removeObject(forKey: userDefaultsKey)
+        sharedDefaults?.removeObject(forKey: "topShelfRecentItems")
+        sharedDefaults?.set(Date().timeIntervalSince1970, forKey: "topShelfClearedAt")
+        TVTopShelfContentProvider.topShelfContentDidChange()
+    }
+
+    /// Diagnostics: the last write and clear, and the extension's last read (see its `noteRead`).
+    func diagnostics() -> [String: Any] {
+        guard let defaults = sharedDefaults else { return ["app_group": false] }
+        let items = readItems()
+        let composites = items.compactMap(\.compositeFileName)
+        func age(_ key: String) -> Any {
+            let t = defaults.double(forKey: key)
+            return t > 0 ? Int(Date().timeIntervalSince1970 - t) : "never"
+        }
+        return [
+            "app_group": containerURL != nil,
+            "cached_items": items.count,
+            "item_types": items.map(\.type),
+            "items_from_selected_plex": items.filter { $0.serverIdentifier.hasPrefix("http") }.count,
+            "composites_named": composites.count,
+            "composites_on_disk": composites.filter { name in
+                compositeFileURL(fileName: name).map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            }.count,
+            "written_seconds_ago": age("topShelfWrittenAt"),
+            "cleared_seconds_ago": age("topShelfClearedAt"),
+            "extension_read_seconds_ago": age("topShelfExtensionReadAt"),
+            "extension_read_cached": defaults.object(forKey: "topShelfExtensionReadCached") ?? "never",
+            "extension_read_returned": defaults.object(forKey: "topShelfExtensionReadReturned") ?? "never",
+        ]
     }
 
     // MARK: - Composite image files (AppGroup/Library/Caches/TopShelf/*.jpg)
 
-    // The container ROOT is not writable on tvOS — only `Library/Caches` under it
-    // is. Creating the composites dir at the root silently failed (the mkdir error
-    // was swallowed by `try?`), so every `writeComposite` then failed ENOENT and
-    // Top Shelf never had a single composite to show. Keep this path in sync with
-    // the extension's copy of this file, which builds the same URL independently.
+    // On tvOS only `Library/Caches` in the App Group container is writable, not its root.
+    // Keep this path in sync with the extension's copy of this file.
     private var compositeDirName: String { "TopShelf" }
 
     /// The TopShelf composites directory, created if needed. nil if no container.

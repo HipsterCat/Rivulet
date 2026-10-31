@@ -31,12 +31,13 @@ nonisolated struct JFUser: Decodable, Sendable {
     let name: String?
 }
 
-/// `Users/Me`, read for the deletion rights in its policy.
+/// `Users/Me`, read for the deletion and recording rights in its policy.
 nonisolated struct JFUserWithPolicy: Decodable, Sendable {
     let policy: Policy?
     nonisolated struct Policy: Decodable, Sendable {
         let isAdministrator: Bool?
         let enableContentDeletion: Bool?
+        let enableLiveTvManagement: Bool?
     }
 }
 
@@ -93,6 +94,8 @@ nonisolated struct JFItem: Decodable, Sendable {
     let mediaStreams: [JFMediaStream]?  // needs Fields=MediaStreams on list calls
 
     let userData: JFUserData?
+    let playlistItemId: String? // Playlists/{id}/Items rows
+    let mediaType: String? // Video or Audio, on a Playlist
 
     let imageTags: [String: String]?
     let backdropImageTags: [String]?
@@ -113,6 +116,9 @@ nonisolated struct JFItem: Decodable, Sendable {
     let productionLocations: [String]?
     let providerIds: [String: String]?
     let mediaSources: [JFMediaSource]?
+    let localTrailerCount: Int?
+    let specialFeatureCount: Int?
+    let extraType: String?          // on a trailer or special feature: Trailer, Featurette, BehindTheScenes, ...
 }
 
 nonisolated struct JFUserData: Decodable, Sendable {
@@ -341,4 +347,19 @@ nonisolated struct JFUserDataUpdate: Encodable, Sendable {
 /// POST /UserItems/{id}/UserData with a 0-10 star rating.
 nonisolated struct JFRatingUpdate: Encodable, Sendable {
     let rating: Double
+}
+
+nonisolated struct JFCreatePlaylist: Encodable, Sendable {
+    let name: String
+    let ids: [String]
+    let userId: String
+    let mediaType: String
+}
+
+nonisolated struct JFUpdatePlaylist: Encodable, Sendable {
+    let name: String
+}
+
+nonisolated struct JFCreated: Decodable, Sendable {
+    let id: String
 }
