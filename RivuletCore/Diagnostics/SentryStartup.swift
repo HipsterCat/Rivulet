@@ -29,11 +29,28 @@ public enum SentryStartup {
     /// actor it trips the Main Thread Checker on every launch.
     @MainActor
     /// `configure` sets options that only exist on the caller's platform.
+    /// Starts at once on a stored ingest pass (so last launch's crash goes out), or after fetching one.
     public static func start(platform: Platform, configure: @escaping (Options) -> Void = { _ in }) {
         guard SentryConfig.isEnabled else { return }
+        if let pass = IngestPass.cached() {
+            start(platform: platform, pass: pass, configure: configure)
+            if IngestPass.cached(margin: IngestPass.refreshMargin) == nil {
+                // ponytail: the new pass serves the next launch; a process alive past the old one's expiry goes quiet.
+                Task { _ = await IngestPass.fetch() }
+            }
+        } else {
+            Task {
+                guard let pass = await IngestPass.fetch() else { return }
+                start(platform: platform, pass: pass, configure: configure)
+            }
+        }
+    }
 
+    @MainActor
+    private static func start(platform: Platform, pass: String, configure: @escaping (Options) -> Void) {
+        guard let dsn = IngestPass.dsn(SentryConfig.dsn, pass: pass) else { return }
         SentrySDK.start { options in
-            options.dsn = SentryConfig.dsn
+            options.dsn = dsn
             options.debug = false
             // Initial scope, so startup events carry the tag. It tags without
             // splitting grouping: a shared-code crash stays one issue.
@@ -76,6 +93,13 @@ public enum SentryStartup {
             configure(options)
 
             options.beforeSend = { event in
+                // A hang is reported by the process that hung, so its footprint now is the one that
+                // mattered. (A watchdog kill arrives next launch: it reads the scope's `memory` context.)
+                if event.exceptions?.first?.type?.hasPrefix("App Hang") == true {
+                    var context = event.context ?? [:]
+                    context["hang_process"] = ["footprint_mb": DiagnosticsHistory.footprintMB()]
+                    event.context = context
+                }
                 // Two non-fatal hangs per launch; "Fatal App Hang" (watchdog kills) always goes.
                 if event.exceptions?.first?.type?.hasPrefix("App Hang") == true,
                    !SentryBridge.admit("app-hang", limit: 2) {
@@ -108,5 +132,10 @@ public enum SentryStartup {
             }
         }
         SentryBridge.isActive = true
+        // Settings usage, at most daily, once launch work has settled.
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(60))
+            SettingsUsageTelemetry.sendIfDue()
+        }
     }
 }

@@ -202,15 +202,28 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
 
     private var parseError: Error?
 
+    /// Built once per parse; `parseDate` runs for every programme.
+    private let calendar = Calendar(identifier: .gregorian)
+    private var timeZones: [Int: TimeZone] = [:]
+    /// True while inside a programme of an unwanted channel: its dates and text are not read.
+    private var skippingProgramme = false
+
     func parse(data: Data) throws -> XMLTVParser.ParseResult {
         let parser = XMLParser(data: data)
         parser.delegate = self
 
         if !parser.parse() {
-            if let error = parseError {
-                throw error
+            // Error 5 is a feed that ends at an element boundary (cut off, or junk after </tv>):
+            // everything before it parsed, so keep it instead of losing the whole guide.
+            let endedEarly = (parseError as NSError?).map {
+                $0.domain == XMLParser.errorDomain && $0.code == XMLParser.ErrorCode.prematureDocumentEndError.rawValue
+            } ?? false
+            if !endedEarly {
+                if let error = parseError {
+                    throw error
+                }
+                throw XMLTVParseError.parseFailed
             }
-            throw XMLTVParseError.parseFailed
         }
 
         return XMLTVParser.ParseResult(channels: channels, programs: programs.mapValues(Self.closingOpenEnded))
@@ -244,8 +257,9 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
 
         case "programme":
             currentProgramChannelId = attributeDict["channel"]
-            currentProgramStart = parseDate(attributeDict["start"])
-            currentProgramStop = parseDate(attributeDict["stop"])
+            skippingProgramme = currentProgramChannelId.map { !channelWanted($0) } ?? true
+            currentProgramStart = skippingProgramme ? nil : parseDate(attributeDict["start"])
+            currentProgramStop = skippingProgramme ? nil : parseDate(attributeDict["stop"])
             currentTitle = ""
             currentSubtitle = ""
             currentDescription = ""
@@ -279,10 +293,12 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
     }
 
     func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if skippingProgramme { return }
         text += string
     }
 
     func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        if skippingProgramme { return }
         text += String(decoding: CDATABlock, as: UTF8.self)
     }
 
@@ -355,6 +371,7 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
                 programs[channelId]?.append(program)
             }
             currentProgramChannelId = nil
+            skippingProgramme = false
 
         default:
             break
@@ -362,8 +379,12 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
     }
 
     private func isWanted(_ channelId: String) -> Bool {
+        if let filter, let stop = currentProgramStop, stop < filter.notBefore { return false }
+        return channelWanted(channelId)
+    }
+
+    private func channelWanted(_ channelId: String) -> Bool {
         guard let filter else { return true }
-        if let stop = currentProgramStop, stop < filter.notBefore { return false }
         if keeps == nil { keeps = filter.keeps(channels: channels) }
         return keeps?(channelId) ?? true
     }
@@ -405,6 +426,13 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
 
     // MARK: - Helpers
 
+    private func zone(_ seconds: Int) -> TimeZone? {
+        if let cached = timeZones[seconds] { return cached }
+        let zone = TimeZone(secondsFromGMT: seconds)
+        timeZones[seconds] = zone
+        return zone
+    }
+
     /// Fast manual date parsing for XMLTV format (yyyyMMddHHmmss with optional timezone)
     /// ~10x faster than DateFormatter for high-volume parsing
     private func parseDate(_ string: String?) -> Date? {
@@ -435,7 +463,7 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
         // previous UTC fallback for feeds that omit the optional timezone.
         let suffix = s[s.index(s.startIndex, offsetBy: 14)...]
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        var timeZone = TimeZone(secondsFromGMT: 0)
+        var timeZone = zone(0)
         // `+0800`, and the colon form `+08:00` some feeds write.
         let offset = suffix.replacingOccurrences(of: ":", with: "")
         if offset.count >= 5 {
@@ -448,7 +476,7 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
                hours <= 23,
                minutes <= 59 {
                 let sign = signCharacter == "-" ? -1 : 1
-                timeZone = TimeZone(secondsFromGMT: sign * (hours * 3600 + minutes * 60))
+                timeZone = zone(sign * (hours * 3600 + minutes * 60))
             }
         }
 
@@ -461,7 +489,7 @@ private nonisolated final class XMLTVInternalParser: NSObject, XMLParserDelegate
         components.second = second
         components.timeZone = timeZone
 
-        return Calendar(identifier: .gregorian).date(from: components)
+        return calendar.date(from: components)
     }
 }
 

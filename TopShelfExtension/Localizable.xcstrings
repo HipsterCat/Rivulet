@@ -14,6 +14,12 @@
             "state" : "translated",
             "value" : "Συνέχεια παρακολούθησης"
           }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Continuer à regarder"
+          }
         }
       }
     },
@@ -29,6 +35,40 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Προστέθηκαν πρόσφατα"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ajouts récents"
+          }
+        }
+      }
+    },
+    "S%lld, E%lld · %@" : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "S%1$lld, F%2$lld · %3$@"
+          }
+        },
+        "el" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Κ%1$lld, Ε%2$lld · %3$@"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "S%1$lld, E%2$lld · %3$@"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "S%1$lld, É%2$lld · %3$@"
           }
         }
       }

@@ -24,6 +24,10 @@ struct MacShellCommands: Commands {
                 Button("Switch Profile…") { account.box.switchProfile() }
             }
         }
+        CommandGroup(after: .newItem) {
+            Button("Join Watch Together…") { MacWatchTogether.askToJoin() }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
+        }
         CommandMenu("Go") {
             Button("Back") { history?.box.back() }
                 .keyboardShortcut("[")
@@ -45,7 +49,7 @@ struct MacShellCommands: Commands {
                 Button("Favorites") { selection = .some(.favorites) }
                     .keyboardShortcut("3")
             }
-            let libraries = browse.sidebarLibraries.sidebarOrder(servers: browse.providerOrder)
+            let libraries = browse.sidebarAllLibraries.sidebarOrder(servers: browse.providerOrder)
             if !libraries.isEmpty { Divider() }
             ForEach(Array(libraries.enumerated()), id: \.element) { index, library in
                 let title = browse.labels.title(library.title, providerID: library.providerID)

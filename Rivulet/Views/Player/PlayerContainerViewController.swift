@@ -30,8 +30,13 @@ class PlayerContainerViewController: UIViewController {
     private var railPillConstraints: [NSLayoutConstraint] = []
     private var pausedDimView: UIView?
     private var chromeScrim = ChromeScrimView()
-    private var ambientScrim: BottomScrimView?
     private var captionOverlay: CaptionOverlayView?
+    /// Passing notes, top right (subtitle downloads, a server converting the file).
+    private var noticeCard: PlayerNoticeCardView?
+    /// The pause screen (10 s and 2 min paused). Written only by `applyPauseScreen`.
+    private var pauseScreen: PauseScreenView?
+    /// Insights raised over the pause screen from its hint.
+    private var pauseInsights: PauseInsightsView?
     private var cancellables = Set<AnyCancellable>()
     /// The one floating panel shared by CC, audio, info and Up Next.
     private var activeRailPanel: PlayerRailPanelView?
@@ -64,6 +69,17 @@ class PlayerContainerViewController: UIViewController {
     private var insightsTriviaCache: TitleTrivia?
     private var suppressedTriviaIDsCache: Set<String> = []
     private var panGestureRecognizer: UIPanGestureRecognizer?
+    // The swipe-to-scrub pan's per-touch state (see `handlePanGesture`).
+    private var swipeAxisLock = SwipeScrubAxisLock()
+    private var swipeScrubEntered = false
+    private var swipeScrubLastX: CGFloat = 0
+    /// A gated Up/Down swipe or a click took this touch, so it never scrubs.
+    private var swipeTouchSpent = false
+    private var swipeTouchBeganAt: CFTimeInterval = .infinity
+    /// This scrub's counts for its diagnostics line.
+    private var swipeScrubTravel: Double = 0
+    private var swipeScrubPeakSpeed: Double = 0
+    private var swipeScrubNetSeconds: Double = 0
     private var touchSurfaceTapGesture: UITapGestureRecognizer?
 
     /// Opaque black plate that covers the whole player while it fades out on
@@ -85,6 +101,8 @@ class PlayerContainerViewController: UIViewController {
     private var contentAnchor: ContentFocusAnchorView?
     /// Touch twin for the content state's Up/Down (see `setupContentAnchor`).
     private var contentSwipeBinding: DirectionalInputBinding?
+    /// Touch twin for the floating skip pill's Up/Down (see `skipPillVertical`).
+    private var skipPillSwipeBinding: DirectionalInputBinding?
     /// Tap-vs-hold for a content-state Left/Right press, the same detector the
     /// scrubber proxy uses, so both focus regimes behave identically.
     private let contentPressDetector = DirectionalPressDetector()
@@ -197,8 +215,6 @@ class PlayerContainerViewController: UIViewController {
             dim.alpha = 0
             dim.isUserInteractionEnabled = false
 
-            let ambientBottomScrim = BottomScrimView()
-            ambientBottomScrim.alpha = 0
             let railView = PlayerRailView()
             let bar = PlayerProgressBarView()
             let proxy = ScrubberFocusProxyView()
@@ -215,17 +231,31 @@ class PlayerContainerViewController: UIViewController {
                     Task { await vm.skipActiveMarker() }
                 }
             }
-            // Up/Down while the pill owns focus (chrome hidden) surfaces the
-            // controls; while the chrome is up, let the engine move focus back
-            // to the rail on Down (return false → not consumed).
-            pill.onDirectionalPress = { [weak self] _ in
-                guard let vm = self?.viewModel else { return false }
+            // Up/Down while the pill owns focus bring the controls up (`skipPillVertical`);
+            // with the chrome up the engine moves focus.
+            pill.onDirectionalPress = { [weak self] type in
+                guard let self, let vm = self.viewModel else { return false }
                 if vm.showControls { return false }
-                vm.showControlsTemporarily()
+                self.skipPillVertical(up: type == .upArrow)
                 return true
             }
+            // The press's touch twin, on the same predicate; never mid-scrub, click or ring jog.
+            skipPillSwipeBinding = DirectionalInputBinding(
+                gatedSwipesOn: pill,
+                directions: [.up, .down],
+                shouldHandle: { [weak self, weak pill] _ in
+                    guard let self, let vm = self.viewModel, pill?.isFocused == true else { return false }
+                    return !vm.showControls && !self.swipeScrubEntered
+                        && !RemoteInputHandler.isClickpadDown && !RemoteInputHandler.isRingJogging
+                },
+                onSwipe: { [weak self] direction in
+                    guard let self else { return }
+                    self.swipeTouchSpent = true
+                    self.skipPillVertical(up: direction == .up)
+                }
+            )
 
-            [chromeScrim, dim, ambientBottomScrim, railView, bar, proxy, pill].forEach {
+            [chromeScrim, dim, railView, bar, proxy, pill].forEach {
                 view.addSubview($0)
                 $0.translatesAutoresizingMaskIntoConstraints = false
             }
@@ -233,9 +263,6 @@ class PlayerContainerViewController: UIViewController {
             // matches, but state this is intentional, not incidental).
             view.bringSubviewToFront(chromeScrim)
             view.bringSubviewToFront(dim)
-            // Ambient bottom scrim sits above the dim/chrome scrim but below
-            // the scrubber, so during ambient pause the scrubber reads over it.
-            view.bringSubviewToFront(ambientBottomScrim)
             view.bringSubviewToFront(railView)
             view.bringSubviewToFront(bar)
             view.bringSubviewToFront(proxy)
@@ -251,14 +278,6 @@ class PlayerContainerViewController: UIViewController {
                 dim.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 dim.trailingAnchor.constraint(equalTo: view.trailingAnchor),
                 dim.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-
-                // Ambient bottom scrim: full-width, pinned to the bottom, tall
-                // enough to sit behind the scrubber (which is ~118pt off the
-                // bottom) during ambient pause.
-                ambientBottomScrim.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                ambientBottomScrim.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                ambientBottomScrim.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-                ambientBottomScrim.heightAnchor.constraint(equalToConstant: 320),
 
                 // Rail: the screen's bottom band, edge to edge (AVKit's layout).
                 railView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -295,8 +314,9 @@ class PlayerContainerViewController: UIViewController {
                 pill.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -56),
             ]
             let slotWidth = railView.skipPillSlot.widthAnchor.constraint(equalTo: pill.widthAnchor)
-            // Below required: the stack view zeroes a hidden slot's width.
-            slotWidth.priority = .defaultHigh
+            // Below the pill's compression resistance (750): the stack view zeroes a
+            // hidden slot's width, and at a tie the solver squashed the pill to 0 (#583).
+            slotWidth.priority = .defaultHigh - 1
             slotWidth.isActive = true
             railPillConstraints = [
                 pill.centerXAnchor.constraint(equalTo: railView.skipPillSlot.centerXAnchor),
@@ -317,11 +337,18 @@ class PlayerContainerViewController: UIViewController {
                 view.insertSubview(contentAnchor, belowSubview: railView)
             }
 
+            // The pause screen covers the video and captions and stays below the
+            // anchor: full-screen, so above it the anchor could not take focus.
+            let pause = PauseScreenView(frame: view.bounds)
+            pause.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            pause.progress = { [weak vm] in (vm?.currentTime ?? 0, vm?.duration ?? 0) }
+            view.insertSubview(pause, belowSubview: contentAnchor ?? railView)
+            pauseScreen = pause
+
             rail = railView
             progressBar = bar
             scrubberProxy = proxy
             skipPill = pill
-            ambientScrim = ambientBottomScrim
             pausedDimView = dim
 
             bindChrome(to: vm)
@@ -386,6 +413,7 @@ class PlayerContainerViewController: UIViewController {
         // Chrome hidden + a skip marker up: the pill is the lone affordance, so
         // it owns focus and a single Select jumps forward. (Ownership is false
         // whenever the rail/panel is up, so this never fights the checks above.)
+        if let pauseInsights { return [pauseInsights] }
         if viewModel?.skipPillOwnsFocus == true, let skipPill {
             return [skipPill]
         }
@@ -441,10 +469,10 @@ class PlayerContainerViewController: UIViewController {
                 panel.dismissPanel()
                 return
             }
-            // Ambient pause backdrop: back returns to the paused frame, it
-            // does not exit the player.
+            // Pause screen: back returns to the paused frame, it does not
+            // exit the player.
             if vm.backReturnsToPausedFrame {
-                vm.hidePausedPoster()
+                vm.dismissPauseScreen()
                 return
             }
             // Back from the transport buttons closes the whole chrome in one
@@ -539,6 +567,13 @@ class PlayerContainerViewController: UIViewController {
         }
     }
 
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Safety net for an exit that never stops the view model (`stopPlayback`
+        // otherwise brings the pause screen down through `applyPauseScreen`).
+        pauseScreen?.hide()
+    }
+
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         blockDismissResetWorkItem?.cancel()
@@ -566,6 +601,8 @@ class PlayerContainerViewController: UIViewController {
     /// Last-seen value of `viewModel.skipPillOwnsFocus`, so a change can
     /// trigger a focus re-resolution toward/away from the pill exactly once.
     private var lastSkipPillOwnsFocus = false
+    /// The pause screen was up on the last chrome pass; its arrival sets the fade's clock.
+    private var lastAmbient = false
 
     /// Flag to block dismiss calls that occur immediately after we handled a menu action
     /// This prevents the double-handling issue where handleMenuButton() closes something,
@@ -728,14 +765,20 @@ class PlayerContainerViewController: UIViewController {
 
         // Up/Down's touch twin (the iPhone Remote sends no arrow presses).
         // Not while the clickpad is down: a click jolts the touch into a fake swipe.
+        // Nor in a ring jog or a swipe-scrub; a swipe that acts here spends the touch.
         contentSwipeBinding = DirectionalInputBinding(
             gatedSwipesOn: anchor,
             directions: [.up, .down],
             shouldHandle: { [weak self] direction in
-                guard let self, !RemoteInputHandler.isClickpadDown else { return false }
+                guard let self, !RemoteInputHandler.isClickpadDown,
+                      !RemoteInputHandler.isRingJogging, !self.swipeScrubEntered else { return false }
                 return self.contentOwnsPress(direction == .up ? .upArrow : .downArrow)
             },
-            onSwipe: { [weak self] direction in self?.handleContentVertical(up: direction == .up) }
+            onSwipe: { [weak self] direction in
+                guard let self else { return }
+                self.swipeTouchSpent = true
+                self.handleContentVertical(up: direction == .up)
+            }
         )
 
         contentPressDetector.onTap = { [weak self] forward in
@@ -777,9 +820,20 @@ class PlayerContainerViewController: UIViewController {
 
     /// Up/Down: while scrubbing, Up snaps to the next chapter in the direction
     /// of travel and Down cancels. Otherwise they surface the controls as AVKit
-    /// does: Up lands on the first tool button, Down opens the Info pane.
+    /// does: Up lands on the first tool button, Down opens the Info pane
+    /// (Insights over the pause screen, from its hint). With the controls
+    /// already up, Down lands on the first tab instead, as Down from the bar does.
     private func handleContentVertical(up: Bool) {
         guard let vm = viewModel else { return }
+        if !up, pauseScreen?.showsInsightsHint == true, !vm.isScrubbing {
+            openPauseInsights()
+            return
+        }
+        // Whether the rail, tabs included (they hide while loading), was on screen
+        // before this press: a touch tap, Play/Pause, a scrub commit or the player
+        // opening show it while focus stays here. Read before anything below
+        // brings the chrome up.
+        let railWasUp = (rail?.alpha ?? 0) > 0.5 && rail?.pillRowView.isHidden == false
         vm.hidePausedPoster()
         if vm.isScrubbing {
             if up {
@@ -801,8 +855,21 @@ class PlayerContainerViewController: UIViewController {
         } else {
             if let info = rail?.infoButton { rail?.setFocusLanding(info) }
             vm.enterControlsFocus()
-            presentPane(.info)
+            if !railWasUp { presentPane(.info) }
         }
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+    }
+
+    /// Up/Down from the floating skip pill bring the controls up in one move:
+    /// Up keeps focus on the pill in its tool-row slot, Down lands on the scrubber.
+    private func skipPillVertical(up: Bool) {
+        guard let vm = viewModel else { return }
+        vm.showControlsTemporarily()
+        guard up, let skipPill else { focusScrubber(); return }
+        applyChromeVisibility()
+        rail?.setFocusLanding(skipPill)
+        vm.enterControlsFocus()
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
     }
@@ -865,6 +932,13 @@ class PlayerContainerViewController: UIViewController {
                 vm.showControlsTemporarily()
             }
         }
+        focusScrubber()
+    }
+
+    /// Puts focus on the scrubber with the controls up, starting the controls
+    /// focus mode, for Select from the content and Down from the skip pill.
+    private func focusScrubber() {
+        guard let vm = viewModel else { return }
         // The chrome sink runs a pass later; the proxy must be focusable now.
         applyChromeVisibility()
         guard scrubberProxy?.isFocusEnabled == true else { return }
@@ -891,6 +965,12 @@ class PlayerContainerViewController: UIViewController {
         if descriptionOverlay != nil {
             dismissDescription()
             blockDismissTemporarily()
+            return
+        }
+
+        // The error overlay is all that is up: Menu closes it, as its Dismiss button does.
+        if vm.playbackState.isFailed {
+            dismissPlayer()
             return
         }
 
@@ -940,7 +1020,7 @@ class PlayerContainerViewController: UIViewController {
                     panel.dismissPanel()
                 }
             } else if vm.backReturnsToPausedFrame {
-                vm.hidePausedPoster()
+                vm.dismissPauseScreen()
             } else if vm.showPausedPoster {
                 dismissPlayer()
             } else if vm.controlsFocusActive {
@@ -975,22 +1055,22 @@ class PlayerContainerViewController: UIViewController {
         let panRecognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePanGesture(_:)))
         // Only recognize indirect touches (Siri Remote touchpad, not direct screen touches)
         panRecognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
-        // A pan that begins cancels the focus engine's move, so the delegate
-        // lets it begin only on a clearly horizontal, actionable swipe.
+        // Observes alongside every recognizer, as Live TV's `LiveTimelineScrubPan`,
+        // and acts only once `SwipeScrubAxisLock` locks the touch horizontal.
+        panRecognizer.cancelsTouchesInView = false
         panRecognizer.delegate = self
         view.addGestureRecognizer(panRecognizer)
         panGestureRecognizer = panRecognizer
     }
 
-    /// True when a touch-surface swipe should drive the scrubber. Mirrors the
-    /// bail conditions in `handlePanGesture`, since beginning steals the gesture
-    /// from the focus engine. Only focus on a transport button blocks it.
+    /// True when a touch-surface swipe may drive the scrubber.
     private var panCanDriveScrub: Bool {
         guard let vm = viewModel else { return false }
-        return !vm.playbackState.isFailed
+        return vm.playbackState == .paused
             && vm.postVideoState == .hidden
             && descriptionOverlay == nil
             && !focusIsOnTransportButton
+            && pauseInsights == nil
     }
 
     /// Focus is parked on a transport button rather than the scrubber. While
@@ -1007,8 +1087,8 @@ class PlayerContainerViewController: UIViewController {
     /// Bare-tap on the Siri Remote touch surface (no force/click). Fires
     /// only on `.indirect` touches — the touchpad — and not on `.select`
     /// presses (those are the click and are routed to play/pause via the
-    /// micro-gamepad buttonA handler). Coexists with the pan recognizer:
-    /// if the user starts moving, pan takes over and tap doesn't fire.
+    /// micro-gamepad buttonA handler). Coexists with the scrub pan, which only
+    /// observes: a touch that moves fails the tap by its own movement tolerance.
     private func setupTouchSurfaceTapGesture() {
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTouchSurfaceTap))
         tap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
@@ -1018,64 +1098,154 @@ class PlayerContainerViewController: UIViewController {
         tap.allowedPressTypes = []
         view.addGestureRecognizer(tap)
         touchSurfaceTapGesture = tap
+
+        // Double tap zooms, as AVKit's tap-to-zoom does (#589). The single tap
+        // waits it out, which is the same short delay AVKit pays.
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleTouchSurfaceDoubleTap))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+        doubleTap.allowedPressTypes = []
+        view.addGestureRecognizer(doubleTap)
+        tap.require(toFail: doubleTap)
+    }
+
+    /// True when the touch-surface tap was the touch half of a clickpad click.
+    private var tapWasClick: Bool {
+        RemoteInputHandler.isClickpadDown
+            || CACurrentMediaTime() - RemoteInputHandler.lastClickpadDownAt < 0.6
+            || CACurrentMediaTime() - MenuPressInterceptor.lastPressBeganAt < 0.6
+    }
+
+    private var touchSurfaceTapAllowed: Bool {
+        guard let vm = viewModel else { return false }
+        return !vm.isScrubbing
+            && vm.postVideoState == .hidden
+            && !vm.playbackState.isFailed
+            && descriptionOverlay == nil
     }
 
     @objc private func handleTouchSurfaceTap() {
-        guard let vm = viewModel else { return }
-        guard !vm.isScrubbing,
-              vm.postVideoState == .hidden,
-              !vm.playbackState.isFailed,
-              descriptionOverlay == nil
-        else { return }
+        guard let vm = viewModel, touchSurfaceTapAllowed else { return }
 
         // With the controls up, a bare tap (not a click) cycles the bar
         // between play time and the clock.
-        let clicked = RemoteInputHandler.isClickpadDown
-            || CACurrentMediaTime() - RemoteInputHandler.lastClickpadDownAt < 0.6
-        if vm.showControls, !clicked, let bar = progressBar {
+        if vm.showControls, !tapWasClick, let bar = progressBar {
             bar.setShowsClockTimes(!bar.showsClockTimes)
-            SettingsStore.setBool(Self.clockTimesKey, bar.showsClockTimes)
         }
         vm.showControlsTemporarily()
     }
 
-    private static let clockTimesKey = "playerShowsClockTimes"
+    @objc private func handleTouchSurfaceDoubleTap() {
+        // A double click is two play/pause presses, never a zoom.
+        guard let vm = viewModel, touchSurfaceTapAllowed, !tapWasClick else { return }
+        vm.fillsScreen.toggle()
+    }
 
+    /// Does nothing until `SwipeScrubAxisLock` decides the touch: horizontal scrubs,
+    /// vertical and undecided touches belong to the focus engine and the gated swipes.
     @objc private func handlePanGesture(_ gesture: UIPanGestureRecognizer) {
-        // Kept in sync with `panCanDriveScrub`, which stops the recognizer from
-        // beginning (and thus stealing the gesture) in these same states.
-        guard panCanDriveScrub else { return }
-        // A touch that turned into a ring jog belongs to the jog from then on.
-        guard !RemoteInputHandler.isRingJogging else { return }
-
-        // Swipe-to-scrub works whether playing or paused.
+        // Scrubs only while paused, as AVKit does: a swipe while playing is ignored.
 
         let translation = gesture.translation(in: view)
         let velocity = gesture.velocity(in: view)
 
         switch gesture.state {
-        case .began:
-            inputCoordinator.handle(action: .scrubRelative(seconds: 0), source: .irPress)
-
-        case .changed:
-            // Proportional scrubbing: horizontal translation maps to seek time
-            // Sensitivity: ~1 second per 2 points of horizontal movement
-            // Positive translation.x = swipe right = forward
-            let seekDelta = translation.x * 0.5
-            inputCoordinator.handle(action: .scrubRelative(seconds: seekDelta), source: .irPress)
-            gesture.setTranslation(.zero, in: view)
+        case .began, .changed:
+            if gesture.state == .began {
+                swipeAxisLock.reset()
+                swipeScrubEntered = false
+                swipeTouchSpent = false
+                swipeTouchBeganAt = CACurrentMediaTime()
+            }
+            // A touch that turned into a ring jog belongs to the jog from then on.
+            guard !RemoteInputHandler.isRingJogging else { return }
+            // A click jolts the touch into a fake swipe, so it spends the touch.
+            if swipeTouchClicked { swipeTouchSpent = true }
+            guard !swipeTouchSpent else { return }
+            guard swipeAxisLock.axis == .undecided else {
+                guard swipeScrubEntered, panCanDriveScrub else { return }
+                // The playhead follows the finger; right = forward.
+                let dx = Double(translation.x - swipeScrubLastX)
+                let speed = abs(Double(velocity.x))
+                swipeScrubLastX = translation.x
+                let seekDelta = SwipeScrubTransfer.seconds(
+                    forTravel: dx, speed: speed, duration: viewModel?.duration ?? 0)
+                noteSwipeScrubSample(travel: dx, speed: speed, seconds: seekDelta)
+                inputCoordinator.handle(action: .scrubRelative(seconds: seekDelta), source: .irPress)
+                return
+            }
+            let axis = swipeAxisLock.update(
+                translationX: Double(translation.x), translationY: Double(translation.y))
+            // Undecided or vertical: the focus engine's and the gated swipes'.
+            guard axis == .horizontal else { return }
+            guard panCanDriveScrub else {
+                DiagLog.notice(.playback, "[scrub] swipe did not start a scrub: "
+                    + (focusIsOnTransportButton ? "focus is on a control" : "player state"))
+                return
+            }
+            swipeScrubEntered = true
+            swipeScrubLastX = translation.x
+            swipeScrubTravel = 0
+            swipeScrubPeakSpeed = 0
+            swipeScrubNetSeconds = 0
+            DiagLog.notice(.playback, "[scrub] swipe started a scrub")
+            // The travel that decided the lock counts, at the base rate.
+            let lockTravel = Double(translation.x)
+            let lockSeconds = SwipeScrubTransfer.baseSeconds(
+                forTravel: lockTravel, duration: viewModel?.duration ?? 0)
+            noteSwipeScrubSample(travel: lockTravel, speed: abs(Double(velocity.x)), seconds: lockSeconds)
+            inputCoordinator.handle(action: .scrubRelative(seconds: lockSeconds), source: .irPress)
 
         case .ended, .cancelled:
-            // If significant horizontal velocity, apply a final "flick" adjustment
-            if abs(velocity.x) > 500 {
-                let flickSeekDelta = velocity.x * 0.02  // Small multiplier for flick
-                inputCoordinator.handle(action: .scrubRelative(seconds: flickSeekDelta), source: .irPress)
+            if swipeScrubEntered {
+                // No post-lift flick; the lift sample may be jitter, so it is not applied.
+                let liftTravel = gesture.state == .ended ? Double(translation.x - swipeScrubLastX) : 0
+                logSwipeScrubEnd(blocked: swipeScrubBlockedReason, liftTravel: liftTravel)
+            } else if gesture.state == .ended, swipeAxisLock.axis != .horizontal,
+                      abs(translation.x) >= abs(translation.y) {
+                // A sideways touch that never became a scrub says why (#632).
+                DiagLog.notice(.playback, "[scrub] swipe did not start a scrub: "
+                    + (swipeScrubBlockedReason ?? "not 2:1 sideways past 24 pt")
+                    + ", t=\(Int(translation.x)),\(Int(translation.y))")
             }
-            // Don't auto-commit - wait for user to press play/select to confirm position
+            swipeScrubEntered = false
 
         default:
-            break
+            swipeScrubEntered = false
         }
+    }
+
+    /// The clickpad is down, or clicked down since the pan began on this touch.
+    private var swipeTouchClicked: Bool {
+        RemoteInputHandler.isClickpadDown || RemoteInputHandler.lastClickpadDownAt >= swipeTouchBeganAt
+    }
+
+    /// Adds one sent scrub update to this scrub's diagnostics counts.
+    private func noteSwipeScrubSample(travel: Double, speed: Double, seconds: Double) {
+        if travel.isFinite { swipeScrubTravel += abs(travel) }
+        if speed.isFinite { swipeScrubPeakSpeed = max(swipeScrubPeakSpeed, speed) }
+        if seconds.isFinite { swipeScrubNetSeconds += seconds }
+    }
+
+    /// One counts-only line per swipe-scrub, for tuning `SwipeScrubTransfer` (#632).
+    private func logSwipeScrubEnd(blocked: String?, liftTravel: Double) {
+        let runtimeMinutes = (viewModel?.duration ?? 0) / 60
+        let counts = String(
+            format: "travel=%.0fpt peak=%.0fpt/s net=%+.1fs runtime=%.0fmin lift=%+.0fpt",
+            swipeScrubTravel, swipeScrubPeakSpeed, swipeScrubNetSeconds,
+            runtimeMinutes.isFinite ? runtimeMinutes : 0, liftTravel.isFinite ? liftTravel : 0)
+        DiagLog.notice(.playback, "[scrub] swipe ended" + (blocked.map { " blocked: \($0);" } ?? ":") + " " + counts)
+    }
+
+    /// Why this touch cannot drive a scrub now, or nil if it can, for the
+    /// diagnostics lines (#632).
+    private var swipeScrubBlockedReason: String? {
+        if RemoteInputHandler.isRingJogging { return "ring jog" }
+        if swipeTouchClicked { return "clickpad down" }
+        if swipeTouchSpent { return "an Up or Down swipe took it" }
+        if viewModel?.playbackState != .paused { return "not paused" }
+        if !panCanDriveScrub { return focusIsOnTransportButton ? "focus is on a control" : "player state" }
+        return nil
     }
 
     private func dismissPlayer() {
@@ -1104,7 +1274,6 @@ class PlayerContainerViewController: UIViewController {
 
     private func bindChrome(to vm: UniversalPlayerViewModel) {
         guard let rail, let bar = progressBar else { return }
-        bar.setShowsClockTimes(SettingsStore.bool(Self.clockTimesKey, default: false))
 
         // Static metadata (re-applied on episode advance via itemGeneration).
         applyRailMetadata(vm: vm)
@@ -1197,6 +1366,11 @@ class PlayerContainerViewController: UIViewController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.applyChromeVisibility() }
             .store(in: &cancellables)
+        vm.$compatibilityNotice
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notice in self?.showNotice(notice) }
+            .store(in: &cancellables)
 
         // Caption inputs. The overlay measures against the picture, so a new
         // aspect ratio has to reach it; the height stepper is per-title and can
@@ -1204,6 +1378,11 @@ class PlayerContainerViewController: UIViewController {
         vm.$videoSize
             .receive(on: DispatchQueue.main)
             .sink { [weak self] size in self?.captionOverlay?.videoSize = size }
+            .store(in: &cancellables)
+
+        vm.$fillsScreen
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] fills in self?.captionOverlay?.fillsScreen = fills }
             .store(in: &cancellables)
 
         vm.$subtitleHeightUnits
@@ -1232,10 +1411,32 @@ class PlayerContainerViewController: UIViewController {
             .sink { [weak self] _ in self?.captionOverlay?.style = CaptionAppearance.current() }
             .store(in: &cancellables)
 
-        // Ambient pause: the whole chrome yields to the clean backdrop.
+        // The pause screen: the whole chrome yields to it.
         vm.$pausePresentation
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.applyChromeVisibility() }
+            .sink { [weak self] _ in
+                self?.applyChromeVisibility()
+                self?.applyPauseScreen()
+            }
+            .store(in: &cancellables)
+
+        // A logo that resolves after the pause screen is up.
+        vm.$titleLogoImage
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] image in self?.pauseScreen?.setLogo(image) }
+            .store(in: &cancellables)
+
+        // A paused return from sleep leaves the engine torn down (no frame, #523).
+        // AetherPlayer publishes that state; the current player's publisher is
+        // followed across item swaps, and no player means not parked.
+        vm.$aetherPlayer
+            .map { player -> AnyPublisher<Bool, Never> in
+                player?.isParkedForReloadPublisher ?? Just(false).eraseToAnyPublisher()
+            }
+            .switchToLatest()
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyPauseScreen() }
             .store(in: &cancellables)
 
         vm.$playbackState
@@ -1273,6 +1474,7 @@ class PlayerContainerViewController: UIViewController {
         vm.$postVideoState
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
+                self?.applyPauseScreen()
                 // Order follows focus: mount the page BEFORE the chrome gives up
                 // focus, and restore the chrome (re-enabling the content anchor)
                 // BEFORE the page is removed, so each focus update runs while its
@@ -1357,6 +1559,7 @@ class PlayerContainerViewController: UIViewController {
             .sink { [weak vm] _ in
                 Task { await vm?.loadInsightsCast() }
                 Task { await vm?.loadInsightsTrivia() }
+                Task { await vm?.refreshSubtitleSearchAvailability() }
             }
             .store(in: &cancellables)
 
@@ -1385,8 +1588,8 @@ class PlayerContainerViewController: UIViewController {
             guard let self, let vm = self.viewModel else { return }
             let list = CardTrackListView.subtitleMenu(
                     tracks: vm.subtitleMenuTracks,
-                    selectedTrackId: vm.currentSubtitleTrackId, onTrackId: vm.subtitleOnTrackId,
-                    actions: vm.canSearchSubtitles ? [
+                    selectedTrackId: vm.chosenSubtitleTrackId, onTrackId: vm.subtitleOnTrackId,
+                    actions: vm.subtitleSearchAvailable ? [
                         CardActionConfig(title: String(localized: "Search for Subtitles")) { [weak self] row in
                             self?.searchSubtitles(from: row)
                         },
@@ -1426,7 +1629,7 @@ class PlayerContainerViewController: UIViewController {
         }
         rail.onSubtitlesHold = { [weak self] in
             guard let self, let vm = self.viewModel else { return }
-            if vm.currentSubtitleTrackId != nil {
+            if vm.chosenSubtitleTrackId != nil {
                 vm.selectSubtitleTrack(id: nil)
                 self.rail?.showNote(String(localized: "Subtitles off"))
             } else if let id = vm.subtitleOnTrackId,
@@ -1480,6 +1683,24 @@ class PlayerContainerViewController: UIViewController {
                 }),
                 width: CardTrackListView.menuWidth, from: rail.filterButton)
         }
+        // Speed: AVKit's set, the current pick checked.
+        rail.setSpeedAvailable(true)
+        rail.onSpeed = { [weak self] in
+            guard let self, let vm = self.viewModel else { return }
+            let rows = UniversalPlayerViewModel.playbackSpeeds.enumerated().map { index, speed in
+                CardTrackListView.Row(
+                    title: speed.formatted(.number.precision(.fractionLength(0...2))) + "x",
+                    subtitle: nil, trackId: index, isSelected: speed == vm.playbackSpeed)
+            }
+            self.presentRailPanel(
+                content: CardTrackListView(header: String(localized: "Speed"), rows: rows, onSelect: { [weak vm, weak self] index in
+                    if let index, UniversalPlayerViewModel.playbackSpeeds.indices.contains(index) {
+                        vm?.setPlaybackSpeed(UniversalPlayerViewModel.playbackSpeeds[index])
+                    }
+                    self?.activeRailPanel?.dismissPanel()
+                }),
+                width: CardTrackListView.menuWidth, from: rail.speedButton)
+        }
         // Quality: every choice, the session's pick checked; Auto says what it is playing.
         rail.setQualityAvailable(true)
         rail.onQuality = { [weak self] in
@@ -1500,6 +1721,12 @@ class PlayerContainerViewController: UIViewController {
                 }),
                 width: CardTrackListView.menuWidth, from: rail.qualityButton)
         }
+        rail.setWatchTogetherAvailable(true)
+        rail.onWatchTogether = { [weak self] in self?.presentWatchTogetherMenu() }
+        WatchTogetherSession.shared.$code
+            .receive(on: DispatchQueue.main)
+            .sink { [weak rail] code in rail?.setWatchTogetherActive(code != nil) }
+            .store(in: &cancellables)
         vm.contentFilter.$isEnabled
             .combineLatest(vm.contentFilter.$isPaused, vm.$contentFilterNotice, vm.contentFilter.$hasSceneSkips)
             .receive(on: DispatchQueue.main)
@@ -1511,11 +1738,64 @@ class PlayerContainerViewController: UIViewController {
             .store(in: &cancellables)
     }
 
+    /// Outside a room, the one row that opens one. Inside, the code to share and who's here.
+    private func presentWatchTogetherMenu() {
+        guard let vm = viewModel, let rail else { return }
+        let session = WatchTogetherSession.shared
+        let leave = 1
+        var rows: [CardTrackListView.Row]
+        if let code = session.code {
+            rows = [.init(title: code, subtitle: String(localized: "Room Code"), trackId: 0, isSelected: false)]
+            rows += session.members.map {
+                .init(title: $0.name, subtitle: Self.memberStatus($0), trackId: 0, isSelected: false)
+            }
+            rows.append(.init(title: String(localized: "Leave Room"), subtitle: nil, trackId: leave, isSelected: false))
+        } else {
+            rows = [.init(title: String(localized: "Start a Room"), subtitle: String(localized: "Get a code to share"),
+                          trackId: 2, isSelected: false)]
+        }
+        presentRailPanel(
+            content: CardTrackListView(header: String(localized: "Watch Together"), rows: rows, onSelect: { [weak self, weak vm] choice in
+                self?.activeRailPanel?.dismissPanel()
+                guard let vm else { return }
+                if choice == leave {
+                    session.leave()
+                } else if choice == 2 {
+                    Task { @MainActor [weak self] in
+                        do {
+                            try await WatchTogetherCoordinator.shared.host(from: vm)
+                            self?.presentWatchTogetherMenu()
+                        } catch {
+                            vm.showWatchTogetherNotice(String(localized: "Couldn't start a room."))
+                        }
+                    }
+                }
+            }),
+            width: CardTrackListView.menuWidth, from: rail.watchTogetherButton)
+    }
+
+    private static func memberStatus(_ member: WatchTogetherSession.Member) -> String {
+        let status = switch member.status {
+        case .watching: String(localized: "Ready")
+        case .loading: String(localized: "Loading")
+        case .buffering: String(localized: "Buffering")
+        case .away: String(localized: "Away")
+        case .noCopy: String(localized: "Doesn't have this title")
+        }
+        return member.isHost ? String(localized: "Host • \(status)") : status
+    }
+
     /// Whether the Insights panel has anything to show: a non-empty cast
     /// list, or at least one trivia fact left after the suppression filter. Either section alone is enough to surface the
     /// rail button; both empty means fully graceful-absent (no button).
     private var insightsButtonShouldBeAvailable: Bool {
         if !insightsCastCache.isEmpty { return true }
+        guard let trivia = insightsTriviaCache else { return false }
+        return !trivia.visibleFacts(suppressed: suppressedTriviaIDsCache).isEmpty
+    }
+
+    /// The pause screen offers Insights only for trivia, never for a cast list alone.
+    private var pauseInsightsAvailable: Bool {
         guard let trivia = insightsTriviaCache else { return false }
         return !trivia.visibleFacts(suppressed: suppressedTriviaIDsCache).isEmpty
     }
@@ -1526,6 +1806,7 @@ class PlayerContainerViewController: UIViewController {
     /// availability independently of the other.
     private func updateInsightsAvailability() {
         rail?.setInsightsAvailable(insightsButtonShouldBeAvailable)
+        pauseScreen?.setInsightsAvailable(pauseInsightsAvailable)
     }
 
     /// Shared presenter for the rail panels; presenting one dismisses the last.
@@ -1559,13 +1840,8 @@ class PlayerContainerViewController: UIViewController {
                 ? [CardTrackListView.Row(title: results == nil ? String(localized: "Search Failed") : String(localized: "No Subtitles Found"),
                                          subtitle: nil, trackId: nil, isSelected: false)]
                 : found.enumerated().map { index, result in
-                    CardTrackListView.Row(
-                        title: result.title ?? result.displayTitle ?? String(localized: "Subtitle"),
-                        subtitle: [result.language, result.codec?.uppercased(),
-                                   result.hearingImpaired == true ? "SDH" : nil,
-                                   result.forced == true ? String(localized: "Forced") : nil]
-                            .compactMap { $0 }.joined(separator: " • "),
-                        trackId: index, isSelected: false)
+                    CardTrackListView.Row(title: result.displayTitle, subtitle: result.detail,
+                                          trackId: index, isSelected: false)
                 }
             _ = self.presentRailPanel(
                 content: CardTrackListView(header: String(localized: "Search Results"), rows: rows, onSelect: { [weak vm, weak self] index in
@@ -1622,6 +1898,7 @@ class PlayerContainerViewController: UIViewController {
     func debugContentVertical(up: Bool) { handleContentVertical(up: up) }
 
     func debugPresentPane(_ name: String) {
+        if name == "watchTogether" { return presentWatchTogetherMenu() }
         guard let tab = PaneTab(rawValue: name) else { return }
         presentPane(tab)
         if let pill = pill(for: tab) { rail?.setFocusLanding(pill) }
@@ -1691,8 +1968,11 @@ class PlayerContainerViewController: UIViewController {
             let meta = vm.metadata
             var badges: [String] = []
             if let rating = meta.displayContentRating { badges.append(rating) }
-            if let resolution = meta.Media?.first?.videoResolution?.lowercased() {
-                badges.append(resolution == "4k" ? "4K" : (["1080", "720"].contains(resolution) ? "HD" : "SD"))
+            // No SD badge: Apple's TV app has none.
+            switch meta.Media?.first?.videoResolution?.lowercased() {
+            case "4k", "2160": badges.append("4K")
+            case "1080", "720": badges.append("HD")
+            default: break
             }
             if meta.hasDolbyVision { badges.append("Dolby Vision") } else if meta.hasHDR { badges.append("HDR") }
             if !vm.subtitleTracks.isEmpty { badges.append("CC") }
@@ -1705,6 +1985,7 @@ class PlayerContainerViewController: UIViewController {
                 badges: badges))
             card.onFromBeginning = { [weak self, weak vm] in
                 self?.activeRailPanel?.dismissPanel()
+                vm?.endReplayWindow(reason: "from beginning")
                 Task {
                     await vm?.seek(to: 0)
                     vm?.resume()
@@ -1732,6 +2013,7 @@ class PlayerContainerViewController: UIViewController {
                     isCurrent: watching,
                     onSelect: { [weak self, weak vm] in
                         self?.activeRailPanel?.dismissPanel()
+                        vm?.endReplayWindow(reason: "chapter pick")
                         Task { await vm?.seek(to: start, exact: true) }
                     })
             }
@@ -1786,6 +2068,7 @@ class PlayerContainerViewController: UIViewController {
             let details = PlayerDetailsPaneView(
                 media: PlayerDetailsPaneView.mediaSections(metadata: vm.metadata, modes: vm.streamingModeInfo,
                                                            dolbyVision: vm.aetherPlayer?.dolbyVisionPlayback,
+                                                           enhancementLayer: vm.aetherPlayer?.dolbyVisionEnhancementLayer,
                                                            enhanceDialogue: SystemAudioAdjustment.dialogueSummary,
                                                            upscale: vm.aetherPlayer?.upscaleSummary),
                 statsProvider: statsProvider)
@@ -1860,8 +2143,8 @@ class PlayerContainerViewController: UIViewController {
         restartPaneIdleTimer()
         // Disarm them for the panel that just came up (see above).
         applyChromeVisibility()
-        // A rail panel is a full-screen-adjacent overlay the ambient-pause
-        // backdrop must not show through/around — see
+        // A rail panel is a full-screen-adjacent overlay the pause screen
+        // must not show through/around — see
         // UniversalPlayerViewModel.isRailPanelOpen.
         viewModel?.isRailPanelOpen = true
         view.setNeedsFocusUpdate(); view.updateFocusIfNeeded()
@@ -1879,6 +2162,24 @@ class PlayerContainerViewController: UIViewController {
             .compactMap { $0 }.joined(separator: ", ")
         let eyebrow = [number, meta.title ?? ""].filter { !$0.isEmpty }.joined(separator: " • ")
         rail?.setTitle(show, eyebrow: eyebrow.isEmpty ? nil : eyebrow)
+    }
+
+    // MARK: - Notices
+
+    /// Mounted on the first notice, always above whatever is on screen then.
+    private func showNotice(_ notice: PlaybackNotice?) {
+        if noticeCard == nil, notice != nil {
+            let card = PlayerNoticeCardView()
+            view.addSubview(card)
+            card.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                card.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -PlayerRailView.sideInset),
+                card.topAnchor.constraint(equalTo: view.topAnchor, constant: 60),
+            ])
+            noticeCard = card
+        }
+        if let card = noticeCard, notice != nil { view.bringSubviewToFront(card) }
+        noticeCard?.show(notice)
     }
 
     // MARK: - Post-video (Up Next)
@@ -1989,6 +2290,8 @@ class PlayerContainerViewController: UIViewController {
     private func applyChromeVisibility() {
         guard let vm = viewModel else { return }
         let ambient = vm.pausePresentation != .frame
+        let ambientChanged = ambient != lastAmbient
+        lastAmbient = ambient
         let isLoading = vm.playbackState == .loading || vm.playbackState == .idle
         // The Up Next card sits over the video alone.
         let chromeVisible = (vm.showControls || vm.isScrubbing || vm.showsSkipBar)
@@ -2002,12 +2305,10 @@ class PlayerContainerViewController: UIViewController {
         if railVisible && !railWasVisible { rail?.resetFocusMemory() }
         railWasVisible = railVisible
         let paused = vm.playbackState == .paused && !ambient && hasPlayedSinceLoad
-        // Ambient pause keeps the scrubber up as a read-only position indicator.
-        let scrubberVisible = chromeVisible || (ambient && !isLoading)
-        // For an episode the rail stays at alpha 1 during ambient so its title
-        // holds; `setAmbient` fades the rest.
-        let keepRailTitle = ambient && vm.metadata.type == "episode"
-        let railAlpha: CGFloat = keepRailTitle ? 1 : (railVisible ? 1 : 0)
+        // The pause screen carries the title and the time left, so nothing of
+        // the chrome stays up under it.
+        let scrubberVisible = chromeVisible
+        let railAlpha: CGFloat = railVisible ? 1 : 0
 
         // The proxy is the rail's first focus landing, focusable as soon as the
         // chrome is up. `proxyHasFocus` keeps it focusable through a scrub it
@@ -2023,6 +2324,7 @@ class PlayerContainerViewController: UIViewController {
         let failed = vm.playbackState.isFailed
         let anchorEnabled = vm.postVideoState == .hidden
             && !failed
+            && pauseInsights == nil
             && !vm.controlsFocusActive
             && !vm.skipPillOwnsFocus
         // Requested after the alpha writes below: the pill and rail accept focus
@@ -2067,15 +2369,12 @@ class PlayerContainerViewController: UIViewController {
         let targets: [(UIView?, CGFloat)] = [
             (chromeScrim, chromeVisible ? 1 : 0),
             (progressBar, scrubberVisible && !paneOpen ? 1 : 0),
-            (ambientScrim, (ambient && !isLoading) ? 1 : 0),
             (rail, railAlpha),
             (skipPill, skipVisible ? 1 : 0),
             (pausedDimView, paused ? 1 : 0),
-            // The pause backdrop replaces the frame the captions belong to (#428).
+            // The pause screen covers the frame the captions belong to (#428).
             (captionOverlay, ambient ? 0 : 1),
         ]
-        // `setAmbient` drives the rail's sub-view alphas, which `targets` cannot see.
-        let railAmbientChanged = rail.map { $0.ambientState != (ambient, keepRailTitle) } ?? false
         let targetsChanged = targets.contains(where: { view, alpha in
             view.map { abs($0.alpha - alpha) > 0.01 } == true
         })
@@ -2084,17 +2383,21 @@ class PlayerContainerViewController: UIViewController {
         let captionLiftChanged = captionOverlay.map { $0.controlsVisible != chromeVisible || $0.paneOpen != paneOpen } ?? false
         captionOverlay?.controlsVisible = chromeVisible
         captionOverlay?.paneOpen = paneOpen
-        guard targetsChanged || railAmbientChanged || ownershipChanged
-                || captionLiftChanged || pillHomeChanged else {
+        // The clock toggle lasts while the controls are up; they come back on play time.
+        // Reset as they appear, not as they fade, so the labels never change on their way out.
+        if chromeVisible, let bar = progressBar, bar.alpha < 0.01 { bar.setShowsClockTimes(false) }
+        guard targetsChanged || ownershipChanged || captionLiftChanged
+                || pillHomeChanged else {
             if anchorNeedsFocusUpdate {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
             }
             return
         }
-        UIView.animate(withDuration: 0.25) {
+        // The pause screen's arrival: the paused dim and chrome hand over to its scrim on its clock.
+        let fade = ambientChanged && ambient ? PauseScreenView.fadeDuration : 0.25
+        UIView.animate(withDuration: fade, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState]) {
             for (view, alpha) in targets { view?.alpha = alpha }
-            self.rail?.setAmbient(ambient, keepTitle: keepRailTitle)
             if captionLiftChanged { self.captionOverlay?.layoutIfNeeded() }
             if pillHomeChanged {
                 self.rail?.skipPillSlot.isHidden = !pillInRail
@@ -2109,6 +2412,87 @@ class PlayerContainerViewController: UIViewController {
         if ownershipChanged || anchorNeedsFocusUpdate {
             setNeedsFocusUpdate()
             updateFocusIfNeeded()
+        }
+    }
+
+    // MARK: - Pause screen
+
+    /// Single writer for the pause screen and for the picture's push-in under it.
+    /// Every way out of a pause (resume, Back, any input, an item swap, an error,
+    /// a stop) returns `pausePresentation` to `.frame`, which lands here.
+    private func applyPauseScreen() {
+        guard let vm = viewModel, let pauseScreen else { return }
+        let tier: PauseScreenView.Tier
+        // The Up Next page owns the screen; the pause screen would draw under its card.
+        switch vm.postVideoState == .hidden ? vm.pausePresentation : .frame {
+        case .frame:
+            closePauseInsights()
+            pauseScreen.hide()
+            return
+        case .info: tier = .info
+        case .art: tier = .art
+        case .dimmed: tier = .dimmed
+        }
+        // No frame exists while the engine is torn down after a sleep (#523): the art stands in.
+        let parked = vm.aetherPlayer?.isParkedForReload ?? false
+        if pauseScreen.isShowing {
+            pauseScreen.update(tier: tier, parked: parked)
+        } else {
+            pauseScreen.show(content: pauseScreenContent(vm), tier: tier, parked: parked)
+        }
+    }
+
+    private func pauseScreenContent(_ vm: UniversalPlayerViewModel) -> PauseScreenView.Content {
+        let metadata = vm.metadata
+        return PauseScreenView.Content(
+            title: PauseScreenText.title(for: metadata),
+            logo: vm.titleLogoImage,
+            detailLine: PauseScreenText.detailLine(for: metadata),
+            synopsis: PauseScreenText.synopsis(for: metadata),
+            artURL: vm.ambientBackdropURL,
+            insightsAvailable: pauseInsightsAvailable
+        )
+    }
+
+    /// Down from the pause screen's hint: Insights over the pause screen, no chrome.
+    private func openPauseInsights() {
+        guard pauseInsights == nil, let vm = viewModel, let pauseScreen,
+              let insights = paneContent(.insights, vm: vm)?.view as? InsightsPanelContainerView else { return }
+        let panel = PauseInsightsView(insights: insights)
+        panel.onClose = { [weak self] in self?.closePauseInsights() }
+        // Above the anchor, which would otherwise occlude it; the anchor is gated off meanwhile.
+        view.insertSubview(panel, aboveSubview: contentAnchor ?? pauseScreen)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            panel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: PlayerRailView.sideInset),
+            panel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -PlayerRailView.sideInset),
+            panel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -50),
+        ])
+        pauseInsights = panel
+        pauseScreen.setPanelUp(true)
+        view.layoutIfNeeded()
+        panel.alpha = 0
+        panel.transform = CGAffineTransform(translationX: 0, y: 40)
+        UIView.animate(withDuration: 0.4, delay: 0, options: [.curveEaseOut]) {
+            panel.alpha = 1
+            panel.transform = .identity
+        }
+        applyChromeVisibility()
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+    }
+
+    private func closePauseInsights() {
+        guard let panel = pauseInsights else { return }
+        pauseInsights = nil
+        pauseScreen?.setPanelUp(false)
+        UIView.animate(withDuration: 0.25, animations: { panel.alpha = 0 }) { _ in panel.removeFromSuperview() }
+        panel.isUserInteractionEnabled = false
+        applyChromeVisibility()
+        // Next turn: Up closes from inside a focus update, which ignores a new request.
+        DispatchQueue.main.async { [weak self] in
+            self?.setNeedsFocusUpdate()
+            self?.updateFocusIfNeeded()
         }
     }
 
@@ -2176,8 +2560,11 @@ class PlayerContainerViewController: UIViewController {
             } else {
                 vm.exitControlsFocus()
             }
-            // A user's move (not a re-resolution) counts as input for the paused poster.
-            if !context.focusHeading.isEmpty { vm.hidePausedPoster() }
+            // A user's move (not a re-resolution) counts as input for the paused poster,
+            // except inside Insights raised over it.
+            let inPauseInsights = [context.previouslyFocusedView, context.nextFocusedView]
+                .contains { view in pauseInsights.map { view?.isDescendant(of: $0) == true } ?? false }
+            if !context.focusHeading.isEmpty && !inPauseInsights { vm.hidePausedPoster() }
         }
         restartPaneIdleTimer()
     }
@@ -2274,48 +2661,44 @@ final class SideScrimView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// Bottom-anchored legibility gradient for the ambient-pause scrubber. The
-/// glass rail normally grounds the scrubber; during ambient the rail is gone,
-/// so this thin transparent→black gradient keeps the scrubber readable over
-/// bright backdrops.
-final class BottomScrimView: UIView {
-    override class var layerClass: AnyClass { CAGradientLayer.self }
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isUserInteractionEnabled = false
-        let gradient = layer as! CAGradientLayer
-        gradient.colors = [
-            UIColor.black.withAlphaComponent(0).cgColor,
-            UIColor.black.withAlphaComponent(0.55).cgColor,
-        ]
-        gradient.locations = [0, 1]
-        gradient.startPoint = CGPoint(x: 0.5, y: 0)
-        gradient.endPoint = CGPoint(x: 0.5, y: 1)
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-}
-
 
 // MARK: - UIGestureRecognizerDelegate
 
 extension PlayerContainerViewController: UIGestureRecognizerDelegate {
 
-    /// Only let the swipe-to-scrub pan claim a clearly horizontal gesture it will
-    /// act on. Refusing here, not in the action, leaves vertical swipes to the engine.
+    /// Lets the scrub pan begin where a scrub could start; the axis is decided later.
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard let pan = gestureRecognizer as? UIPanGestureRecognizer,
               pan === panGestureRecognizer
         else { return true }
 
-        guard panCanDriveScrub else { return false }
+        // Insights over the pause screen pages its cards sideways.
+        guard pauseInsights == nil else { return false }
+        let velocity = pan.velocity(in: view)
+        guard panCanDriveScrub else {
+            return refuseScrub(focusIsOnTransportButton ? "focus is on a control" : "player state", velocity)
+        }
 
         // Never while the clickpad is down: a click jolts the touch into a fake swipe.
-        guard !RemoteInputHandler.isClickpadDown, !RemoteInputHandler.isRingJogging else { return false }
+        guard !RemoteInputHandler.isClickpadDown else { return refuseScrub("clickpad down", velocity) }
+        guard !RemoteInputHandler.isRingJogging else { return refuseScrub("ring jog", velocity) }
+        return true
+    }
 
-        // Decide on velocity: translation is still near zero at this point.
-        // A 2:1 horizontal bias leaves diagonal drift to the focus engine.
-        let velocity = pan.velocity(in: view)
-        guard velocity != .zero else { return false }
-        return abs(velocity.x) > abs(velocity.y) * 2
+    /// The scrub pan never takes a swipe from the focus engine or the gated swipes.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === panGestureRecognizer || otherGestureRecognizer === panGestureRecognizer
+    }
+
+    /// A sideways swipe that did not start a scrub leaves a line for Send Diagnostics (#632).
+    /// Vertical swipes are the focus engine's and say nothing.
+    private func refuseScrub(_ why: String, _ velocity: CGPoint) -> Bool {
+        if abs(velocity.x) >= abs(velocity.y) {
+            DiagLog.notice(.playback, "[scrub] swipe did not start a scrub: \(why)")
+        }
+        return false
     }
 }

@@ -8,20 +8,20 @@ import SwiftUI
 struct MacPlaybackSettingsView: View {
     @AppStorage(SkipLengthKeys.back) private var skipBackwardSeconds = 10
     @AppStorage(SkipLengthKeys.forward) private var skipForwardSeconds = 30
-    /// Observed so the skip pickers redraw; read and written through `MarkerSkipMode`.
+    /// Observed so the skip pickers redraw (and Credits); read and written through `MarkerSkipMode`.
     @AppStorage("autoSkipIntro") private var autoSkipIntro = false
     @AppStorage("autoSkipRecap") private var autoSkipRecap = false
-    @AppStorage("autoSkipCredits") private var autoSkipCredits = false
+    @AppStorage(CreditsBehavior.storageKey) private var atTheCredits = ""
     @AppStorage("autoSkipAds") private var autoSkipAds = false
     @AppStorage("showSkipIntro") private var showSkipIntro = true
     @AppStorage("showSkipRecap") private var showSkipRecap = true
-    @AppStorage("showSkipCredits") private var showSkipCredits = true
     @AppStorage("showSkipAds") private var showSkipAds = true
     @AppStorage("useIntroDB") private var useIntroDB = false
     @AppStorage(StreamingQuality.homeKey) private var homeQuality = StreamingQuality.homeDefault
     @AppStorage(StreamingQuality.awayKey) private var awayQuality = StreamingQuality.awayDefault
     /// The key the player reads (AetherPlayer.upscaleKey).
     @AppStorage("upscaleLowResolution") private var upscales = false
+    @AppStorage(StereoWithSubwoofer.key) private var stereoWithSubwoofer = false
     /// Bumped on every track-intent write: `TrackIntentStore` is not observable.
     @State private var trackRevision = 0
     @AppStorage(AutoplayCountdown.storageKey) private var autoplayCountdown = AutoplayCountdown.fiveSeconds.rawValue
@@ -57,12 +57,21 @@ struct MacPlaybackSettingsView: View {
             Section {
                 skipPicker("Intros", marker: "intro")
                 skipPicker("Recaps", marker: "recap")
-                skipPicker("Credits", marker: "credits")
                 skipPicker("Commercials", marker: "commercial")
             } header: {
                 Text("Skip Markers")
             } footer: {
                 Text("Manual shows a skip button, Automatic skips on its own, and Off shows nothing.")
+            }
+
+            Section {
+                Picker("Credits", selection: Binding(
+                    get: { CreditsBehavior.current() }, set: { CreditsBehavior.set($0) }
+                )) {
+                    ForEach(CreditsBehavior.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+            } footer: {
+                Text("Up Next opens the next episode card when the credits start. Skip Button shows only Skip Credits, then Up Next opens at the end. Off waits for the end. Countdown decides autoplay.")
             }
 
             Section {
@@ -91,6 +100,12 @@ struct MacPlaybackSettingsView: View {
                 Toggle("Upscale SD and 720p", isOn: $upscales)
             } footer: {
                 Text("Sharpens video smaller than your screen with Apple's machine learning upscaler. Uses more power, and stops on its own if the Mac can't keep up. HDR and Dolby Vision play as before.")
+            }
+
+            Section {
+                Toggle("Stereo with Subwoofer", isOn: $stereoWithSubwoofer)
+            } footer: {
+                Text("Plays surround soundtracks as stereo with the subwoofer channel mixed into left and right, for 2.1 speakers on a stereo connection.")
             }
 
             Section {

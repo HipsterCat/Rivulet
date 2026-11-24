@@ -24,7 +24,7 @@ final class ShellSidebarModelTests: XCTestCase {
                 .flatMap(\.items).map(\.tab)
         }
         XCTAssertEqual(tabs(showFavorites: true, hasServer: true),
-                       [.account, .search, .home, .watchlist, .favorites, .settings])
+                       [.account, .search, .home, .watchlist, .favorites, .watchTogether, .settings])
         XCTAssertFalse(tabs(showFavorites: false, hasServer: true).contains(.favorites))
         XCTAssertFalse(tabs(showFavorites: true, hasServer: false).contains(.favorites))
     }
@@ -46,6 +46,22 @@ final class ShellSidebarModelTests: XCTestCase {
             profileName: "Account", hasMediaServer: hasServer,
             playlistServers: playlistServers)
             .flatMap(\.items).map(\.tab)
+    }
+
+    func test_watchTogether_lastSitsWithSettings_movedLeavesIt_hiddenIsGone() {
+        func sections(order: [String], show: Bool = true) -> [[SidebarTab]] {
+            ShellSidebarModel.sections(
+                libraries: [SidebarLibrary(plex: movies, serverName: "Angel")], liveTVSources: [], combineLiveTV: true,
+                showDiscover: false, showWatchlist: false, showWatchTogether: show, order: order, profileName: "Bain")
+                .map { $0.items.map(\.tab) }
+        }
+        let seeded = SidebarArrangement.seed(libraryOrder: ["1"], discoverAbove: true, liveTVAbove: false)
+        XCTAssertEqual(sections(order: seeded).last, [.watchTogether, .settings])
+        let moved = SidebarArrangement.move(SidebarArrangement.watchTogether, up: true,
+                                            visible: ["1", SidebarArrangement.watchTogether], order: seeded)
+        XCTAssertEqual(sections(order: moved).last, [.settings])
+        XCTAssertTrue(sections(order: moved).dropLast().joined().contains(.watchTogether))
+        XCTAssertFalse(sections(order: seeded, show: false).joined().contains(.watchTogether))
     }
 
     func test_profileName_prefersPlexProfileThenPlexAccount() {
@@ -104,7 +120,7 @@ final class ShellSidebarModelTests: XCTestCase {
     func test_withServer_keepsEveryTab() {
         XCTAssertEqual(tabs(hasServer: true, liveTV: true, libraries: [movies], playlistServers: [primary]),
                        [.account, .search, .home, .discover, .watchlist, .library(key: "1"),
-                        .playlists(providerID: "plex:primary"), .liveTV(sourceId: nil), .settings])
+                        .playlists(providerID: "plex:primary"), .liveTV(sourceId: nil), .watchTogether, .settings])
     }
 
     func test_playlistsRow_onlyForServersWithPlaylists() {

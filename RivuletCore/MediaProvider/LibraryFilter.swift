@@ -6,8 +6,8 @@
 //  Rivulet
 //
 //  What a video library page can narrow its Titles grid by: genre, decade
-//  and unwatched. Session state per library; every provider maps it onto its
-//  own query.
+//  and unwatched. Session state per library, except Unwatched, which is
+//  remembered (#618); every provider maps it onto its own query.
 //
 
 import Foundation
@@ -26,12 +26,21 @@ struct LibraryFilter: Equatable, Sendable {
 
     static let none = LibraryFilter()
 
+    /// Where iOS and Mac remember a library's Unwatched choice; tvOS keeps it per profile.
+    static func unwatchedOnlyKey(_ libraryKey: String) -> String { "libraryUnwatchedOnly.\(libraryKey)" }
+
+    /// A library's starting filter: its remembered Unwatched choice, nothing else.
+    static func remembered(_ libraryKey: String, defaults: UserDefaults = .standard) -> LibraryFilter {
+        LibraryFilter(unwatchedOnly: defaults.bool(forKey: unwatchedOnlyKey(libraryKey)))
+    }
+
     var isActive: Bool { genre != nil || decade != nil || unwatchedOnly }
 
     /// Every year of the decade, for servers that filter by a year list.
     var decadeYears: [Int] { decade.map { Array($0..<($0 + 10)) } ?? [] }
 
-    static func decadeTitle(_ decade: Int) -> String { "\(decade)s" }
+    /// "1990s"; German reads "1990er". The year goes in as text: a number takes the locale's grouping ("1.990er").
+    static func decadeTitle(_ decade: Int) -> String { String(localized: "library.decade", defaultValue: "\(String(decade))s") }
 }
 
 struct LibraryFilterOptions: Equatable, Sendable {

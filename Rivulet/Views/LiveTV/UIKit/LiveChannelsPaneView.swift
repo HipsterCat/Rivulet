@@ -42,7 +42,12 @@ final class LiveChannelsPaneView: UIView {
         stack.spacing = Metrics.gap
         stack.alignment = .center
         scrollView.addSubview(stack)
-        cards = channels.map { channel in
+        // ponytail: a card per channel hung the main thread on IPTV lineups of
+        // thousands; show the 200 around the playing one. A collection view if
+        // anyone needs the whole lineup here (the guide has it).
+        let playing = channels.firstIndex { $0.id == currentChannelId } ?? 0
+        let first = max(0, min(playing - 100, channels.count - 200))
+        cards = channels[first..<min(channels.count, first + 200)].map { channel in
             let card = LiveChannelCardView(channel: channel, program: programProvider(channel),
                                            isCurrent: channel.id == currentChannelId)
             card.onPress = { onSelect(channel) }
@@ -196,9 +201,16 @@ private final class LiveChannelCardView: UIView {
         guard let url = landscape ?? channel.logoURL ?? program?.posterURL ?? program?.iconURL else { return }
         art.contentMode = landscape != nil ? .scaleAspectFill : .scaleAspectFit
         imageTask = Task { [weak self] in
-            let image = await ImageCacheManager.shared.image(for: url)
+            var image = await ImageCacheManager.shared.image(for: url)
+            var isLogo = landscape == nil
+            // Programme art that fails to load falls back to the channel logo.
+            if image == nil, !isLogo, let logo = channel.logoURL {
+                image = await ImageCacheManager.shared.image(for: logo)
+                isLogo = true
+            }
             guard let self, !Task.isCancelled else { return }
-            self.art.image = landscape == nil ? image?.legibleChannelLogo : image
+            if isLogo { self.art.contentMode = .scaleAspectFit }
+            self.art.image = isLogo ? image?.legibleChannelLogo : image
         }
     }
 

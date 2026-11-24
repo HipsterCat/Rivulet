@@ -39,6 +39,19 @@ final class HomeHeroTests: XCTestCase {
         XCTAssertEqual(HomeHero.libraryItems(rows).map(\.ref.itemID), ["r1", "r2"])
     }
 
+    /// The rows fallback (no list chosen) shows a title once when two libraries add the same one (#649).
+    func test_rowItems_sameTitleInTwoLibrariesIsOneSlide() {
+        func tmdb1(_ base: MediaItem) -> MediaItem {
+            MediaItem(ref: base.ref, kind: base.kind, title: base.title, sortTitle: nil, overview: nil, year: nil,
+                      runtime: nil, parentRef: nil, grandparentRef: nil, episodeNumber: nil, seasonNumber: nil,
+                      childProgress: nil, userState: base.userState, artwork: base.artwork, parentArtwork: nil,
+                      grandparentArtwork: nil, externalIDs: ["tmdb": "1"])
+        }
+        let rows = [shelf("plex:a|movie.recentlyadded.1", [tmdb1(item("a1")), item("a2")]),
+                    shelf("jellyfin:s|m.recentlyAdded", [tmdb1(item("b1", provider: "jellyfin:s"))])]
+        XCTAssertEqual(HomeHero.rowItems(rows).map(\.ref.itemID), ["a1", "a2"])
+    }
+
     func test_trendingFillsWhenNothingElseIsChosen() {
         let result = items([.trending], continueWatching: [item("c")], shelves: [shelf("recentlyadded", [item("r")])],
                            trending: [item("t1"), item("t2")])
@@ -58,6 +71,13 @@ final class HomeHeroTests: XCTestCase {
         let other = shelf("plex:a|genre", [item("g1")])
         let result = items([.recentlyAdded], shelves: [a, other, b])
         XCTAssertEqual(result.map(\.ref.itemID), ["a1", "b1", "a2", "b2"])
+    }
+
+    func test_recentlyAdded_skipsHiddenRows_unlessEveryOneIsHidden() {
+        let a = shelf("plex:a|movie.recentlyadded.1", [item("a1")])
+        let b = shelf("plex:a|show.recentlyadded.2", [item("b1")])
+        XCTAssertEqual(HomeHero.recentlyAdded([a, b], isRowHidden: { $0.id == b.id }).map(\.ref.itemID), ["a1"])
+        XCTAssertEqual(HomeHero.recentlyAdded([a, b], isRowHidden: { _ in true }).map(\.ref.itemID), ["a1", "b1"])
     }
 
     func test_anEmptyChoiceFallsBackToTrending_thenToRows() {

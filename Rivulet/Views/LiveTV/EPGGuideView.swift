@@ -251,15 +251,46 @@ struct EPGGuide: UIViewRepresentable {
         /// Pushes data into the layout. Returns true if channels/programs changed.
         @discardableResult
         func apply(_ p: EPGGuide, to layout: EPGLayout) -> Bool {
+            // Signature to detect data changes. Includes logoURL so a late
+            // channel-logo patch triggers a reload, and per-channel programme
+            // counts and ends so EPG arriving AFTER the channels (Rivulet loads
+            // them separately) reloads the grid and the rows populate.
+            var sig = Hasher()
+            sig.combine(p.channels.count)
+            for c in p.channels {
+                let guide = p.programsByChannel[c.id]
+                sig.combine(c.id)
+                sig.combine(c.logoURL)
+                sig.combine(guide?.count ?? 0)
+                sig.combine(guide?.first?.id)
+                sig.combine(guide?.last?.id)
+            }
+            sig.combine(p.timelineStart)
+            sig.combine(p.totalMinutes)
+            let signature = sig.finalize()
+            // Focus moves and the clock tick land here too: rebuilding every row
+            // each time hung the main thread on lineups of thousands of channels.
+            guard signature != lastSignature else {
+                layout.now = p.now
+                return false
+            }
+            lastSignature = signature
+
             let ppm = EPGTheme.pointsPerMinute
             let total = Double(p.totalMinutes)
+            let placeholderTitle = String(localized: "No guide data available.")
             var rows: [[EPGLayout.Span]] = []
             var progs: [[UnifiedProgram]] = []
             var chans: [UnifiedChannel] = []
 
             for channel in p.channels {
                 let minStart = -Double(EPGTheme.channelColumnWidth) / Double(ppm)
-                let ranges = (p.programsByChannel[channel.id] ?? []).compactMap { program -> (cs: Double, ce: Double, prog: UnifiedProgram)? in
+                let guide = p.programsByChannel[channel.id] ?? []
+                let rowGuide = guide.isEmpty
+                    ? Self.placeholderPrograms(channelId: channel.id, title: placeholderTitle,
+                                               from: p.timelineStart, spanMinutes: p.totalMinutes)
+                    : guide
+                let ranges = rowGuide.compactMap { program -> (cs: Double, ce: Double, prog: UnifiedProgram)? in
                     let startMin = program.start.timeIntervalSince(p.timelineStart) / 60
                     let endMin = program.stop.timeIntervalSince(p.timelineStart) / 60
                     guard endMin > 0, startMin < total else { return nil }
@@ -282,22 +313,6 @@ struct EPGGuide: UIViewRepresentable {
                 chans.append(channel)
             }
 
-            // Signature to detect data changes. Includes logoURL so a late
-            // channel-logo patch triggers a reload, and per-channel programme
-            // counts so EPG arriving AFTER the channels (Rivulet loads them
-            // separately) reloads the grid and the rows populate.
-            var sig = Hasher()
-            sig.combine(p.channels.count)
-            for c in p.channels {
-                sig.combine(c.id)
-                sig.combine(c.logoURL)
-                sig.combine(p.programsByChannel[c.id]?.count ?? 0)
-            }
-            sig.combine(p.timelineStart)
-            let signature = sig.finalize()
-            let changed = signature != lastSignature
-            lastSignature = signature
-
             sections = chans
             programs = progs
             lastTimelineStart = p.timelineStart
@@ -306,7 +321,29 @@ struct EPGGuide: UIViewRepresentable {
                              totalMinutes: p.totalMinutes,
                              timelineStart: p.timelineStart,
                              now: p.now)
-            return changed
+            return true
+        }
+
+        /// 4-hour "No guide data available." blocks spanning the timeline, so a
+        /// channel with no guide data still has cells to focus and select. Block
+        /// boundaries come from the timeline start, so ids stay stable.
+        private static func placeholderPrograms(channelId: String, title: String, from start: Date, spanMinutes: Int) -> [UnifiedProgram] {
+            let blockSeconds: TimeInterval = 4 * 3600
+            let end = start.addingTimeInterval(TimeInterval(spanMinutes * 60))
+            var programs: [UnifiedProgram] = []
+            var blockStart = start
+            while blockStart < end {
+                let blockEnd = blockStart.addingTimeInterval(blockSeconds)
+                programs.append(UnifiedProgram(
+                    id: "\(channelId):placeholder:\(Int(blockStart.timeIntervalSince1970))",
+                    channelId: channelId,
+                    title: title,
+                    startTime: blockStart,
+                    endTime: blockEnd
+                ))
+                blockStart = blockEnd
+            }
+            return programs
         }
 
         func numberOfSections(in collectionView: UICollectionView) -> Int { programs.count }
@@ -982,6 +1019,14 @@ final class GuideCategoryBarView: UIView {
     private var lastFocusedIndexPath: IndexPath?
     var onMoveDown: (() -> Void)?
     private var downSwipeBinding: DirectionalInputBinding?
+    /// Fades the pills out at the row's ends: the sign that more scroll into
+    /// view, and what keeps them off the clock. A mask, not a painted gradient,
+    /// because the guide's artwork shows through this row.
+    private let edgeMask = CAGradientLayer()
+    /// Short enough that a focused pill the engine scrolls in rests clear of it.
+    private static let edgeFadeWidth: CGFloat = 72
+    /// Room around the row for the focused pill's growth and shadow.
+    private static let maskOverhang: CGFloat = 40
 
     private lazy var collectionView: UICollectionView = {
         let layout = UICollectionViewFlowLayout()
@@ -1013,6 +1058,9 @@ final class GuideCategoryBarView: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         addSubview(collectionView)
+        edgeMask.startPoint = CGPoint(x: 0, y: 0.5)
+        edgeMask.endPoint = CGPoint(x: 1, y: 0.5)
+        layer.mask = edgeMask
         downSwipeBinding = DirectionalInputBinding(
             gatedSwipesOn: collectionView,
             directions: [.down],
@@ -1032,6 +1080,40 @@ final class GuideCategoryBarView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         collectionView.frame = bounds
+        // The fade reads the content size, which the first pass has yet to measure.
+        collectionView.layoutIfNeeded()
+        updateEdgeMask()
+    }
+
+    /// How strongly each end fades, from 0 to 1: nothing beyond that end means
+    /// no fade, and it reaches full strength once a fade's width is out of view.
+    nonisolated static func edgeFades(offsetX: CGFloat, contentWidth: CGFloat, width: CGFloat,
+                                      fadeWidth: CGFloat) -> (leading: CGFloat, trailing: CGFloat) {
+        let hiddenTrailing = contentWidth - width - offsetX
+        return (leading: min(max(offsetX / fadeWidth, 0), 1),
+                trailing: min(max(hiddenTrailing / fadeWidth, 0), 1))
+    }
+
+    private func updateEdgeMask() {
+        let fades = Self.edgeFades(offsetX: collectionView.contentOffset.x,
+                                   contentWidth: collectionView.contentSize.width,
+                                   width: bounds.width, fadeWidth: Self.edgeFadeWidth)
+        let overhang = Self.maskOverhang
+        // Open above, below and to the left, but it ends at the row's right
+        // edge, where the clock starts.
+        let maskWidth = bounds.width + overhang
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        edgeMask.frame = CGRect(x: -overhang, y: -overhang,
+                                width: maskWidth, height: bounds.height + 2 * overhang)
+        edgeMask.colors = [UIColor.white.withAlphaComponent(1 - fades.leading).cgColor,
+                           UIColor.white.cgColor, UIColor.white.cgColor,
+                           UIColor.white.withAlphaComponent(1 - fades.trailing).cgColor]
+        if maskWidth > 0 {
+            edgeMask.locations = [overhang / maskWidth, (overhang + Self.edgeFadeWidth) / maskWidth,
+                                  (maskWidth - Self.edgeFadeWidth) / maskWidth, 1].map { NSNumber(value: Double($0)) }
+        }
+        CATransaction.commit()
     }
 
     func configure(
@@ -1056,6 +1138,8 @@ final class GuideCategoryBarView: UIView {
 
         if itemsChanged {
             collectionView.reloadData()
+            collectionView.layoutIfNeeded()
+            updateEdgeMask()
         } else if selectionChanged {
             refreshVisiblePills()
         }
@@ -1090,6 +1174,10 @@ final class GuideCategoryBarView: UIView {
 extension GuideCategoryBarView: UICollectionViewDataSource,
                                 UICollectionViewDelegate,
                                 UICollectionViewDelegateFlowLayout {
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        updateEdgeMask()
+    }
+
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
         items.count
     }
@@ -1288,7 +1376,7 @@ final class EPGLayout: UICollectionViewLayout {
     private var channelCount = 0
     private var totalMinutes = 0
     private var timelineStart = Date()
-    private var now = Date()
+    var now = Date()
 
     private let colW = EPGTheme.channelColumnWidth
     private let rowH = EPGTheme.rowHeight

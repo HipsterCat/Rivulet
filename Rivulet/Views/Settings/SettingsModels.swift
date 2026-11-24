@@ -46,13 +46,14 @@ enum CrossfadeOption: String, CaseIterable, Hashable, CustomStringConvertible {
 
 enum SettingsPage: Hashable, CaseIterable {
     case root
-    case appearance, playback, music, liveTV, servers, about
+    case appearance, playback, music, liveTV, photos, servers, about
     case plex, plexServerDetail, jellyfin, emby, iptv, libraries, cache
     case homeRows
     case liveTVSourceDetail, liveTVFavorites
     case addLiveTVSource, addXtream, addDispatcharr, addTvheadend, addThreadfin, addPlaylistURL
     case appIconPicker, homeHeroPicker, detailRatingPicker, autoplayCountdownPicker, skipIntervalPicker, skipBackIntervalPicker
-    case subtitleModePicker, autoplayLimitPicker
+    case heightSpeakersPicker, subtitleModePicker, autoplayLimitPicker, profilePickerPicker
+    case skipModePicker, creditsPicker, cinemaTrailersPicker
     case homeQualityPicker, awayQualityPicker
     case audioLanguagePicker, subtitleLanguagePicker
     case contentFilter, contentFilterStrength, contentFilterWords
@@ -64,6 +65,7 @@ enum SettingsPage: Hashable, CaseIterable {
         case .playback: return String(localized: "Playback")
         case .music: return String(localized: "Music")
         case .liveTV: return String(localized: "Live TV")
+        case .photos: return String(localized: "Photos")
         case .servers: return String(localized: "Servers")
         case .about: return String(localized: "About")
         case .plex: return String(localized: "Plex")
@@ -86,8 +88,13 @@ enum SettingsPage: Hashable, CaseIterable {
         case .homeHeroPicker: return String(localized: "Hero")
         case .detailRatingPicker: return String(localized: "Rating")
         case .autoplayCountdownPicker: return String(localized: "Autoplay Countdown")
+        case .profilePickerPicker: return String(localized: "Profile Picker")
+        case .skipModePicker: return SettingsContent.skipModeTarget.title
+        case .creditsPicker: return String(localized: "Credits")
+        case .cinemaTrailersPicker: return String(localized: "Trailers Before Movies")
         case .skipIntervalPicker: return String(localized: "Skip Forward Length")
         case .skipBackIntervalPicker: return String(localized: "Skip Back Length")
+        case .heightSpeakersPicker: return String(localized: "Height Speakers")
         case .subtitleModePicker: return String(localized: "Subtitles")
         case .autoplayLimitPicker: return String(localized: "Autoplay Limit")
         case .homeQualityPicker: return String(localized: "Home Streaming")

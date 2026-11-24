@@ -31,15 +31,37 @@ nonisolated struct JFUser: Decodable, Sendable {
     let name: String?
 }
 
-/// `Users/Me`, read for the deletion and recording rights in its policy.
+/// `Users/Me`, read for the deletion and recording rights in its policy and the libraries kept off Home.
 nonisolated struct JFUserWithPolicy: Decodable, Sendable {
     let policy: Policy?
+    let configuration: Configuration?
+    nonisolated struct Configuration: Decodable, Sendable {
+        let latestItemsExcludes: [String]?
+    }
     nonisolated struct Policy: Decodable, Sendable {
         let isAdministrator: Bool?
         let enableContentDeletion: Bool?
         let enableContentDownloading: Bool?
         let enableLiveTvManagement: Bool?
+        let enableSubtitleManagement: Bool?
     }
+}
+
+/// `Libraries/AvailableOptions`: the subtitle providers (OpenSubtitles) the server has installed.
+nonisolated struct JFLibraryAvailableOptions: Decodable, Sendable {
+    let subtitleFetchers: [Fetcher]?
+    nonisolated struct Fetcher: Decodable, Sendable { let name: String? }
+}
+
+/// `Items/{id}/RemoteSearch/Subtitles/{language}`.
+nonisolated struct JFRemoteSubtitle: Decodable, Sendable {
+    let id: String?
+    let name: String?
+    let providerName: String?
+    let format: String?
+    let threeLetterISOLanguageName: String?
+    let forced: Bool?
+    let hearingImpaired: Bool?
 }
 
 /// `/MediaSegments/{id}`: `type` is Intro, Outro, Recap, Commercial, Preview or Unknown.
@@ -77,6 +99,7 @@ nonisolated struct JFItem: Decodable, Sendable {
     let communityRating: Double?    // 0-10, source not named (TMDB or IMDb)
     let criticRating: Double?       // 0-100, Rotten Tomatoes
     let runTimeTicks: Int64?
+    let normalizationGain: Double?  // audio: dB to -18 LUFS, once the library's LUFS scan has run
     let dateCreated: String?
     let dateLastContentAdded: String?   // series/seasons: when the newest episode arrived
 
@@ -127,6 +150,19 @@ nonisolated struct JFItem: Decodable, Sendable {
     let extraType: String?          // on a trailer or special feature: Trailer, Featurette, BehindTheScenes, ...
     /// Internet trailers (YouTube links from TMDB); detail calls return them.
     let remoteTrailers: [JFRemoteTrailer]?
+
+    // Photos: EXIF and GPS on lists; Path, Width and Height only when asked for.
+    let cameraMake: String?
+    let cameraModel: String?
+    let exposureTime: Double?       // seconds
+    let focalLength: Double?
+    let isoSpeedRating: Int?
+    let aperture: Double?           // APEX
+    let latitude: Double?
+    let longitude: Double?
+    let width: Int?
+    let height: Int?
+    let path: String?
 }
 
 /// One entry of `RemoteTrailers`: a link, usually YouTube, and its name.
@@ -219,6 +255,8 @@ nonisolated struct JFMediaStream: Decodable, Sendable {
     let sampleRate: Int?
     let realFrameRate: Double?
     let averageFrameRate: Double?
+    let aspectRatio: String?        // display aspect: "16:9", "2.40:1", or ffprobe's own ("80:29")
+    let isAnamorphic: Bool?
     let videoRangeType: String?     // SDR, HDR10, HLG, HDR10Plus, DOVI, DOVIWithHDR10, ...
     let colorTransfer: String?      // smpte2084 (PQ), arib-std-b67 (HLG), bt709, ...
     let dvProfile: Int?

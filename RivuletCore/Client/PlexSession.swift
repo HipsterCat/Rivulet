@@ -222,19 +222,22 @@ final class PlexSession: ObservableObject {
 
     // MARK: - Playback
 
-    /// `quality` overrides the Home or Away setting; `previous` lends its fresh throughput reading.
+    /// `quality` overrides the Home or Away setting; `previous` lends its fresh throughput reading;
+    /// `startOffset` overrides the resume point.
     func playback(
         for item: PlexMetadata,
         fromBeginning: Bool = false,
         quality: StreamingQuality? = nil,
         previous: PlexPlaybackRequest? = nil,
-        version: VersionChoice = .best
+        version: VersionChoice = .best,
+        startOffset: TimeInterval? = nil
     ) async throws -> PlexPlaybackRequest {
         // A downloaded item plays its file everywhere, online or not.
         // Up Next after a download stays on that download's server.
         if var local = ClientHost.offline.localPlayback(
             for: item, serverID: item.serverID ?? previous?.downloadProviderID.flatMap(DownloadIdentity.plexMachineID(of:))) {
             if fromBeginning { local.startTime = nil }
+            if let startOffset { local.startTime = startOffset }
             return local
         }
         let full = try await metadata(for: item)
@@ -256,7 +259,7 @@ final class PlexSession: ObservableObject {
             quality: quality,
             plan: nil,
             measurement: previous?.freshMeasurement,
-            startTime: resumes && !fromBeginning ? resume : nil
+            startTime: startOffset ?? (resumes && !fromBeginning ? resume : nil)
         )
     }
 
@@ -307,7 +310,8 @@ final class PlexSession: ObservableObject {
            let key = VersionRanking.select(version, in: media).media.first?.Part?.first?.key,
            let probeURL = Self.directPlayURL(serverURL: serverURL, token: token, partKey: key) {
             // Detached: the probe's read loop must not run on the main actor.
-            let kbps = await ThroughputProbe.measure(url: probeURL)
+            let kbps = await ThroughputProbe.measure(
+                url: probeURL, bytes: { try await PlexNetworkManager.shared.openEndedBytes(for: $0) })
             measurement = (kbps, Date())
         }
         let cap = forced.map { $0.step?.kbps } ?? QualityDecision.capKbps(
@@ -316,7 +320,9 @@ final class PlexSession: ObservableObject {
         var item = full
         if !selection.media.isEmpty { item.Media = selection.media }
         let chosen = selection.media.first
-        let plan = forced ?? QualityDecision.decide(
+        // A transcode would play only the first file of a stacked title (#399).
+        let stacked = (chosen?.Part?.count ?? 0) > 1
+        let plan = stacked ? .original : forced ?? QualityDecision.decide(
             setting: quality, sourceKbps: chosen?.sourceKbps, measuredKbps: measurement?.kbps, isRelay: isRelay
         )
 
@@ -388,7 +394,8 @@ final class PlexSession: ObservableObject {
                 timeMs: offsetMs,
                 state: state,
                 duration: request.item.duration,
-                sessionIdentifier: request.directPlaySessionID
+                sessionIdentifier: request.directPlaySessionID,
+                reportingTimeout: PlaybackReportTimeout.duration
             )
             if let owner = plexProviderID(of: request) { ClientHost.offline.progressReached(owner, itemID: key, at: at) }
             return terminated
@@ -408,7 +415,7 @@ final class PlexSession: ObservableObject {
                                       itemServerID: request.item.serverID, currentMachineID: ClientHost.offline.currentServerID)
     }
 
-    private static func directPlayURL(serverURL: String, token: String, partKey: String) -> URL? {
+    static func directPlayURL(serverURL: String, token: String, partKey: String) -> URL? {
         guard let base = URL(string: serverURL),
               var components = URLComponents(url: base.appending(path: partKey), resolvingAgainstBaseURL: false) else {
             return nil
@@ -417,6 +424,7 @@ final class PlexSession: ObservableObject {
         query.append(URLQueryItem(name: "X-Plex-Token", value: token))
         query.append(URLQueryItem(name: "X-Plex-Client-Identifier", value: PlexAPI.clientIdentifier))
         query.append(URLQueryItem(name: "X-Plex-Platform", value: PlexAPI.platform))
+        query.append(URLQueryItem(name: "X-Plex-Device-Name", value: PlexAPI.playerTitle))
         query.append(URLQueryItem(name: "X-Plex-Product", value: PlexAPI.productName))
         components.queryItems = query
         return components.url
@@ -450,7 +458,7 @@ final class PlexSession: ObservableObject {
 
 nonisolated struct PlexPlaybackRequest: Identifiable, Sendable {
     var id: String { item.id }
-    let item: PlexMetadata
+    var item: PlexMetadata
     let url: URL
     let headers: [String: String]
     let markers: [PlexMarker]

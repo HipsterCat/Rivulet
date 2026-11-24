@@ -17,6 +17,8 @@ import Foundation
 @MainActor
 final class BrowseStore: ObservableObject {
     @Published private(set) var libraries: [MediaLibrary] = []
+    /// Photo libraries across servers, for the sidebar; never in `libraries`.
+    @Published private(set) var photoLibraries: [MediaLibrary] = []
     /// Home rows after Continue Watching: promoted rows of the selected Plex server, then each other server's.
     @Published private(set) var shelves: [MediaHub] = []
     /// One row across every server: the same title on two servers is one card.
@@ -28,6 +30,8 @@ final class BrowseStore: ObservableObject {
     /// Bumped when a Home or hero setting changes, so Home redraws from `UserDefaults`.
     @Published var homeSettingsRevision = 0
     @Published private(set) var isLoadingContent = false
+    /// A refresh has run to its end at least once, whatever it found.
+    @Published private(set) var hasRefreshed = false
     /// Other servers still to answer; a tab on one of their libraries waits for this.
     @Published private(set) var isLoadingOtherServers = false
     @Published private(set) var contentError: String?
@@ -36,7 +40,14 @@ final class BrowseStore: ObservableObject {
     /// Favorites changed here this session, so menus and hearts are right before lists refetch.
     @Published private(set) var favoriteOverrides: [MediaItemRef: Bool] = [:]
     /// Libraries the profile hid from the sidebar (`SidebarLibraryVisibility`).
-    @Published var hiddenSidebarLibraries: Set<String> = SidebarLibraryVisibility.stored()
+    @Published var hiddenSidebarLibraries: Set<String> = SidebarLibraryVisibility.stored() {
+        didSet {
+            guard hiddenSidebarLibraries != oldValue else { return }
+            loader.hiddenLibraries = hiddenSidebarLibraries
+            loader.publish()
+            reloadPersonalRows()
+        }
+    }
     /// Bumped on a server or profile switch; the tab stacks rebuild on it.
     @Published private(set) var sessionGeneration = 0
     /// Providers where the account may delete media; asked once per session.
@@ -70,6 +81,7 @@ final class BrowseStore: ObservableObject {
 
     init() {
         loader.onChange = { [weak self] home in self?.apply(home) }
+        loader.hiddenLibraries = hiddenSidebarLibraries
         loader.onSecondaryFinished = { [weak self] in
             self?.isLoadingOtherServers = false
             self?.reloadPersonalRows()
@@ -125,7 +137,12 @@ final class BrowseStore: ObservableObject {
             resetForNewSession()
         }
         isLoadingContent = true
-        defer { if generation == refreshGeneration { isLoadingContent = false } }
+        defer {
+            if generation == refreshGeneration {
+                isLoadingContent = false
+                hasRefreshed = true
+            }
+        }
         isLoadingOtherServers = !secondary.isEmpty
         do {
             // The selected server's failure is the page's; another server's only drops its rows.
@@ -171,6 +188,7 @@ final class BrowseStore: ObservableObject {
 
     /// Called after playback or a watched toggle: repaint open pages, then Home.
     func watchStateDidChange() async {
+        PlexNetworkManager.shared.forgetRecentReads()
         watchStateRevision += 1
         await refresh()
     }
@@ -179,6 +197,7 @@ final class BrowseStore: ObservableObject {
         resetForNewSession()
         signature = ""
         libraries = []
+        photoLibraries = []
         shelves = []
         continueWatching = []
         playlists = [:]
@@ -207,6 +226,7 @@ final class BrowseStore: ObservableObject {
         deletableProviders = []
         refreshBlocked = []
         libraries = []
+        photoLibraries = []
         shelves = []
         continueWatching = []
         failures = [:]
@@ -222,6 +242,7 @@ final class BrowseStore: ObservableObject {
         let home = ClientHost.transformHome(assembled)
         failures = home.failures
         libraries = home.libraries
+        photoLibraries = home.photoLibraries
         shelves = home.shelves
         cwRows = home.continueWatching
         mergeContinueWatching()
@@ -257,6 +278,11 @@ final class BrowseStore: ObservableObject {
 
     static let continueWatchingID = "continueWatching"
 
+    /// Home has rows to draw, or another server's libraries beside a failed server's banner.
+    var hasHomeContent: Bool {
+        continueWatchingHub != nil || !shelves.isEmpty || (!failures.isEmpty && !libraries.isEmpty)
+    }
+
     // MARK: - Playlists
 
     private func playlistsOf(_ providers: [any MediaProvider]) async -> [String: [MediaPlaylist]?] {
@@ -289,8 +315,11 @@ final class BrowseStore: ObservableObject {
     private func loadPermissions(_ providers: [any MediaProvider]) async {
         for provider in providers where !checkedPermissions.contains(provider.id) {
             checkedPermissions.insert(provider.id)
-            if await provider.canDeleteMedia() { deletableProviders.insert(provider.id) }
             if await !provider.canRefreshMetadata() { refreshBlocked.insert(provider.id) }
+        }
+        // Delete is asked on every refresh until allowed; providers keep the answers servers gave (#561).
+        for provider in providers where !deletableProviders.contains(provider.id) {
+            if await provider.canDeleteMedia() { deletableProviders.insert(provider.id) }
         }
         // Download is asked until a server answers, so one failed read never hides it for the session.
         var asked = downloadPermissions
@@ -381,13 +410,20 @@ final class BrowseStore: ObservableObject {
     // MARK: - Hero
 
     func trendingHeroItems() async -> [MediaItem] {
-        await heroSources.trending(providers: allProviders)
+        await heroSources.trending(providers: allProviders).filter(isShownOnHome)
     }
 
     /// The watchlist's first ten entries that any server owns, in watchlist order.
     func watchlistHeroItems() async -> [MediaItem] {
         let entries = Array(PlexWatchlistService.shared.watchlistItems.prefix(10))
         return await heroSources.watchlist(titles: entries.map(TitleMatch.init), key: entries.map(\.id), providers: allProviders)
+            .filter(isShownOnHome)
+    }
+
+    /// False for an item from a hidden library; an item that names no library stays.
+    func isShownOnHome(_ item: MediaItem) -> Bool {
+        guard let libraryID = item.libraryID else { return true }
+        return !hiddenSidebarLibraries.contains(SidebarLibraryVisibility.key(providerID: item.ref.providerID, libraryID: libraryID))
     }
 
     // MARK: - Artwork
@@ -395,7 +431,7 @@ final class BrowseStore: ObservableObject {
     /// Which artwork a call site wants. `.thumb` on an episode is a 16:9 still, while `.poster` on the
     /// same episode is its show's 2:3 poster; the wrong one letterboxes or crops every tile in a rail.
     enum ArtworkKind {
-        /// 2:3 tile art. Episodes resolve to the show poster (tvOS `PosterCell`).
+        /// 2:3 tile art. Episodes and seasons resolve to the show poster (tvOS `PosterCell`).
         case poster
         /// The item's own image. 16:9 for episodes, square for music.
         case thumb
@@ -405,7 +441,8 @@ final class BrowseStore: ObservableObject {
 
     func artworkURL(for item: MediaItem, kind: ArtworkKind = .thumb, width: Int = 900, height: Int = 1350) -> URL? {
         let url: URL? = switch kind {
-        case .poster: item.grandparentArtwork?.poster ?? item.artwork.poster ?? item.parentArtwork?.poster
+        case .poster: item.grandparentArtwork?.poster
+            ?? (item.kind == .season ? item.parentArtwork?.poster : nil) ?? item.artwork.poster ?? item.parentArtwork?.poster
         case .thumb: item.artwork.thumbnail ?? item.artwork.poster
         case .backdrop: item.kind == .episode
             ? (item.grandparentArtwork?.backdrop ?? item.artwork.backdrop ?? item.artwork.thumbnail)

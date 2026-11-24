@@ -15,6 +15,7 @@ import SwiftUI
 struct MacImage: View {
     let url: URL?
     @State private var image: NSImage?
+    @Environment(\.onArtworkShown) private var onArtworkShown
 
     init(url: URL?) {
         self.url = url
@@ -35,12 +36,19 @@ struct MacImage: View {
                 guard let url else { return }
                 if let cached = MacArtworkCache.shared.cachedImage(for: url) {
                     image = cached
+                    onArtworkShown?()
                     return
                 }
                 guard let loaded = await MacArtworkCache.shared.image(for: url), !Task.isCancelled else { return }
-                withAnimation(.easeOut(duration: 0.2)) { image = loaded }
+                // Shown once its fade-in has finished, not when it starts.
+                withAnimation(.easeOut(duration: 0.2)) { image = loaded } completion: { onArtworkShown?() }
             }
     }
+}
+
+extension EnvironmentValues {
+    /// Called when a `MacImage` below has its artwork on screen (the launch splash waits on the hero's).
+    @Entry var onArtworkShown: (() -> Void)?
 }
 
 /// A MediaItem's artwork, resized by its server to the pixel size the tile draws at.
@@ -51,11 +59,28 @@ struct MacItemArtwork: View {
     let width: CGFloat
     /// Width over height of the requested image.
     let aspectRatio: CGFloat
+    /// The Home hero: a backdrop with the title baked in is swapped for a textless TMDB one (#450).
+    var swapsTitledBackdrop = false
     @EnvironmentObject private var browse: BrowseStore
     @Environment(\.displayScale) private var displayScale
+    @State private var textless: (from: URL, to: URL)?
+
+    private var url: URL? { Self.url(browse, item: item, kind: kind, width: width, aspectRatio: aspectRatio, scale: displayScale) }
 
     var body: some View {
-        MacImage(url: Self.url(browse, item: item, kind: kind, width: width, aspectRatio: aspectRatio, scale: displayScale))
+        let url = url
+        let swap = url.flatMap { HeroTextlessBackdrop.cached($0) } ?? (textless?.from == url ? textless?.to : nil)
+        MacImage(url: swap ?? url)
+            .task(id: url) { await swapIfTitled(url) }
+    }
+
+    private func swapIfTitled(_ url: URL?) async {
+        guard swapsTitledBackdrop, let url, let tmdb = item.heroTMDB, HeroTextlessBackdrop.cached(url) == nil else { return }
+        let swap = await HeroTextlessBackdrop.resolve(
+            backdrop: url, logo: await browse.logoURL(for: item), title: item.showTitle, tmdb: tmdb, size: "original"
+        ) { await MacArtworkCache.shared.image(for: $0)?.cgImageRepresentation }
+        guard !Task.isCancelled, let swap else { return }
+        textless = (url, swap)
     }
 
     /// The exact URL this view requests, so a prefetch warms the same cache entry.
@@ -152,7 +177,8 @@ struct MacProgressBar: View {
 }
 
 extension View {
-    /// Progress bar along the bottom, or the watched check when there is no bar.
+    /// Progress bar along the bottom, or the watched check when there is no bar. A show with
+    /// episodes left wears their count instead (#658).
     func macWatchState(_ item: MediaItem) -> some View {
         overlay(alignment: .bottom) {
             if let fraction = item.progressBarFraction {
@@ -160,7 +186,9 @@ extension View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if item.progressBarFraction == nil, item.isWatched {
+            if let count = item.unwatchedEpisodeCount {
+                MacUnwatchedCountPill(count: count)
+            } else if item.progressBarFraction == nil, item.isWatched {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.subheadline)
                     .symbolRenderingMode(.palette)
@@ -179,6 +207,22 @@ extension View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.secondary, lineWidth: 1))
+    }
+}
+
+/// A show's unwatched episodes, in the edition badge's dark capsule.
+private struct MacUnwatchedCountPill: View {
+    let count: Int
+
+    var body: some View {
+        Text(count, format: .number)
+            .font(.caption2.weight(.semibold))
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.black.opacity(0.55), in: Capsule())
+            .padding(6)
     }
 }
 
@@ -222,7 +266,7 @@ struct MacPosterCard: View {
             MacItemArtwork(item: item, kind: item.isMusicItem ? .thumb : .poster, width: width ?? 180, aspectRatio: ratio)
                 .aspectRatio(ratio, contentMode: .fit)
                 .macWatchState(item)
-                .overlay(alignment: .topLeading) { editionBadge }
+                .overlay(alignment: .topTrailing) { editionBadge }
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .macTileHover()
 
@@ -247,7 +291,7 @@ struct MacPosterCard: View {
     }
 
     /// Plex edition ("Director's Cut"), so two editions sharing a poster tell apart.
-    private var edition: String? { item.editionTitle?.isEmpty == false ? item.editionTitle : nil }
+    private var edition: String? { MediaItem.shortEdition(item.editionTitle) }
 
     @ViewBuilder
     private var editionBadge: some View {
@@ -260,6 +304,8 @@ struct MacPosterCard: View {
                 .padding(.vertical, 3)
                 .background(.black.opacity(0.55), in: Capsule())
                 .padding(6)
+                // Below the watched check, which shares this corner.
+                .padding(.top, item.progressBarFraction == nil && item.isWatched ? 22 : 0)
         }
     }
 }

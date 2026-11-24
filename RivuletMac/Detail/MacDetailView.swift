@@ -14,6 +14,8 @@ struct MacDetailView: View {
     @State private var seasonKey: MediaItemRef?
     @State private var episodes: [MediaItem] = []
     @State private var episodesSeasonKey: MediaItemRef?
+    /// The picked season's own extras, shown with the show's.
+    @State private var seasonExtras: [MediaItemDetail.Extra] = []
     @State private var related: [MediaItem] = []
     @State private var members: [MediaItem] = []
     @State private var error: String?
@@ -21,6 +23,9 @@ struct MacDetailView: View {
     @State private var summaryExpanded = false
 
     private var shown: MediaItem { detail?.item ?? item }
+
+    /// A season opens its show: only the season picker shows one season.
+    init(item: MediaItem) { self.item = item.seasonShow ?? item }
     private var isSeries: Bool { shown.kind == .show || shown.kind == .season }
 
     var body: some View {
@@ -56,6 +61,7 @@ struct MacDetailView: View {
             await load()
         }
         .task(id: seasonKey) { await loadEpisodes() }
+        .task(id: seasonKey) { await loadSeasonExtras() }
     }
 
     @ViewBuilder
@@ -70,7 +76,7 @@ struct MacDetailView: View {
             summaryView.padding(.horizontal, MacMetrics.pageMargin)
         }
         if isSeries { episodesSection }
-        MacDetailExtras(detail: detail)
+        MacDetailExtras(detail: detail?.adding(extras: seasonExtras))
         if !members.isEmpty {
             MacRail(title: String(localized: "In This Collection"), kind: .poster, items: members) { member, width in
                 MacTileButton(item: member) { MacPosterCard(item: member, width: width) }
@@ -138,6 +144,7 @@ struct MacDetailView: View {
                             ForEach(episodes) { episode in
                                 MacEpisodeCell(episode: episode, isNextUp: episode.id == nextUpID, width: 300)
                                     .id(episode.id)
+                                    .transition(.opacity)
                             }
                         }
                     }
@@ -240,11 +247,20 @@ struct MacDetailView: View {
         do {
             let loaded = try await browse.provider(for: season.ref).children(of: season.ref).sortedByNumber()
             guard seasonKey == key else { return }
-            episodes = loaded
+            // A deleted episode fades out of the list.
+            let shrank = episodesSeasonKey == key && loaded.count < episodes.count
+            withAnimation(shrank ? .default : nil) { episodes = loaded }
             episodesSeasonKey = key
         } catch let error where isCancellationError(error) {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private func loadSeasonExtras() async {
+        seasonExtras = []
+        guard shown.kind == .show, let key = seasonKey else { return }
+        let loaded = try? await browse.provider(for: key).fullDetail(for: key).extras
+        if seasonKey == key { seasonExtras = loaded ?? [] }
     }
 }

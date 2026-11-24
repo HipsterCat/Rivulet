@@ -237,52 +237,6 @@ final class TrackPreferenceTests: XCTestCase {
     // MARK: - Plex per-item selected stream vs stored intent
 
     /// The build-66 regression: an item whose Plex metadata carries a
-    /// `selected: true` regular English stream must NOT override a stored
-    /// ENG-forced intent. Forced and regular subs are different products;
-    /// the forced boundary holds against the per-item tier too.
-    func testPlexSelectedRegularStreamCannotOverrideForcedIntent() {
-        let selected = sub(1, lang: "eng", forced: false)
-        let intent = SubtitleIntent.track(
-            language: "eng", forced: true, hearingImpaired: false, codec: "srt"
-        )
-
-        XCTAssertFalse(
-            TrackIntentResolver.plexSelectedSubtitleMayOverride(selected, intent: intent)
-        )
-    }
-
-    /// A regular selected stream may override a regular stored intent —
-    /// the per-item pick is more specific than the global memory.
-    func testPlexSelectedRegularStreamMayOverrideRegularIntent() {
-        let selected = sub(1, lang: "spa", forced: false)
-        let intent = SubtitleIntent.track(
-            language: "eng", forced: false, hearingImpaired: false, codec: "srt"
-        )
-
-        XCTAssertTrue(
-            TrackIntentResolver.plexSelectedSubtitleMayOverride(selected, intent: intent)
-        )
-    }
-
-    /// Explicit global Off still yields to a deliberate per-item pick
-    /// (the pre-play picker's server-side persistence contract).
-    func testPlexSelectedStreamMayOverrideExplicitOff() {
-        let selected = sub(1, lang: "eng", forced: false)
-
-        XCTAssertTrue(
-            TrackIntentResolver.plexSelectedSubtitleMayOverride(selected, intent: .off)
-        )
-    }
-
-    /// No stored intent at all: the per-item selection stands.
-    func testPlexSelectedStreamMayOverrideNilIntent() {
-        let selected = sub(1, lang: "eng", forced: false)
-
-        XCTAssertTrue(
-            TrackIntentResolver.plexSelectedSubtitleMayOverride(selected, intent: nil)
-        )
-    }
-
     // MARK: - Audio resolution
 
     func testAudioReturnsNilForEmptyTracks() {
@@ -757,8 +711,9 @@ final class TrackPreferenceTests: XCTestCase {
         try! JSONDecoder().decode([PlexStream].self, from: Data(json.utf8))
     }
 
-    /// Plex's per-item audio pick wins over the intent; the stored intent then picks subtitles.
-    func testStartingSelectionHonorsPerItemAudioPick() {
+    /// With an audio language saved, the server's `selected` audio is ignored, as subtitles' is (#636);
+    /// the stored intent then picks subtitles.
+    func testStartingSelectionIgnoresTheServersSelectedAudioOnceALanguageIsSaved() {
         TrackIntentStore.audioIntent = AudioIntent(language: "eng")
         TrackIntentStore.subtitleIntent = .track(language: "eng", forced: false, hearingImpaired: false, codec: nil)
         let start = TrackIntentResolver.startingPlexSelection(streams: streams(#"""
@@ -766,23 +721,44 @@ final class TrackPreferenceTests: XCTestCase {
              {"id":2,"streamType":2,"index":2,"languageCode":"jpn","codec":"aac","selected":true},
              {"id":3,"streamType":3,"index":3,"languageCode":"eng","codec":"srt"}]
             """#))
-        XCTAssertEqual(start.audio, 2)
+        XCTAssertEqual(start.audio, 1)
         XCTAssertEqual(start.subtitle, .track(3))
     }
 
-    /// A deliberate Plex subtitle pick overrides a stored Off; nothing selected resolves to off.
-    func testStartingSelectionSubtitleOverrideAndOff() {
+    /// With no audio language saved, the server's pick from the account's language plays (#382).
+    func testStartingSelectionFollowsTheServerWithNoAudioLanguageSaved() {
+        let start = TrackIntentResolver.startingPlexSelection(streams: streams(#"""
+            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","codec":"eac3","default":true},
+             {"id":2,"streamType":2,"index":2,"languageCode":"jpn","codec":"aac","selected":true}]
+            """#))
+        XCTAssertEqual(start.audio, 2)
+    }
+
+    /// A reload of the same title keeps the playing track over the saved language.
+    func testStartingSelectionKeepsACarriedAudioTrack() {
+        TrackIntentStore.audioIntent = AudioIntent(language: "eng")
+        let start = TrackIntentResolver.startingPlexSelection(streams: streams(#"""
+            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","codec":"eac3","default":true},
+             {"id":2,"streamType":2,"index":2,"languageCode":"jpn","codec":"aac"}]
+            """#), audioOverride: 2)
+        XCTAssertEqual(start.audio, 2)
+    }
+
+    /// The saved subtitle choice decides, whatever stream the server marks selected (#636):
+    /// that mark comes from other apps and the account's own auto-select, never from a pick here.
+    func testStartingSelectionIgnoresTheServersSelectedSubtitle() {
+        let selectedSubtitle = #"""
+            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","default":true,"selected":true},
+             {"id":3,"streamType":3,"index":3,"languageCode":"eng","codec":"srt","selected":true}]
+            """#
         TrackIntentStore.subtitleIntent = .off
-        let picked = TrackIntentResolver.startingPlexSelection(streams: streams(#"""
-            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","default":true,"selected":true},
-             {"id":3,"streamType":3,"index":3,"languageCode":"spa","selected":true}]
-            """#))
-        XCTAssertEqual(picked.subtitle, .track(3))
-        let off = TrackIntentResolver.startingPlexSelection(streams: streams(#"""
-            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","default":true,"selected":true},
-             {"id":3,"streamType":3,"index":3,"languageCode":"spa"}]
-            """#))
-        XCTAssertEqual(off.subtitle, .off)
+        XCTAssertEqual(TrackIntentResolver.startingPlexSelection(streams: streams(selectedSubtitle)).subtitle, .off)
+        // Foreign Audio over English audio: no full subtitles, selected or not.
+        TrackIntentStore.subtitleIntent = .foreignAudio(language: "eng", hearingImpaired: false)
+        XCTAssertEqual(TrackIntentResolver.startingPlexSelection(streams: streams(selectedSubtitle)).subtitle, .off)
+        // Always, in English: the saved choice turns them on by itself.
+        TrackIntentStore.subtitleIntent = .track(language: "eng", forced: false, hearingImpaired: false, codec: nil)
+        XCTAssertEqual(TrackIntentResolver.startingPlexSelection(streams: streams(selectedSubtitle)).subtitle, .track(3))
     }
 
     /// A provider's shim numbers a stream 0 (a Jellyfin sidecar); the intent can pick it.
@@ -793,5 +769,75 @@ final class TrackPreferenceTests: XCTestCase {
              {"id":5,"streamType":2,"index":5,"languageCode":"eng","default":true,"selected":true}]
             """#))
         XCTAssertEqual(start.subtitle, .track(0))
+    }
+
+    // MARK: - Opening audio
+
+    /// The reported file: the better English track is listed second. The engine opens on the
+    /// starting pick by container index, or it switches to it mid-load and drops Dolby Vision.
+    func testStartingAudioOpensOnTheSecondTrackByContainerIndex() {
+        TrackIntentStore.audioIntent = AudioIntent(language: "eng", codec: "dts", channels: 8)
+        let streams = self.streams(#"""
+            [{"id":101,"streamType":2,"index":1,"languageCode":"eng","codec":"eac3","channels":8,"default":true},
+             {"id":102,"streamType":2,"index":2,"languageCode":"eng","codec":"dca","channels":8}]
+            """#)
+        let start = TrackIntentResolver.startingPlexSelection(streams: streams)
+        XCTAssertEqual(start.audio, 102)
+        XCTAssertEqual(TrackIntentResolver.audioStreamIndex(ofPlexStream: start.audio, in: streams), 2)
+    }
+
+    /// A Jellyfin stream's id is the server's own numbering, offset by sidecars; the engine needs `index`.
+    func testAudioStreamIndexIsTheContainerIndexNotTheID() {
+        let streams = self.streams(#"""
+            [{"id":0,"streamType":3,"languageCode":"eng","codec":"srt","key":"/s/0"},
+             {"id":3,"streamType":2,"index":2,"languageCode":"eng","codec":"eac3"}]
+            """#)
+        XCTAssertEqual(TrackIntentResolver.audioStreamIndex(ofPlexStream: 3, in: streams), 2)
+    }
+
+    /// Only an audio stream maps; anything else leaves the engine's own pick.
+    func testAudioStreamIndexIgnoresOtherStreams() {
+        let streams = self.streams(#"""
+            [{"id":1,"streamType":2,"index":1,"languageCode":"eng","codec":"eac3"},
+             {"id":4,"streamType":3,"index":4,"languageCode":"eng","codec":"srt"}]
+            """#)
+        XCTAssertNil(TrackIntentResolver.audioStreamIndex(ofPlexStream: 4, in: streams))
+        XCTAssertNil(TrackIntentResolver.audioStreamIndex(ofPlexStream: 9, in: streams))
+        XCTAssertNil(TrackIntentResolver.audioStreamIndex(ofPlexStream: nil, in: streams))
+    }
+
+    // MARK: - Engine audio after load
+
+    private func flagged(_ track: MediaTrack, commentary: Bool = false, described: Bool = false) -> MediaTrack {
+        MediaTrack(id: track.id, name: track.name, languageCode: track.languageCode, codec: track.codec,
+                   isDefault: track.isDefault, isCommentary: commentary, isAudioDescription: described,
+                   channels: track.channels)
+    }
+
+    /// The engine opened on the starting pick; the post-load pass keeps it even where
+    /// the engine's list would rank another track first (#627).
+    func testEngineAudioKeepsTheOpenedTrack() {
+        let opened = audio(1, lang: "eng", codec: "eac3", channels: 6)
+        let tracks = [opened, audio(2, lang: "eng", codec: "truehd", channels: 8)]
+        XCTAssertEqual(TrackIntentResolver.engineAudio(opened: opened, in: tracks,
+                                                       intent: AudioIntent(language: "eng"))?.id, 1)
+    }
+
+    /// A commentary flag only the engine reads moves the pick to the intent's track.
+    func testEngineAudioLeavesACommentaryTheServerCouldNotSee() {
+        let opened = flagged(audio(2, lang: "eng", codec: "dts", channels: 8), commentary: true)
+        let tracks = [audio(1, lang: "eng", codec: "eac3", channels: 6), opened]
+        XCTAssertEqual(TrackIntentResolver.engineAudio(opened: opened, in: tracks,
+                                                       intent: AudioIntent(language: "eng"))?.id, 1)
+    }
+
+    /// A saved commentary shape, or a carried pick, keeps the flagged track.
+    func testEngineAudioKeepsAWantedCommentary() {
+        let opened = flagged(audio(2, lang: "eng", codec: "dts", channels: 8), commentary: true)
+        let tracks = [audio(1, lang: "eng", codec: "eac3", channels: 6), opened]
+        XCTAssertEqual(TrackIntentResolver.engineAudio(opened: opened, in: tracks,
+                                                       intent: AudioIntent(language: "eng", codec: "dts", channels: 8))?.id, 2)
+        XCTAssertEqual(TrackIntentResolver.engineAudio(opened: opened, in: tracks, carried: true,
+                                                       intent: AudioIntent(language: "eng"))?.id, 2)
     }
 }

@@ -131,6 +131,7 @@ class PlexAuthManager: ObservableObject {
             KeychainHelper.delete(keychainTokenKey)
             KeychainHelper.delete(keychainServerTokenKey)
             PlexProfileSession.delete()
+            PlexProfileSession.deleteProfilePlexTokens()
             KeychainHelper.deleteAllPins()
             state = .idle
             return
@@ -585,6 +586,31 @@ class PlexAuthManager: ObservableObject {
         }
     }
 
+    /// `http://<ip>:<port>` for a plex.direct URL naming a LAN address, else nil.
+    /// With no internet the router cannot resolve plex.direct names (#668).
+    nonisolated static func lanFallbackURL(for urlString: String) -> String? {
+        guard let components = URLComponents(string: urlString), let host = components.host,
+              let address = ServerLocation.plexDirectAddress(host.lowercased()),
+              ServerLocation.isPrivateAddress(address) else { return nil }
+        let literal = address.contains(":") ? "[\(address)]" : address
+        return "http://\(literal):\(components.port ?? 32400)"
+    }
+
+    /// Without plex.tv there is no connection list, so the saved plex.direct
+    /// URL's own address is the only candidate. It must answer as the saved server.
+    private func adoptLANAddressWithoutPlexTV(from currentURL: String, expecting savedID: String?) async -> Bool {
+        guard let savedID, let lanURL = Self.lanFallbackURL(for: currentURL),
+              await testConnection(lanURL, expecting: savedID) != nil,
+              await serverAcceptsToken(selectedServerToken, at: lanURL) else { return false }
+        DiagLog.notice(.connection, "plex.tv unreachable, using the LAN address: \(DiagLog.describe(url: lanURL))")
+        selectedServerURL = lanURL
+        userDefaults.set(lanURL, forKey: serverURLKey)
+        isConnected = true
+        connectionError = nil
+        state = .authenticated
+        return true
+    }
+
     /// False only on an explicit 401/403 from a server already proven to be the right one.
     private func serverAcceptsToken(_ token: String?, at urlString: String) async -> Bool {
         guard let token, let url = URL(string: "\(urlString)/") else { return true }
@@ -610,10 +636,11 @@ class PlexAuthManager: ObservableObject {
         return String(text[range].dropFirst("machineIdentifier=\"".count).dropLast())
     }
 
-    /// One breadcrumb per failed connection probe (mirrored as a log), so the
-    /// per-candidate failure trail is visible (GitHub #224).
+    /// One breadcrumb per failed connection probe, so an event carries the
+    /// per-candidate failure trail (GitHub #224). Debug, so it is not mirrored as a
+    /// log: losing candidates is normal, and a total failure is logged on its own.
     private static func addConnectionTestBreadcrumb(urlString: String, outcome: String) {
-        let breadcrumb = Breadcrumb(level: .warning, category: "plex_auth")
+        let breadcrumb = Breadcrumb(level: .debug, category: "plex_auth")
         breadcrumb.message = "Connection probe failed"
         breadcrumb.data = [
             "host": URL(string: urlString)?.host ?? "invalid-url",
@@ -712,6 +739,7 @@ class PlexAuthManager: ObservableObject {
         KeychainHelper.delete(keychainTokenKey)
         KeychainHelper.delete(keychainServerTokenKey)
         PlexProfileSession.delete()
+        PlexProfileSession.deleteProfilePlexTokens()
         PlexCertificateDelegate.forgetCertificateHashes()
 
         // Clear non-sensitive data from UserDefaults
@@ -827,12 +855,13 @@ class PlexAuthManager: ObservableObject {
     /// Signed out of Plex is not a lock: `storedContent` reads `.withheld` with no account token.
     var relocksOnLaunch: Bool { authToken != nil && storedContent == .withheld }
 
-    /// The account token for account-level content (Watchlist, favourite channels),
-    /// only while the account itself is the profile in use.
+    /// The plex.tv token for account-level content (Watchlist, favourite channels):
+    /// the account's own, or the profile in use's own switched token.
     var accountContentToken: String? {
-        guard selectedServerToken != nil,
-              userDefaults.integer(forKey: PlexProfileSession.contentUserIDKey) == 0 else { return nil }
-        return authToken
+        let id = contentOwnerID
+        return PlexProfileSession.accountContentToken(
+            accountToken: authToken, contentUserID: id, contentUnlocked: selectedServerToken != nil,
+            profileToken: id == 0 ? nil : PlexProfileSession.profilePlexToken(userID: id))
     }
 
     /// Whether a Home user is the signed-in account itself, not another profile in its Home.
@@ -854,9 +883,10 @@ class PlexAuthManager: ObservableObject {
 
     /// Installs a Home profile's server token. Returns true when content now
     /// belongs to a different user than the one it was loaded and cached for.
-    func enterProfile(_ user: PlexHomeUser, serverToken: String, usedPin: Bool) -> Bool {
+    func enterProfile(_ user: PlexHomeUser, serverToken: String, plexToken: String, usedPin: Bool) -> Bool {
         guard let authToken else { return false }
         let isAccount = isAccount(user)
+        if !isAccount { PlexProfileSession.saveProfilePlexToken(plexToken, userID: user.id) }
         let access = PlexProfileSession.access(isAccount: isAccount, usedPin: usedPin, serverToken: serverToken)
         PlexProfileSession(userID: user.id, accountToken: authToken, access: access).save()
         if selectedServerToken != serverToken { selectedServerToken = serverToken }
@@ -1060,6 +1090,7 @@ class PlexAuthManager: ObservableObject {
                 }
             } catch {
                 DiagLog.error(.connection, "Server discovery for re-selection failed: \(DiagLog.describe(error))")
+                if await adoptLANAddressWithoutPlexTV(from: currentURL, expecting: savedID) { return }
                 // Keep existing credentials - just mark as not connected
                 // User can still see cached content
 

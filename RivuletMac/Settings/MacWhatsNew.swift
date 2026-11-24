@@ -3,10 +3,68 @@
 
 import SwiftUI
 
-/// The Mac release notes, keyed "<CFBundleShortVersionString> (<CFBundleVersion>)", newest first.
+/// The Mac release notes, keyed "<CFBundleShortVersionString> (<CFBundleVersion>)", newest first;
+/// CI takes the build number from the shared `vX.Y.Z-<build>` tag.
 /// A line starting with "## " is a heading; any other line is a bullet.
 enum MacChangelog {
     static let entries: [(version: String, lines: [String])] = [
+        ("1.3.1 (132)", [
+            "Swipe the Home hero with your trackpad. @priyanshuppal",
+            "Live TV can start a show from the beginning when Plex is recording it",
+            "Libraries you hide from Home stay out of the Home hero",
+            "Updated AetherEngine to 7.71.0",
+        ]),
+        ("1.3.1 (131)", [
+            "Plex titles play the original file again instead of a server conversion",
+        ]),
+        ("1.3.1 (130)", [
+            "New: Stereo with Subwoofer in Settings > Playback, for 2.1 speakers",
+            "New: Leave a Tip, in Settings > General",
+            "Show posters show how many episodes you haven't watched",
+            "A new launch animation draws the Rivulet R",
+            "When a file won't play, Rivulet switches to a server stream or says why",
+            "Plex servers on your home network play when your internet is down",
+            "Dolby Vision stays on when your preferred audio track isn't the first one. @andreiborisov",
+            "What's On no longer freezes on large guides, and shows every channel",
+            "Rivulet no longer asks for keychain access over and over",
+            "Updated AetherEngine to 7.69.0",
+        ]),
+        ("1.3.1 (129)", [
+            "New: Watch Together. Start or join a room and watch in sync with friends",
+            "Subtitles follow your Subtitles setting, not a track Plex has selected",
+            "Auto quality no longer drops to 720p on a very fast connection",
+        ]),
+        ("1.3.1 (128)", [
+            "Home can show your favorite Live TV channels",
+            "Library sorting matches Apple TV, New Episodes included",
+            "Libraries remember the Unwatched filter",
+            "The Home hero follows the rows you show on Home",
+            "Delete shows up again on a remote connection",
+            "Plex's dashboard, Tautulli and webhooks show which device is playing",
+            "Fixed finding some Plex servers",
+            "Updated AetherEngine to 7.66.1",
+        ]),
+        ("1.3.0 (127)", [
+            "Updated AetherEngine to 7.62.1",
+            "Fixed watch progress reporting through credits, reloads and episode changes",
+            "Photos fixes",
+            "French: fixed the Play and Continue Watching labels",
+        ]),
+        ("1.3.0 (126)", [
+            "Photos, with favorites, slideshows, photo info, a map and a memories row",
+            "Improved search to find more matches, genres, and people",
+            "Subtitle search in the player. Jellyfin and Emby should work (please test)",
+            "Plex home profiles now see their own watchlist",
+            "Hidden libraries stay off Home and the hero",
+            "Direct Play buffers as far ahead as storage allows",
+            "Added delete option in more long press menus",
+            "Video libraries can be browsed by folder",
+            "Season tiles show the show's poster and open the show",
+            "Faster playback, and finishing a title adds one play in Plex",
+            "With credits playing out, Up Next's countdown ends when the video does",
+            "Artwork stays on your device between launches",
+            "French is available, and German covers more of the app. @JoschaP",
+        ]),
         ("1.0.0 (1)", [
             "Rivulet now has a native Mac app",
             "Plex, Jellyfin and Emby in one place, with Continue Watching merged across servers",
@@ -32,17 +90,24 @@ enum MacChangelog {
 
 /// Shown once after an update whose build has notes, and from Help > What's New.
 struct MacWhatsNewView: View {
-    let version: String
+    /// Newest first: every build since the last one seen, or one from Help.
+    let versions: [String]
     var showsContinue = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("What's New").font(.largeTitle.bold())
-            Text("Version \(version)").font(.subheadline).foregroundStyle(.secondary)
             ScrollView {
-                MacChangelogLines(lines: MacChangelog.lines(for: version) ?? [])
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 20) {
+                    ForEach(versions, id: \.self) { version in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Version \(version)").font(.subheadline).foregroundStyle(.secondary)
+                            MacChangelogLines(lines: MacChangelog.lines(for: version) ?? [])
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             if showsContinue {
                 Button("Continue") { dismiss() }.keyboardShortcut(.defaultAction).frame(maxWidth: .infinity)

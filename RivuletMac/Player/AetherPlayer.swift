@@ -159,6 +159,14 @@ final class AetherPlayer: ObservableObject {
     private var userIntendsToPlay = false
     private var lastLoad: LoadRequest?
 
+    /// A stacked title (#399) plays one file at a time while the player reports the
+    /// title's timeline: a seek into another file loads it, and only the last file's end is `.ended`.
+    private var stack: StackedParts<StackedPartFile>?
+    private var partIndex = 0
+    private var partStart: TimeInterval { stack?.starts[partIndex] ?? 0 }
+    /// True while the next file loads: the engine's idle/ended states and zeroed clock belong to the swap.
+    private var isSwitchingPart = false
+
     private enum LoadRequest {
         case vod(url: URL, headers: [String: String], subtitles: [SidecarSubtitle])
         case live(url: URL, headers: [String: String], forceEngineDemux: Bool)
@@ -192,18 +200,24 @@ final class AetherPlayer: ObservableObject {
         // The engine otherwise uses system trust alone, so a server the API
         // session accepts would browse and never play (#337).
         EngineTLS.serverTrustEvaluator = { PlexCertificateDelegate.trustsServer($0) }
+        // No subtitle delay control here, so image subtitles keep the engine's minimum window.
+        engine.maximumSubtitleOffsetSeconds = 0
         softwarePiPBridge.player = self
         wirePublishers()
     }
 
     private func wirePublishers() {
-        engine.$state
+        PlaybackTransportState.publisher(state: engine.$state.map(\.transportState).eraseToAnyPublisher(),
+                                         phase: engine.$playbackPhase.map(\.transportPhase).eraseToAnyPublisher(),
+                                         nativeReady: PlaybackTransportState.nativeReadiness(engine.$currentAVPlayer.eraseToAnyPublisher()))
+            .map(\.engineState)
             // errorInfo is assigned right before state, so read it on this turn.
             .map { [engine] state in (state, engine.errorInfo) }
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state, errorInfo in
                 guard let self else { return }
-                self.state = Self.translate(state, errorInfo: errorInfo)
+                let translated = Self.translate(state, errorInfo: errorInfo)
+                if !self.holdsForPartSwitch(translated) { self.state = translated }
                 if case .error = state { self.canRetry = errorInfo?.kind != .dolbyVisionRequiresHardware }
                 self.recomputeBuffering()
                 self.softwarePiPBridge.update(isPaused: state != .playing)
@@ -233,7 +247,7 @@ final class AetherPlayer: ObservableObject {
             .sink { [weak self] in
                 guard let self else { return }
                 if let source = self.engine.softwarePiPSource { self.softwarePiPBridge.update(timeRange: source.timeRange()) }
-                self.duration = $0
+                self.duration = self.stack?.duration ?? $0
             }
             .store(in: &cancellables)
 
@@ -290,7 +304,7 @@ final class AetherPlayer: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] event in
                 guard let self, event.isTerminal, let pending = self.pendingSeekTarget,
-                      abs(pending - event.target) < 0.5 else { return }
+                      abs(pending - (event.target + self.partStart)) < 0.5 else { return }
                 self.pendingSeekTarget = nil
             }
             .store(in: &cancellables)
@@ -374,7 +388,8 @@ final class AetherPlayer: ObservableObject {
     }
 
     private func clockTicked(_ time: Double) {
-        currentTime = time
+        guard !isSwitchingPart else { return }
+        currentTime = time + partStart
         if isStarting, time > 0 {
             isStarting = false
             pendingSeekTarget = nil
@@ -416,12 +431,21 @@ final class AetherPlayer: ObservableObject {
     /// Same key as the tvOS Upscale SD and 720p setting; absent = off.
     static let upscaleKey = "upscaleLowResolution"
 
-    func loadLive(url: URL, headers: [String: String]? = nil, forceEngineDemux: Bool = false) async throws {
-        lastLoad = .live(url: url, headers: headers ?? [:], forceEngineDemux: forceEngineDemux)
-        try await performLiveLoad(url: url, headers: headers ?? [:], forceEngineDemux: forceEngineDemux)
+    /// Stereo with Subwoofer (#614): a stereo fold that keeps the LFE.
+    static func audioShaping() -> AudioShaping {
+        StereoWithSubwoofer.isOn() ? AudioShaping(maxChannels: 2, lfeMixDB: StereoWithSubwoofer.lfeMixDB) : AudioShaping()
     }
 
-    private func performLiveLoad(url: URL, headers: [String: String], forceEngineDemux: Bool) async throws {
+    /// `joinsAtRecordingStart` plays a Plex recording in progress from its first segment; a retry joins live.
+    func loadLive(url: URL, headers: [String: String]? = nil, forceEngineDemux: Bool = false,
+                  joinsAtRecordingStart: Bool = false) async throws {
+        lastLoad = .live(url: url, headers: headers ?? [:], forceEngineDemux: forceEngineDemux)
+        try await performLiveLoad(url: url, headers: headers ?? [:], forceEngineDemux: forceEngineDemux,
+                                  joinsAtRecordingStart: joinsAtRecordingStart)
+    }
+
+    private func performLiveLoad(url: URL, headers: [String: String], forceEngineDemux: Bool,
+                                 joinsAtRecordingStart: Bool = false) async throws {
         beginLoad()
         let isNativeHLS = Self.isHLSURL(url) && !forceEngineDemux
         // Forced onto the engine demuxer AND a playlist: the Plex direct-play grant.
@@ -452,6 +476,12 @@ final class AetherPlayer: ObservableObject {
             // depth on short-GOP channels: the playlist caps at 900 segments.
             options.liveJoinProfile = .fastZap
             options.audioDelaySeconds = AudioSync.seconds()
+            options.audioShaping = Self.audioShaping()
+            if joinsAtRecordingStart {
+                // #444: play from the recording's first segment; the window reaches back to it.
+                options.liveJoinsAtPlaylistStart = true
+                options.dvrWindowSeconds = 4 * 3600
+            }
             return options
         }
 
@@ -484,13 +514,68 @@ final class AetherPlayer: ObservableObject {
         headers: [String: String]? = nil,
         startTime: TimeInterval? = nil,
         externalSubtitles: [SidecarSubtitle] = [],
-        keepingTransport: Bool = false
+        audioStreamIndex: Int? = nil,
+        keepingTransport: Bool = false,
+        stackedParts: StackedParts<StackedPartFile>? = nil
     ) async throws {
-        lastLoad = .vod(url: url, headers: headers ?? [:], subtitles: externalSubtitles)
+        stack = stackedParts
+        isSwitchingPart = false
+        guard let stackedParts else {
+            partIndex = 0
+            lastLoad = .vod(url: url, headers: headers ?? [:], subtitles: externalSubtitles)
+            try await performVODLoad(
+                url: url, headers: headers ?? [:], startTime: startTime, subtitles: externalSubtitles,
+                keepingTransport: keepingTransport, audioStreamIndex: audioStreamIndex
+            )
+            return
+        }
+        duration = stackedParts.duration
+        let (index, offset) = stackedParts.locate(startTime ?? 0)
+        partIndex = index
+        let file = stackedParts.files[index]
+        lastLoad = .vod(url: file.url, headers: headers ?? [:], subtitles: file.sidecars)
+        // Stream indexes match across the files of one release.
         try await performVODLoad(
-            url: url, headers: headers ?? [:], startTime: startTime, subtitles: externalSubtitles,
-            keepingTransport: keepingTransport
+            url: file.url, headers: headers ?? [:], startTime: startTime == nil ? nil : offset,
+            subtitles: file.sidecars, keepingTransport: keepingTransport, audioStreamIndex: audioStreamIndex
         )
+    }
+
+    /// A stacked part's end loads the next part, so the engine's `.ended` is not the title's.
+    /// Also hides the swap's own idle/ended. True when `state` should not be published.
+    private func holdsForPartSwitch(_ state: State) -> Bool {
+        if isSwitchingPart { return state == .idle || state == .ended }
+        guard state == .ended, let stack, partIndex + 1 < stack.files.count else { return false }
+        isSwitchingPart = true
+        Task { await switchPart(to: partIndex + 1, at: 0) }
+        return true
+    }
+
+    /// Opens another file of the stacked title at `offset` within it, keeping the pause
+    /// state and the track picks (stream indexes match across the files of one release).
+    private func switchPart(to index: Int, at offset: TimeInterval) async {
+        isSwitchingPart = true
+        defer { isSwitchingPart = false }
+        guard let stack, stack.files.indices.contains(index), case .vod(_, let headers, _)? = lastLoad else { return }
+        let audio = engine.activeAudioTrackIndex
+        let subtitle = engine.activeSubtitleTrackIndex
+        partIndex = index
+        let file = stack.files[index]
+        lastLoad = .vod(url: file.url, headers: headers, subtitles: file.sidecars)
+        do {
+            // Stream indexes match across the files of one release, so the part opens on the playing audio.
+            try await performVODLoad(url: file.url, headers: headers, startTime: offset > 0 ? offset : nil,
+                                     subtitles: file.sidecars, keepingTransport: true, audioStreamIndex: audio)
+        } catch {
+            return
+        }
+        if let audio, audio != engine.activeAudioTrackIndex, engine.audioTracks.contains(where: { $0.id == audio }) {
+            selectAudioTrack(id: audio)
+        }
+        if subtitle != engine.activeSubtitleTrackIndex,
+           subtitle.map({ id in engine.subtitleTracks.contains { $0.id == id } }) ?? true {
+            selectSubtitleTrack(id: subtitle)
+        }
     }
 
     private func performVODLoad(
@@ -498,10 +583,11 @@ final class AetherPlayer: ObservableObject {
         headers: [String: String],
         startTime: TimeInterval?,
         subtitles: [SidecarSubtitle],
-        keepingTransport: Bool = false
+        keepingTransport: Bool = false,
+        audioStreamIndex: Int? = nil
     ) async throws {
         beginLoad(keepingTransport: keepingTransport)
-        pendingSeekTarget = startTime
+        pendingSeekTarget = startTime.map { $0 + partStart }
         isStarting = true
         var options = LoadOptions(
             suppressDisplayCriteria: false,
@@ -533,11 +619,20 @@ final class AetherPlayer: ObservableObject {
         )
         options.autoplay = userIntendsToPlay
         options.audioDelaySeconds = AudioSync.seconds()
+        options.audioShaping = Self.audioShaping()
+        // Read ahead as far as the engine's disk budget allows.
+        options.forwardBufferSegments = .max
+        // Reopening the same title within the session plays from the segments already fetched.
+        options.retainsSessionCacheAfterStop = true
         // Engine takes it only for SDR below the screen's size and switches it off if it can't keep up.
         options.upscalesLowResolutionVideo = UserDefaults.standard.bool(forKey: Self.upscaleKey)
 
         do {
-            try await engine.load(url: url, startPosition: startTime, options: options)
+            // Opens on the host's audio pick. Switching once the engine lists its tracks rebuilds
+            // the load before its display handshake ends, and the rebuild serves Dolby Vision as
+            // its HDR10 base (#627).
+            try await engine.load(url: url, startPosition: startTime, options: options,
+                                  audioSourceStreamIndex: audioStreamIndex.flatMap { Int32(exactly: $0) })
             if userIntendsToPlay, rate != 1 { engine.setRate(rate) }
             seedVideoSize()
         } catch {
@@ -552,6 +647,14 @@ final class AetherPlayer: ObservableObject {
         let position = currentTime
         switch lastLoad {
         case .vod(let url, let headers, let subtitles):
+            if let stack {
+                let (index, offset) = stack.locate(position)
+                partIndex = index
+                let file = stack.files[index]
+                self.lastLoad = .vod(url: file.url, headers: headers, subtitles: file.sidecars)
+                try? await performVODLoad(url: file.url, headers: headers, startTime: offset > 1 ? offset : nil, subtitles: file.sidecars)
+                return
+            }
             try? await performVODLoad(url: url, headers: headers, startTime: position > 1 ? position : nil, subtitles: subtitles)
         case .live(let url, let headers, let forceEngineDemux):
             try? await performLiveLoad(url: url, headers: headers, forceEngineDemux: forceEngineDemux)
@@ -604,6 +707,43 @@ final class AetherPlayer: ObservableObject {
 
     func togglePlayPause() {
         state == .playing ? pause() : play()
+    }
+
+    /// A rate Watch Together sets for sync: not the user's speed, so the menu doesn't show it.
+    func setSyncRate(_ syncRate: Float) {
+        engine.setRate(syncRate)
+    }
+
+    /// Whether playback is wanted, buffering or not.
+    var intendsToPlay: Bool { userIntendsToPlay }
+
+    /// The playhead off the presentation clock: the engine's tick is too coarse for
+    /// Watch Together. The tick wins when they disagree (a seek or reload is under way).
+    var precisePosition: TimeInterval {
+        let tick = currentTime
+        let host = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1_000_000_000)
+        var source: Double?
+        if let timebase = engine.softwarePresentationTimebase {
+            let time = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: timebase)
+            source = time.isNumeric ? time.seconds : nil
+        } else if let timebase = engine.currentAVPlayerItem?.timebase {
+            let time = CMSyncConvertTime(host, from: CMClockGetHostTimeClock(), to: timebase)
+            source = time.isNumeric ? engine.presentationAxisMap.sourceSeconds(forItemSeconds: time.seconds) : nil
+        }
+        guard let source, abs(source - tick) < 1 else { return tick }
+        return source
+    }
+
+    /// Seeks and returns where the picture landed, or nil when it gave up.
+    func seekLanding(to time: TimeInterval) async -> TimeInterval? {
+        let outcomes = engine.seekEvents.receive(on: DispatchQueue.main).map { event -> WatchTogetherSeekOutcome in
+            switch event.outcome {
+            case .began: .began
+            case .landed(let rendered): .landed(rendered)
+            default: .gaveUp
+            }
+        }.eraseToAnyPublisher()
+        return await watchTogetherLanding(of: outcomes) { [engine] in await engine.seek(to: time) }
     }
 
     func setRate(_ newRate: Float) {
@@ -672,7 +812,13 @@ final class AetherPlayer: ObservableObject {
             try? await Task.sleep(for: .seconds(10))
             if self?.pendingSeekTarget == target { self?.pendingSeekTarget = nil }
         }
-        await engine.seek(to: target, exact: exact)
+        guard let stack else { return await engine.seek(to: target, exact: exact) }
+        let (index, offset) = stack.locate(target)
+        if index == partIndex {
+            await engine.seek(to: offset, exact: exact)
+        } else {
+            await switchPart(to: index, at: offset)
+        }
     }
 
     func seekToLiveEdge() async {
@@ -737,6 +883,9 @@ final class AetherPlayer: ObservableObject {
     func stop() {
         userIntendsToPlay = false
         lastLoad = nil
+        stack = nil
+        partIndex = 0
+        isSwitchingPart = false
         clearNativeMediaSelection()
         nativeVideoSizeObservation = nil
         videoSize = .zero
@@ -757,9 +906,12 @@ final class AetherPlayer: ObservableObject {
     /// A still of the loaded file at `seconds`, keyframe-snapped and cached by the engine.
     /// nil when the source cannot open a second reader.
     func still(atSeconds seconds: TimeInterval, maxWidth: Int = 480) async -> CGImage? {
+        // A stacked title's stills come from the open file only.
+        let local = stack.map { $0.locate(seconds) }
+        if let local, local.index != partIndex { return nil }
         if frameExtractor == nil { frameExtractor = engine.makeFrameExtractor() }
         guard let extractor = frameExtractor else { return nil }
-        return await extractor.thumbnail(at: seconds, maxWidth: maxWidth)
+        return await extractor.thumbnail(at: local?.offset ?? seconds, maxWidth: maxWidth)
     }
 
     private func dropFrameExtractor() {
@@ -1234,5 +1386,44 @@ nonisolated private final class SoftwarePiPBridge: NSObject, AVPictureInPictureS
             await self?.player?.skip(by: seconds)
         }
         completionHandler()
+    }
+}
+
+private extension PlaybackState {
+    var transportState: PlaybackTransportState.State {
+        switch self {
+        case .idle: .idle
+        case .loading: .loading
+        case .playing: .playing
+        case .paused: .paused
+        case .seeking: .seeking
+        case .ended: .ended
+        case .error(let message): .error(message)
+        }
+    }
+}
+
+private extension PlaybackTransportState.State {
+    var engineState: PlaybackState {
+        switch self {
+        case .idle: .idle
+        case .loading: .loading
+        case .playing: .playing
+        case .paused: .paused
+        case .seeking: .seeking
+        case .ended: .ended
+        case .error(let message): .error(message)
+        }
+    }
+}
+
+private extension PlaybackPhase {
+    var transportPhase: PlaybackTransportState.Phase {
+        switch self {
+        case .playing: .playing
+        case .paused: .paused
+        case .rebuffering: .rebuffering
+        default: .loading
+        }
     }
 }

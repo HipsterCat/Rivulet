@@ -17,12 +17,17 @@ struct IOSPlexDetailView: View {
     @State private var seasonKey: MediaItemRef?
     @State private var episodes: [MediaItem] = []
     @State private var episodesSeasonKey: MediaItemRef?
+    /// The picked season's own extras, shown with the show's.
+    @State private var seasonExtras: [MediaItemDetail.Extra] = []
     @State private var related: [MediaItem] = []
     @State private var error: String?
     @State private var loadedRevision: Int?
     @State private var summaryExpanded = false
 
     private var shown: MediaItem { detail?.item ?? item }
+
+    /// A season opens its show: only the season picker shows one season.
+    init(item: MediaItem) { self.item = item.seasonShow ?? item }
     private var isSeries: Bool { shown.kind == .show || shown.kind == .season }
     private var regular: Bool { sizeClass == .regular }
 
@@ -61,6 +66,7 @@ struct IOSPlexDetailView: View {
             await load()
         }
         .task(id: seasonKey) { await loadEpisodes() }
+        .task(id: seasonKey) { await loadSeasonExtras() }
     }
 
     @ViewBuilder
@@ -81,7 +87,7 @@ struct IOSPlexDetailView: View {
         if isSeries {
             episodesSection(leading: leading)
         }
-        IOSPlexExtrasRow(detail: detail)
+        IOSPlexExtrasRow(detail: detail?.adding(extras: seasonExtras))
         if !related.isEmpty {
             IOSPlexRail(title: String(localized: "More Like This"), kind: .poster, items: related) {
                 IOSPlexPosterCard(item: $0, width: $1)
@@ -133,6 +139,7 @@ struct IOSPlexDetailView: View {
                 LazyVStack(alignment: .leading, spacing: 20) {
                     ForEach(episodes) { episode in
                         IOSPlexEpisodeCell(episode: episode, isNextUp: episode.id == nextUpID, layout: .row)
+                            .transition(.opacity)
                     }
                 }
                 .padding(.horizontal, leading)
@@ -143,12 +150,12 @@ struct IOSPlexDetailView: View {
     /// The season menu: switch seasons, or download the one showing.
     @ViewBuilder
     private var seasonPicker: some View {
-        let title = currentSeason.map(seasonLabel) ?? String(localized: "Episodes")
+        let title = currentSeason?.seasonLabel ?? String(localized: "Episodes")
         if seasons.count > 1 || (currentSeason != nil && canDownload) {
             Menu {
                 if seasons.count > 1 {
                     Picker("Season", selection: $seasonKey) {
-                        ForEach(seasons) { Text(seasonLabel($0)).tag(Optional($0.ref)) }
+                        ForEach(seasons) { Text($0.seasonLabel).tag(Optional($0.ref)) }
                     }
                 }
                 if let season = currentSeason, canDownload {
@@ -170,11 +177,6 @@ struct IOSPlexDetailView: View {
     }
 
     private var canDownload: Bool { browse.canDownload(item) }
-
-    private func seasonLabel(_ season: MediaItem) -> String {
-        guard let index = season.seasonNumber else { return season.displayTitle }
-        return index == 0 ? String(localized: "Specials") : String(localized: "Season \(index)")
-    }
 
     // MARK: - Play target
 
@@ -243,12 +245,21 @@ struct IOSPlexDetailView: View {
         do {
             let loaded = try await browse.provider(for: season.ref).children(of: season.ref).sortedByNumber()
             guard seasonKey == key else { return }
-            episodes = loaded
+            // A deleted episode fades out of the list.
+            let shrank = episodesSeasonKey == key && loaded.count < episodes.count
+            withAnimation(shrank ? .default : nil) { episodes = loaded }
             episodesSeasonKey = key
         } catch let error where isCancellationError(error) {
         } catch {
             self.error = error.localizedDescription
         }
+    }
+
+    private func loadSeasonExtras() async {
+        seasonExtras = []
+        guard shown.kind == .show, let key = seasonKey else { return }
+        let loaded = try? await browse.provider(for: key).fullDetail(for: key).extras
+        if seasonKey == key { seasonExtras = loaded ?? [] }
     }
 }
 
@@ -401,6 +412,10 @@ private struct IOSPlexDetailHeader: View {
                         actions.setFavorite(item, !isFavorite)
                     }
                 }
+                if canPlay, item.isPlayable, let detail {
+                    let versions = VersionPicker.versions(in: detail)
+                    if !versions.isEmpty { versionMenu(versions) }
+                }
                 if item.isPlayable, canDownload {
                     IOSDownloadButton(item: item)
                 }
@@ -469,6 +484,20 @@ private struct IOSPlexDetailHeader: View {
                 }
             }
         }
+    }
+
+    /// Plays one of the title's files instead of the best one.
+    private func versionMenu(_ versions: [MediaSource]) -> some View {
+        Menu {
+            ForEach(Array(zip(versions, VersionPicker.labels(for: versions))), id: \.0.id) { source, label in
+                Button(label) { if let playTarget { actions.playVersion(playTarget, source.id) } }
+            }
+        } label: {
+            Image(systemName: "square.stack.3d.up").frame(width: 22, height: 22)
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .accessibilityLabel("Version")
     }
 
     private func circleButton(_ symbol: String, label: LocalizedStringKey, action: @escaping () -> Void) -> some View {

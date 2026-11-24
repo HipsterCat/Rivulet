@@ -40,24 +40,27 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
     /// and stop the encoding.
     private let transcodeSessions = OSAllocatedUnfairLock(initialState: Set<String>())
 
-    private var baseURL: URL { client.baseURL }
+    var baseURL: URL { client.baseURL }
     private var token: String { client.token ?? "" }
 
     /// What every list call asks for beyond the defaults: the counts behind
     /// "12/24 watched", and the parent image ids that list responses omit
     /// otherwise. Detail calls (GET /Items/{id}) return every field.
-    private static let listFields = URLQueryItem(
+    static let listFields = URLQueryItem(
         name: "fields", value: "Overview,RecursiveItemCount,SortName,ParentId,MediaSourceCount,Genres,ProviderIds"
     )
 
-    private func map(_ dtos: [JFItem]?) -> [MediaItem] {
+    func map(_ dtos: [JFItem]?) -> [MediaItem] {
         (dtos ?? []).map { JellyfinMediaMapper.item($0, providerID: id, baseURL: baseURL) }
     }
 
     // MARK: - Browse
 
     func libraries() async throws -> [MediaLibrary] {
+        async let me: JFUserWithPolicy? = try? client.get("Users/Me")
         let result: JFQueryResult = try await client.get("UserViews")
+        // A failed read keeps every library on Home.
+        let excludes = Set(await me?.configuration?.latestItemsExcludes ?? [])
         var libraries: [MediaLibrary] = []
         for view in result.items ?? [] {
             // One count per "homevideos" view decides photo browser or video page.
@@ -65,7 +68,7 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
             if view.collectionType == "homevideos", let viewID = view.id {
                 content = try await self.homeVideosContent(libraryID: viewID)
             }
-            if let library = JellyfinMediaMapper.library(view, providerID: id, homeVideos: content) {
+            if let library = JellyfinMediaMapper.library(view, providerID: id, homeVideos: content, homeExcludes: excludes) {
                 libraries.append(library)
             }
         }
@@ -487,13 +490,16 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
             URLQueryItem(name: "ids", value: ids.joined(separator: ",")), Self.listFields
         ])
         let byID = Dictionary(map(result.items).map { ($0.ref.itemID, $0) }, uniquingKeysWith: { a, _ in a })
-        return ids.compactMap { byID[$0] }
+        let libraryOf = Dictionary(owned.map { ($0.id, $0.libraryID) }, uniquingKeysWith: { a, _ in a })
+        // The library goes on each match, so Home can leave out a hidden one.
+        return ids.compactMap { id in byID[id].map { var item = $0; item.libraryID = libraryOf[id]; return item } }
     }
 
     private struct OwnedEntry: Sendable {
         let id: String
         let kind: MediaKind
         let ids: [String: String]
+        let libraryID: String
     }
 
     private struct OwnedIndex {
@@ -536,17 +542,24 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
         }
     }
 
+    /// Listed per video library, so each title knows its library.
     private func listOwned() async throws -> [OwnedEntry] {
-        let index: JFQueryResult = try await client.get("Items", [
-            URLQueryItem(name: "recursive", value: "true"),
-            URLQueryItem(name: "includeItemTypes", value: "Movie,Series"),
-            URLQueryItem(name: "fields", value: "ProviderIds"),
-            URLQueryItem(name: "enableImages", value: "false"),
-            URLQueryItem(name: "enableUserData", value: "false")
-        ])
-        return (index.items ?? []).compactMap { dto in
-            dto.id.map { OwnedEntry(id: $0, kind: JellyfinMediaMapper.kind(dto.type), ids: JellyfinMediaMapper.externalIDs(dto.providerIds)) }
+        var entries: [OwnedEntry] = []
+        for library in try await libraries() where [.movies, .shows, .mixed].contains(library.kind) {
+            let index: JFQueryResult = try await client.get("Items", [
+                URLQueryItem(name: "parentId", value: library.id),
+                URLQueryItem(name: "recursive", value: "true"),
+                URLQueryItem(name: "includeItemTypes", value: "Movie,Series"),
+                URLQueryItem(name: "fields", value: "ProviderIds"),
+                URLQueryItem(name: "enableImages", value: "false"),
+                URLQueryItem(name: "enableUserData", value: "false")
+            ])
+            entries += (index.items ?? []).compactMap { dto in
+                dto.id.map { OwnedEntry(id: $0, kind: JellyfinMediaMapper.kind(dto.type),
+                                        ids: JellyfinMediaMapper.externalIDs(dto.providerIds), libraryID: library.id) }
+            }
         }
+        return entries
     }
 
     /// This server's image resized to fill the box (measured on 12.1: a cover that never upscales).
@@ -628,6 +641,20 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
         return PlaybackExtras(markers: markers)
     }
 
+    /// Trickplay sheets at the width nearest the 320 pt scrub still; nil when the version has none.
+    func scrubPreviews(for itemRef: MediaItemRef, sourceID: String?) async -> (any ScrubPreviewSource)? {
+        let item: JFTrickplayItem? = try? await client.get("Items/\(itemRef.itemID)",
+                                                           [URLQueryItem(name: "fields", value: "Trickplay")])
+        guard let widths = item?.widths(forSource: sourceID),
+              let info = JFTrickplayInfo.choose(from: widths, near: 320) else { return nil }
+        let client = client
+        let itemID = itemRef.itemID
+        let query = sourceID.map { [URLQueryItem(name: "mediaSourceId", value: $0)] } ?? []
+        return JellyfinTrickplayPreviews(info: info) { index in
+            await client.bytes("Videos/\(itemID)/Trickplay/\(info.width)/\(index).jpg", query)
+        }
+    }
+
     /// Direct play when the server allows it, else the server's HLS transcode.
     /// A source with neither throws `.transcodeRequired`.
     func resolveStream(for itemRef: MediaItemRef, sourceID: String?, maxBitrate: Int?) async throws -> StreamInfo {
@@ -660,6 +687,8 @@ final class JellyfinProvider: MediaProvider, @unchecked Sendable {
             )
         )
         let sources = response.mediaSources ?? []
+        // No sources and an ErrorCode: the server said no (not allowed, stream limit).
+        if sources.isEmpty, let refusal = ServerRefusal(playbackErrorCode: response.errorCode) { throw refusal }
         let ranked = sources.map {
             JellyfinMediaMapper.mediaSource($0, itemID: itemRef.itemID, playSessionID: response.playSessionId,
                                             baseURL: baseURL, token: token)
@@ -794,6 +823,7 @@ struct JellyfinProgressReporter: ProgressReporter {
     let mediaSourceID: String?
     let playSessionID: String?
     let isTranscode: Bool
+    var reportTimeout = PlaybackReportTimeout.duration
 
     private func report(_ position: TimeInterval, paused: Bool) -> JFPlaybackReport {
         JFPlaybackReport(
@@ -803,8 +833,8 @@ struct JellyfinProgressReporter: ProgressReporter {
         )
     }
 
-    func start(position: TimeInterval) async {
-        try? await client.post("Sessions/Playing", body: report(position, paused: false))
+    func start(position: TimeInterval) async throws {
+        try await client.post("Sessions/Playing", body: report(position, paused: false))
     }
 
     func progress(position: TimeInterval) async {
@@ -816,13 +846,17 @@ struct JellyfinProgressReporter: ProgressReporter {
     }
 
     func stopped(at position: TimeInterval) async {
-        try? await client.post("Sessions/Playing/Stopped", body: report(position, paused: false))
+        await PlaybackReportTimeout.cleanup(for: reportTimeout) {
+            try await client.post("Sessions/Playing/Stopped", body: report(position, paused: false))
+        }
         // Best effort: the server also reaps an idle encode on its own.
         guard isTranscode, let playSessionID else { return }
-        try? await client.delete("Videos/ActiveEncodings", query: [
-            URLQueryItem(name: "deviceId", value: client.deviceID),
-            URLQueryItem(name: "playSessionId", value: playSessionID)
-        ])
+        await PlaybackReportTimeout.cleanup {
+            try await client.delete("Videos/ActiveEncodings", query: [
+                URLQueryItem(name: "deviceId", value: client.deviceID),
+                URLQueryItem(name: "playSessionId", value: playSessionID)
+            ])
+        }
     }
 }
 

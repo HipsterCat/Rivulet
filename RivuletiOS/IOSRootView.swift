@@ -10,9 +10,10 @@ struct IOSRootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.horizontalSizeClass) private var sizeClass
     @SceneStorage("iosSelectedTab") private var selectedTab = "home"
-    @StateObject private var playback = IOSPlaybackController()
+    @ObservedObject private var playback = IOSPlaybackController.shared
     @State private var showingAccount = false
     @State private var showingWhatsNew = false
+    @State private var whatsNewVersions: [String] = []
     @ObservedObject private var profiles = PlexUserProfileManager.shared
     @State private var choosingProfile = false
     @AppStorage("lastSeenBuild") private var lastSeenBuild = ""
@@ -29,22 +30,36 @@ struct IOSRootView: View {
     @Namespace private var libraryZoom
     @Namespace private var sidebarZoom
     @Namespace private var searchZoom
+    /// The app's one gate: a window opened after launch finds it finished and shows no splash.
+    @ObservedObject private var splashGate: LaunchSplashGate
+    /// The splash's exit has played; launch sheets wait for it.
+    @State private var splashGone: Bool
+    /// What's New found at launch, held until the splash has gone.
+    @State private var whatsNewPending = false
+
+    init(splashGate: LaunchSplashGate) {
+        self.splashGate = splashGate
+        _splashGone = State(initialValue: splashGate.isFinished)
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
             Tab("Home", systemImage: "house", value: "home") {
-                tabStack(homeZoom) { IOSPlexHomeView() }
+                tabStack(homeZoom) {
+                    IOSPlexHomeView().environment(\.launchHeroReady) { splashGate.heroIsReady() }
+                }
             }
-            Tab("Library", systemImage: "rectangle.stack", value: "library") {
-                IOSPlexLibrarySplitView(selection: $librarySelection, column: $libraryColumn, path: $libraryPath)
-                    // A server or profile switch drops the split: its pages hold the old one's items.
-                    .id(browse.sessionGeneration)
-                    .environment(\.plexZoomNamespace, libraryZoom)
-            }
-            // The sidebar lists each library itself, so the list tab would repeat it.
-            .defaultVisibility(.hidden, for: .sidebar)
             // iPhone flattens sections into the tab bar, so libraries live only in the iPad sidebar.
             TabSection("Library") {
+                // First in the section, so the iPad top bar's Library opens the list, not the last page picked.
+                Tab("Library", systemImage: "rectangle.stack", value: "library") {
+                    IOSPlexLibrarySplitView(selection: $librarySelection, column: $libraryColumn, path: $libraryPath)
+                        // A server or profile switch drops the split: its pages hold the old one's items.
+                        .id(browse.sessionGeneration)
+                        .environment(\.plexZoomNamespace, libraryZoom)
+                }
+                // The sidebar lists each library itself, so the list tab would repeat it.
+                .defaultVisibility(.hidden, for: .sidebar)
                 if showsSidebarLibraries {
                     Tab("Downloads", systemImage: "arrow.down.circle", value: "downloads") {
                         sidebarStack("downloads") { IOSDownloadsView(showsAccount: true) }
@@ -53,9 +68,9 @@ struct IOSRootView: View {
                 }
                 // Not by `id`: that is the server's own section number, so two servers collide and UIKit's sidebar throws.
                 ForEach(showsSidebarLibraries ? videoLibraries : [], id: \.self) { library in
-                    Tab(browse.labels.title(library.title, providerID: library.providerID), systemImage: library.icon,
+                    Tab(browse.labels.title(library.title, providerID: library.providerID), systemImage: library.iosIcon,
                         value: libraryTab(library)) {
-                        sidebarStack(libraryTab(library)) { IOSPlexLibraryView(library: library, showsAccount: true) }
+                        sidebarStack(libraryTab(library)) { IOSLibraryPage(library: library, showsAccount: true) }
                     }
                     .defaultVisibility(.hidden, for: .tabBar)
                 }
@@ -80,7 +95,7 @@ struct IOSRootView: View {
         .environment(\.openAccount) { showingAccount = true }
         .environment(\.openDownloads, openDownloads)
         .sheet(isPresented: $showingAccount) { IOSAccountView().iosSessionObjects(plex) }
-        .sheet(isPresented: $showingWhatsNew) { IOSWhatsNewSheet(version: IOSChangelog.currentVersion) }
+        .sheet(isPresented: $showingWhatsNew) { IOSWhatsNewSheet(versions: whatsNewVersions) }
         .sheet(isPresented: $choosingProfile) { IOSProfilePickerSheet() }
         // Content is withheld until a profile is entered: ask who is watching,
         // and nothing of the locked profile's keeps playing.
@@ -88,6 +103,18 @@ struct IOSRootView: View {
             if needed { playback.close() }
             choosingProfile = needed
         }
+        // Over the tab bar, sidebar and bars too, until its exit has played.
+        .overlay {
+            if !splashGone {
+                IOSLaunchSplash(finished: splashGate.isFinished) { splashGone = true }
+                    .ignoresSafeArea()
+            }
+        }
+        // Only Home's hero is worth waiting for; another restored tab opens without it.
+        .onChange(of: showsHome, initial: true) { _, home in
+            if !home { splashGate.heroIsReady() }
+        }
+        .onChange(of: splashGone) { presentWhatsNewIfReady() }
         .iosPlaybackHost(playback)
         .task { showWhatsNewIfUpdated() }
         #if DEBUG
@@ -134,15 +161,31 @@ struct IOSRootView: View {
         }
         .onChange(of: browse.libraries) { _, libraries in
             if !libraries.isEmpty, !browse.isLoadingOtherServers { dropOrphanedLibraryTab() }
-            if case .library(let library) = librarySelection, !libraries.contains(library) {
-                librarySelection = nil
-                libraryPath = NavigationPath()
-            }
+            dropMissingLibrarySelection()
+        }
+        .onChange(of: browse.photoLibraries) { dropMissingLibrarySelection() }
+        .onChange(of: browse.hiddenSidebarLibraries) {
+            dropOrphanedLibraryTab()
+            dropMissingLibrarySelection()
         }
         .onChange(of: browse.isLoadingOtherServers) { _, loading in
             if !loading, !browse.libraries.isEmpty { dropOrphanedLibraryTab() }
         }
         .onChange(of: playlistServers) { if !browse.isLoadingOtherServers { dropOrphanedLibraryTab() } }
+    }
+
+    /// A library gone from the server or hidden in Settings leaves the selection.
+    private func dropMissingLibrarySelection() {
+        if case .library(let library) = librarySelection, !browse.shownLibraries.contains(library) {
+            librarySelection = nil
+            libraryPath = NavigationPath()
+        }
+    }
+
+    /// Home is on screen: its own tab, or a stored tab this window does not have (a tab from an
+    /// older build, or a library not loaded yet), for which the tab view shows its first tab, Home.
+    private var showsHome: Bool {
+        selectedTab == "home" || !(["library", "live-tv", "search"] + sidebarTabs).contains(selectedTab)
     }
 
     /// A sidebar library tab vanishes on a server without that library.
@@ -215,9 +258,9 @@ struct IOSRootView: View {
         return browse.providerOrder.filter { browse.playlists[$0] != nil }
     }
 
-    /// Movie and TV libraries only: iOS has no music player. Each server's together, the selected first.
+    /// Movie, TV and photo libraries: iOS has no music player. Each server's together, the selected first.
     private var videoLibraries: [MediaLibrary] {
-        browse.libraries.sidebarOrder(servers: browse.providerOrder)
+        browse.shownLibraries.sidebarOrder(servers: browse.providerOrder)
     }
 
     private func libraryTab(_ library: MediaLibrary) -> String { "library:\(library.providerID)|\(library.id)" }
@@ -228,8 +271,17 @@ struct IOSRootView: View {
     private func showWhatsNewIfUpdated() {
         let current = IOSChangelog.currentVersion
         guard plex.isConfigured, current != lastSeenBuild else { return }
+        whatsNewVersions = WhatsNewRange.versions(IOSChangelog.entries.map(\.version), current: current, lastSeen: lastSeenBuild)
         lastSeenBuild = current
-        showingWhatsNew = IOSChangelog.lines(for: current) != nil
+        whatsNewPending = !whatsNewVersions.isEmpty
+        presentWhatsNewIfReady()
+    }
+
+    /// What's New slides up once the launch splash has gone, never over it.
+    private func presentWhatsNewIfReady() {
+        guard whatsNewPending, splashGone else { return }
+        whatsNewPending = false
+        showingWhatsNew = true
     }
 
     #if DEBUG
@@ -244,7 +296,7 @@ struct IOSRootView: View {
             libraryColumn = .detail
             return
         }
-        guard let item = try? await SearchResults.search(title, providers: browse.searchProviders).first(where: { $0.title == title }) else { return }
+        guard let item = try? await SearchResults.search(title, providers: browse.searchProviders).titles.first(where: { $0.title == title }) else { return }
         selectedTab = "library"
         libraryColumn = .detail
         // iPad's split view picks a library on appear and clears the path when it does, so pick first.
@@ -292,7 +344,7 @@ struct IOSRootView: View {
 
 #Preview {
     let session = PlexSession()
-    IOSRootView()
+    IOSRootView(splashGate: LaunchSplashGate(browse: session.browse))
         .environmentObject(session)
         .environmentObject(session.browse)
         .environmentObject(IOSDownloadCenter.shared)

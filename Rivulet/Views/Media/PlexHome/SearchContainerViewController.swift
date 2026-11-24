@@ -94,7 +94,22 @@ final class SearchContainerViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if presentedViewController == nil { reportNested(false) }
+        #if DEBUG
+        if !debugQueryApplied, let query = ProcessInfo.processInfo.environment["RIVULET_SEARCH"] {
+            debugQueryApplied = true
+            // After sign-in settles: a search before the server is chosen finds nothing.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(6))
+                self?.searchController.searchBar.text = query
+                self?.results.updateSearchQuery(query)
+            }
+        }
+        #endif
     }
+
+    #if DEBUG
+    private var debugQueryApplied = false
+    #endif
 
     /// Leaving the tab (the shell caches this controller) resets the query and focus. Skipped while
     /// a music detail covers the page, so returning from an album keeps the user's place.
@@ -146,6 +161,12 @@ final class SearchContainerViewController: UIViewController {
         // Read-and-clear on EVERY arrow, so the flag never carries over from an
         // earlier press and makes the next one think a move happened.
         let engineMoved = results.consumeEngineMovedFocus()
+        // The grid keyboard (non-touch remotes) is one focus item that moves its own highlight, so
+        // "focus unchanged" below would read every key move as a declined press. Results sit beside it.
+        if focusIsInGridKeyboard {
+            super.pressesBegan(presses, with: event)
+            return
+        }
         if types.contains(.downArrow), !focusIsInResults {
             rescue(to: .results)
         } else if types.contains(.upArrow),
@@ -230,6 +251,15 @@ final class SearchContainerViewController: UIViewController {
         // it from the focus system and void the request.
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
+    }
+
+    /// The linear keyboard is one short row; a grid is several rows tall.
+    static func isGridKeyboard(_ size: CGSize) -> Bool { size.height * 4 > size.width }
+
+    private var focusIsInGridKeyboard: Bool {
+        guard presentedViewController == nil, !focusIsInResults,
+              let item = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView else { return false }
+        return Self.isGridKeyboard(item.bounds.size)
     }
 
     private var focusIsInResults: Bool {

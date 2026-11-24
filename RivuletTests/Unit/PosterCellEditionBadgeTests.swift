@@ -24,12 +24,29 @@ final class PosterCellEditionBadgeTests: XCTestCase {
     func test_edition_showsAndClearsOnReuse() {
         let cell = PosterCell(frame: CGRect(x: 0, y: 0, width: 220, height: 400))
         cell.configure(item: movie(edition: "Extended Edition"))
-        XCTAssertEqual(cell.editionBadgeText, "Extended Edition")
+        XCTAssertEqual(cell.editionBadgeText, "Extended")
         cell.prepareForReuse()
         XCTAssertNil(cell.editionBadgeText)
         cell.configure(item: movie(edition: nil))
         XCTAssertNil(cell.editionBadgeText)
         cell.configure(item: movie(edition: ""))
         XCTAssertNil(cell.editionBadgeText, "an empty edition is no edition")
+    }
+
+    /// #666: trailing badges wait for focus; a dot stands in for them at rest.
+    func test_trailingBadges_restAsADot() {
+        let cell = PosterCell(frame: CGRect(x: 0, y: 0, width: 220, height: 400))
+        var show = PlexMetadata()
+        show.type = "show"
+        show.leafCount = 10
+        show.viewedLeafCount = 3
+        cell.configure(item: show)
+        XCTAssertEqual(cell.unwatchedBadgeText, "7")
+        XCTAssertTrue(cell.showsTrailingDot)
+        cell.configure(item: movie(edition: "Director's Cut"))
+        XCTAssertNil(cell.unwatchedBadgeText)
+        XCTAssertTrue(cell.showsTrailingDot, "an edition alone gets the dot")
+        cell.configure(item: movie(edition: nil))
+        XCTAssertFalse(cell.showsTrailingDot, "nothing to reveal, no dot")
     }
 }

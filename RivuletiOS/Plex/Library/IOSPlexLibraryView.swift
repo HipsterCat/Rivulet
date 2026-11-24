@@ -36,8 +36,8 @@ struct IOSPlexLibrarySplitView: View {
             }
         }
         // Side by side, the detail column is never left empty.
-        .onChange(of: [sizeClass == .regular, browse.libraries.isEmpty], initial: true) {
-            if sizeClass == .regular, selection == nil, let first = browse.libraries.first {
+        .onChange(of: [sizeClass == .regular, browse.shownLibraries.isEmpty], initial: true) {
+            if sizeClass == .regular, selection == nil, let first = browse.shownLibraries.first {
                 selection = .library(first)
             }
         }
@@ -52,7 +52,7 @@ struct IOSPlexLibrarySplitView: View {
         switch selection {
         case .downloads: IOSDownloadsView()
         case .favorites: IOSFavoritesView()
-        case .library(let library): IOSPlexLibraryView(library: library)
+        case .library(let library): IOSLibraryPage(library: library)
         case .playlists(let providerID): IOSPlexPlaylistsView(providerID: providerID)
         case nil: ContentUnavailableView("Choose a Library", systemImage: "rectangle.stack")
         }
@@ -95,7 +95,7 @@ struct IOSPlexLibrariesView: View {
                             Section(group.name ?? "") {
                                 ForEach(group.libraries) { library in
                                     NavigationLink(value: IOSLibrarySelection.library(library)) {
-                                        Label(library.title, systemImage: library.icon)
+                                        Label(library.title, systemImage: library.iosIcon)
                                     }
                                 }
                                 if showPlaylists, !browse.playlists(providerID: group.providerID).isEmpty {
@@ -122,7 +122,7 @@ struct IOSPlexLibrariesView: View {
         }
     }
 
-    private var videoLibraries: [MediaLibrary] { browse.libraries }
+    private var videoLibraries: [MediaLibrary] { browse.shownLibraries }
 
     /// One section per server, under its name once there are several.
     private var serverGroups: [(id: String, providerID: String, name: String?, libraries: [MediaLibrary])] {
@@ -144,8 +144,8 @@ struct IOSPlexLibrariesView: View {
     }
 }
 
-/// One library: Recommended (its own rows under a hero, like Home) or Browse (every title).
-/// The page is remembered per library.
+/// One library: Recommended (its own rows under a hero, like Home), Browse (every title) or
+/// Folders (as on disk). The page is remembered per library.
 struct IOSPlexLibraryView: View {
     let library: MediaLibrary
     /// Only a tab root shows the avatar; a library pushed from the Library list does not.
@@ -157,12 +157,13 @@ struct IOSPlexLibraryView: View {
     @State private var rows: [MediaHub] = []
 
     enum Page: String, CaseIterable {
-        case recommended, browse
+        case recommended, browse, folders
 
         var title: String {
             switch self {
             case .recommended: String(localized: "Recommended")
             case .browse: String(localized: "Browse")
+            case .folders: String(localized: "Folders")
             }
         }
     }
@@ -170,10 +171,14 @@ struct IOSPlexLibraryView: View {
     init(library: MediaLibrary, showsAccount: Bool = false) {
         self.library = library
         self.showsAccount = showsAccount
-        _pageRaw = AppStorage(wrappedValue: Page.recommended.rawValue, "iosLibraryPage.\(library.settingKey)")
+        let initial: Page = library.browsesByFolder ? .folders : .recommended
+        _pageRaw = AppStorage(wrappedValue: initial.rawValue, "iosLibraryPage.\(library.settingKey)")
     }
 
-    private var page: Page { Page(rawValue: pageRaw) ?? .recommended }
+    private var pages: [Page] {
+        library.offersFolders(on: browse.provider(for: library.providerID)) ? Page.allCases : [.recommended, .browse]
+    }
+    private var page: Page { Page(rawValue: pageRaw).flatMap { pages.contains($0) ? $0 : nil } ?? .recommended }
     private var heroItems: [MediaItem] { page == .recommended && showHero ? HomeHero.libraryItems(rows) : [] }
 
     var body: some View {
@@ -182,6 +187,7 @@ struct IOSPlexLibraryView: View {
             switch page {
             case .recommended: IOSPlexLibraryRecommendedView(library: library, rows: $rows, heroItems: heroItems)
             case .browse: IOSPlexLibraryBrowseView(library: library)
+            case .folders: IOSFolderListView(library: library)
             }
         }
         .iosPlexHeroChrome(hero: !heroItems.isEmpty, title: browse.labels.title(library.title, providerID: library.providerID))
@@ -190,7 +196,7 @@ struct IOSPlexLibraryView: View {
             ToolbarItem(placement: .topBarLeading) {
                 Menu {
                     Picker("Page", selection: $pageRaw) {
-                        ForEach(Page.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
+                        ForEach(pages, id: \.self) { Text($0.title).tag($0.rawValue) }
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -280,25 +286,19 @@ private struct IOSPlexLibraryBrowseView: View {
     @State private var isFetchingFirstPage = false
 
     private static let pageSize = 90
-    private static let sorts: [(LibrarySortOption, String)] = [
-        (.titleAsc, String(localized: "Title")),
-        (.addedAtDesc, String(localized: "Date Added")),
-        (.releaseDateDesc, String(localized: "Release Date")),
-        (.ratingDesc, String(localized: "Rating"))
-    ]
 
     init(library: MediaLibrary) {
         self.library = library
-        _sortRaw = AppStorage(wrappedValue: LibrarySortOption.titleAsc.rawValue, "iosLibrarySort.\(library.settingKey)")
+        _sortRaw = AppStorage(wrappedValue: LibrarySortOption.titleAsc.rawValue, LibrarySortOption.iosKey(library.settingKey))
+        _filter = State(initialValue: .remembered(library.settingKey))
     }
 
-    /// The sorts the library page offers, in its order: all of them on Plex, else what the server can apply.
-    private var sorts: [(LibrarySortOption, String)] {
+    /// The provider's sorts, as on tvOS.
+    private var sorts: [LibrarySortOption] {
         let provider = browse.provider(for: library.providerID)
-        let offered = IOSLibrarySorts.menu(
+        return IOSLibrarySorts.menu(
             offered: provider?.sortOptions(for: library.kind) ?? LibrarySortOption.expressible(for: library.kind),
             isPlex: provider?.kind == .plex)
-        return Self.sorts.filter { offered.contains($0.0) }
     }
 
     private var sort: LibrarySortOption { LibrarySortOption(rawValue: sortRaw) ?? .titleAsc }
@@ -350,7 +350,7 @@ private struct IOSPlexLibraryBrowseView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Picker("Sort By", selection: $sortRaw) {
-                        ForEach(sorts, id: \.0) { Text($0.1).tag($0.0.rawValue) }
+                        ForEach(sorts, id: \.self) { Text($0.displayName).tag($0.rawValue) }
                     }
                 } label: {
                     Label("Sort", systemImage: "arrow.up.arrow.down")
@@ -381,6 +381,9 @@ private struct IOSPlexLibraryBrowseView: View {
                 }
                 .tint(filter.isActive ? .accentColor : nil)
             }
+        }
+        .onChange(of: filter.unwatchedOnly) { _, on in
+            UserDefaults.standard.set(on, forKey: LibraryFilter.unwatchedOnlyKey(library.settingKey))
         }
         .task(id: library.id) {
             guard offersGenreAndDecade, let provider = browse.provider(for: library.providerID) else { return }

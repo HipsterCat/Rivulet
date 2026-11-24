@@ -88,6 +88,10 @@ enum MediaRowMetrics {
 
     /// 1:1 square for music (artist/album/track): the poster's grid column.
     static let music = Tile(art: CGSize(width: poster.art.width, height: poster.art.width))
+
+    /// A cast or crew circle over name and subtitle (`CastCell`), the detail page's cast row.
+    /// The photo's focus effect is the system's, so the frame is the circle with no growth.
+    static let person = Tile(art: CGSize(width: poster.art.width, height: 355), growth: .zero)
     static let musicWidth = music.frame.width
     static let musicHeight = music.frame.height
 
@@ -110,6 +114,13 @@ enum MediaRowMetrics {
     static let playlistFullCount = 3
     static let playlist: Tile = {
         let width = gridWidth(columns: playlistFullCount)
+        return Tile(art: CGSize(width: width, height: (width * 9 / 16).rounded()), lockup: .card)
+    }()
+
+    /// Large 16:9 card, two across (the photo library's memories row). Unmeasured: the Apple TV
+    /// app is not on the simulator, so growth is the card default; measuring its two-across row is owed.
+    static let feature: Tile = {
+        let width = gridWidth(columns: 2)
         return Tile(art: CGSize(width: width, height: (width * 9 / 16).rounded()), lockup: .card)
     }()
 
@@ -144,7 +155,9 @@ enum MediaRowMetrics {
     static var headerFont: UIFont { .systemFont(ofSize: 31, weight: .semibold) }
     /// Bold section titles (hub headers, playlist header).
     static let sectionTitleSize: CGFloat = 30
-    static var headerColor: UIColor { UIColor.white.withAlphaComponent(0.55) }
+    static var headerColor: UIColor { UIColor.white.withAlphaComponent(0.49) }
+    /// Detail page and Person headers read 0.55 in the Apple TV app; Home's read 0.49.
+    static var pageHeaderColor: UIColor { UIColor.white.withAlphaComponent(0.55) }
 
     /// Section insets (top, bottom) of a titled shelf row of `tile`s. The row's flow layout
     /// centres the frames in their focus padding, so half of it plus half the growth sits
@@ -154,6 +167,17 @@ enum MediaRowMetrics {
         let artBelowHeader = headerBaselineToArt - headerBaselineInset
         return (artBelowHeader - half, shelfArtGap - half - headerHeight - artBelowHeader)
     }
+
+    /// Room under a tile for its title line (`PosterCaption`).
+    static let posterCaptionHeight: CGFloat = 36
+    /// Settings → Appearance → Titles Under Posters: every poster row and grid.
+    static let posterTitlesKey = "showPosterTitles"
+    static let posterTitlesDefault = false
+    static var showsPosterTitles: Bool {
+        (UserDefaults.standard.object(forKey: posterTitlesKey) as? Bool) ?? posterTitlesDefault
+    }
+    /// Extra row height for the title line, 0 while the setting is off.
+    static var posterCaptionSpace: CGFloat { showsPosterTitles ? posterCaptionHeight : 0 }
 
     /// Library poster grid: artwork top to the next row's artwork top (Apple's 55 between 390-tall tiles).
     static var posterGridPitch: CGFloat { poster.art.height + 55 }

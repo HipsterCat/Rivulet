@@ -18,6 +18,8 @@ final class MediaDetailChromeView: UIView {
     /// Sizes shared with the home hero's buttons. The pill width is a floor; long titles grow past it.
     private static let actionButtonHeight: CGFloat = HeroPillButton.buttonHeight
     private static let actionPillWidth: CGFloat = HeroPillButton.pillWidth
+    /// The glyph's box: the 30 pt hero box drew 19.5 x 22, Apple's is 23 x 26.
+    private static let playGlyphSize: CGFloat = 35.5
     private static let playProgressTrackWidth: CGFloat = 50
     private static let playProgressTrackHeight: CGFloat = 8
     /// Apple's description cap: wider on an episode.
@@ -26,6 +28,18 @@ final class MediaDetailChromeView: UIView {
     private static let captionFont = UIFont.systemFont(ofSize: 25, weight: .medium)
     private static let descriptionFont = UIFont.systemFont(ofSize: 23, weight: .medium)
     private static let rolesLabelAlpha: CGFloat = 0.6
+    private static let descriptionAlpha: CGFloat = 0.5
+    /// Apple's line pitches: 30 for the synopsis, 32.5 for the Starring block.
+    private static let descriptionLineHeight: CGFloat = 30
+    private static let castLineHeight: CGFloat = 32.5
+
+    private static func paragraphStyle(lineHeight: CGFloat) -> NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        p.minimumLineHeight = lineHeight
+        p.maximumLineHeight = lineHeight
+        p.lineBreakMode = .byTruncatingTail
+        return p
+    }
 
     // MARK: - Public surface
 
@@ -93,6 +107,8 @@ final class MediaDetailChromeView: UIView {
 
     /// The episode the Play pill names, shown in place of a show's synopsis.
     private var episodeDescription: (prefix: String, body: String)?
+    /// That episode's file, for a show or season's quality badges: the show itself has none.
+    private var playTargetSource: MediaSource?
 
     /// Sizes the logo view to the image's aspect, since `.scaleAspectFit` centres the glyphs
     /// and would push them right of the metadata's leading edge.
@@ -155,7 +171,7 @@ final class MediaDetailChromeView: UIView {
         let s = UIStackView()
         s.translatesAutoresizingMaskIntoConstraints = false
         s.axis = .horizontal
-        s.spacing = 6
+        s.spacing = 12
         s.alignment = .center
         return s
     }()
@@ -166,7 +182,7 @@ final class MediaDetailChromeView: UIView {
         let l = UILabel()
         l.translatesAutoresizingMaskIntoConstraints = false
         l.font = MediaDetailChromeView.descriptionFont
-        l.textColor = UIColor.white.withAlphaComponent(0.85)
+        l.textColor = UIColor.white.withAlphaComponent(MediaDetailChromeView.descriptionAlpha)
         l.numberOfLines = 4
         l.lineBreakMode = .byTruncatingTail
         return l
@@ -239,6 +255,9 @@ final class MediaDetailChromeView: UIView {
         metadataBlock.addArrangedSubview(genreRow)
         metadataBlock.addArrangedSubview(descriptionLabel)
         metadataBlock.addArrangedSubview(qualityRow)
+        // Measured: genre to synopsis 35 and synopsis to date 34.5 against 32 and 30 at 18.
+        metadataBlock.setCustomSpacing(21, after: genreRow)
+        metadataBlock.setCustomSpacing(22.5, after: descriptionLabel)
         chromeStack.addArrangedSubview(metadataBlock)
 
         // Apple's rhythm: 18 between the text rows, 32 above the buttons.
@@ -356,6 +375,7 @@ final class MediaDetailChromeView: UIView {
         item = nil
         detail = nil
         episodeDescription = nil
+        playTargetSource = nil
         if let prev = logoAspectConstraint {
             prev.isActive = false
             logoAspectConstraint = nil
@@ -435,6 +455,7 @@ final class MediaDetailChromeView: UIView {
         pendingLoads = 0
         readyWaiters = []
         episodeDescription = nil
+        playTargetSource = nil
 
         titleLogoImageView.image = nil
         titleFallbackLabel.text = nil
@@ -524,10 +545,15 @@ final class MediaDetailChromeView: UIView {
         pendingLoads += 1
         Task { [weak self] in
             guard let self else { return }
-            guard let fetched = await Self.fetchDetail(item.ref) else {
+            guard var fetched = await Self.fetchDetail(item.ref) else {
                 await MainActor.run { self.finishLoad(token) }
                 return
             }
+            // The ratings Worker's scores, only when the server lacks the chosen source (Jellyfin and
+            // Emby name none of their own). Capped like the info popup's read. Empty for episodes.
+            let needsWorker = MediaRating.detailRating(in: fetched.ratings)?.source != MediaRating.detailSource
+            async let extraRatings: [MediaRating] = needsWorker
+                ? RatingsClient.shared.ratings(for: fetched, within: 1) : []
             // An episode's own detail has no genres — fall back to the parent
             // show's genres (same as the episode detail page).
             var genres = fetched.genres
@@ -535,6 +561,8 @@ final class MediaDetailChromeView: UIView {
                let showDetail = await Self.fetchDetail(showRef) {
                 genres = showDetail.genres
             }
+            let extra = await extraRatings
+            if !extra.isEmpty { fetched.ratings = MediaRating.ordered(fetched.ratings + extra) }
             await MainActor.run {
                 defer { self.finishLoad(token) }
                 guard self.loadToken == token else { return }
@@ -560,18 +588,20 @@ final class MediaDetailChromeView: UIView {
                   self.loadToken == token
             else { return }
             self.setPlayTarget(episode)
-            await self.showEpisodeDescription(for: episode, page: item.kind, token: token)
+            // One fetch for both: the episode's file names the badges, and its overview fills a bare list item's.
+            let episodeDetail = await Self.fetchDetail(episode.ref)
+            guard self.loadToken == token else { return }
+            // A failed fetch keeps the badges already shown.
+            if let source = episodeDetail?.primarySource { self.playTargetSource = source }
+            if let shown = self.item { self.rebuildQualityRow(item: shown, detail: self.detail) }
+            self.showEpisodeDescription(for: episode, detail: episodeDetail, page: item.kind)
         }
     }
 
-    /// Swaps the synopsis for the named episode's (one fetch when the episode lacks an overview).
-    private func showEpisodeDescription(for episode: MediaItem, page: MediaKind, token: UInt64) async {
+    /// Swaps the synopsis for the named episode's, from its detail when the list item lacks an overview.
+    private func showEpisodeDescription(for episode: MediaItem, detail episodeDetail: MediaItemDetail?, page: MediaKind) {
         var overview = episode.overview
-        if overview?.isEmpty != false,
-           EpisodePicker.episodeDescription(for: episode, overview: "x", on: page) != nil {
-            overview = await Self.fetchDetail(episode.ref)?.item.overview
-        }
-        guard loadToken == token else { return }
+        if overview?.isEmpty != false { overview = episodeDetail?.item.overview }
         episodeDescription = EpisodePicker.episodeDescription(for: episode, overview: overview, on: page)
         if let item, let detail { renderDescription(item: item, detail: detail) }
     }
@@ -602,6 +632,8 @@ final class MediaDetailChromeView: UIView {
             let attr = NSMutableAttributedString(string: String(localized: "Starring "), attributes: [
                 .foregroundColor: UIColor.white.withAlphaComponent(Self.rolesLabelAlpha)])
             attr.append(NSAttributedString(string: topCast.joined(separator: ", ")))
+            attr.addAttribute(.paragraphStyle, value: Self.paragraphStyle(lineHeight: Self.castLineHeight),
+                              range: NSRange(location: 0, length: attr.length))
             castLabel.attributedText = attr
         } else {
             castLabel.attributedText = nil
@@ -610,12 +642,14 @@ final class MediaDetailChromeView: UIView {
     }
 
     private func renderDescription(item: MediaItem, detail: MediaItemDetail) {
-        let color = UIColor.white.withAlphaComponent(0.85)
+        let color = UIColor.white.withAlphaComponent(Self.descriptionAlpha)
+        let style = Self.paragraphStyle(lineHeight: Self.descriptionLineHeight)
         func prefixed(_ prefix: String, _ body: String) {
             let attr = NSMutableAttributedString(string: prefix, attributes: [
-                .font: UIFont.systemFont(ofSize: 23, weight: .bold), .foregroundColor: color])
+                .font: UIFont.systemFont(ofSize: 23, weight: .bold), .foregroundColor: color,
+                .paragraphStyle: style])
             attr.append(NSAttributedString(string: body, attributes: [
-                .font: Self.descriptionFont, .foregroundColor: color]))
+                .font: Self.descriptionFont, .foregroundColor: color, .paragraphStyle: style]))
             descriptionLabel.attributedText = attr
         }
         if let episode = episodeDescription {
@@ -624,9 +658,8 @@ final class MediaDetailChromeView: UIView {
                   let overview = detail.item.overview, !overview.isEmpty {
             prefixed(String(localized: "S\(s), E\(e): "), overview)   // episode page
         } else if let overview = detail.item.overview, !overview.isEmpty {
-            descriptionLabel.attributedText = nil
-            descriptionLabel.text = overview
-            descriptionLabel.font = Self.descriptionFont
+            descriptionLabel.attributedText = NSAttributedString(string: overview, attributes: [
+                .font: Self.descriptionFont, .foregroundColor: color, .paragraphStyle: style])
         }
     }
 
@@ -961,8 +994,9 @@ final class MediaDetailChromeView: UIView {
                                   alpha: Self.qualityRowAlpha).forEach(qualityRow.addArrangedSubview)
         }
 
-        for badge in Self.calmBadges(detail?.primarySource) {
-            qualityRow.addArrangedSubview(Self.makeBadge(badge, alpha: Self.qualityRowAlpha))
+        for badge in (detail?.primarySource ?? playTargetSource)?.detailBadges ?? [] {
+            qualityRow.addArrangedSubview(Self.makeBadge(badge, alpha: Self.qualityRowAlpha,
+                                                         filled: MediaSource.filledBadges.contains(badge)))
         }
     }
 
@@ -972,9 +1006,15 @@ final class MediaDetailChromeView: UIView {
         if let rating = MediaRating.detailRating(in: ratings) {
             let label = makeCaptionLabel(rating.badgeText, alpha: alpha)
             let ratingStack: UIStackView
-            if rating.source == .rottenTomatoes || rating.source == .rottenTomatoesAudience {
-                let glyph = UIImageView(image: emojiGlyph(
-                    rating.source == .rottenTomatoes ? (rating.value >= 6 ? "🍅" : "🤢") : "🍿"))
+            let emoji: String? = switch rating.source {
+            case .rottenTomatoes: rating.value >= 6 ? "🍅" : "🤢"
+            case .rottenTomatoesAudience: "🍿"
+            // Jellyfin and Emby's community rating: a star, as their own apps draw it.
+            case .unknown: "⭐"
+            default: nil
+            }
+            if let emoji {
+                let glyph = UIImageView(image: emojiGlyph(emoji))
                 glyph.translatesAutoresizingMaskIntoConstraints = false
                 NSLayoutConstraint.activate([
                     glyph.widthAnchor.constraint(equalToConstant: 20),
@@ -1008,20 +1048,9 @@ final class MediaDetailChromeView: UIView {
         return views
     }
 
-    /// The row's quality badges, kept short: 4K only, every range badge (DV, HDR10+ ...), and audio only
-    /// when it is object audio.
-    static func calmBadges(_ source: MediaSource?) -> [String] {
-        guard let source else { return [] }
-        var badges = source.resolutionBadge == "4K" ? ["4K"] : []
-        badges += source.rangeBadges
-        if let audio = source.audioBadge {
-            if audio.hasSuffix("Atmos") { badges.append("Atmos") } else if audio.hasPrefix("DTS-X") { badges.append("DTS:X") }
-        }
-        return badges
-    }
-
     /// An emoji as the score's glyph (tomato when fresh at 60% and up, nauseated face when rotten,
-    /// popcorn for the audience); the system's art, so no rating-site artwork ships in the app.
+    /// popcorn for the audience, a star for the server's own score); the system's art, so no
+    /// rating-site artwork ships in the app.
     private static func emojiGlyph(_ emoji: String) -> UIImage {
         UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20)).image { _ in
             let glyph = emoji as NSString
@@ -1039,7 +1068,8 @@ final class MediaDetailChromeView: UIView {
         pill.layer.cornerRadius = Self.actionButtonHeight / 2
         pill.layer.cornerCurve = .continuous
 
-        let playIcon = UIImageView(image: UIImage(systemName: "play.fill"))
+        let playIcon = UIImageView(image: UIImage(systemName: "play.fill")?.withConfiguration(
+            UIImage.SymbolConfiguration(pointSize: Self.playGlyphSize, weight: .semibold)))
         playIcon.translatesAutoresizingMaskIntoConstraints = false
         playIcon.tintColor = .white
         playIcon.contentMode = .scaleAspectFit
@@ -1078,8 +1108,8 @@ final class MediaDetailChromeView: UIView {
         pill.addSubview(contentStack)
 
         NSLayoutConstraint.activate(Self.pillConstraints(pill, content: contentStack) + [
-            playIcon.widthAnchor.constraint(equalToConstant: 24),
-            playIcon.heightAnchor.constraint(equalToConstant: 24),
+            playIcon.widthAnchor.constraint(equalToConstant: Self.playGlyphSize),
+            playIcon.heightAnchor.constraint(equalToConstant: Self.playGlyphSize),
 
             progressTrack.heightAnchor.constraint(equalToConstant: Self.playProgressTrackHeight),
             progressTrack.widthAnchor.constraint(equalToConstant: Self.playProgressTrackWidth),
@@ -1200,17 +1230,18 @@ final class MediaDetailChromeView: UIView {
     }
 
     /// Bordered rating / quality badge, 22pt tall in total (Apple's badge cap).
-    static func makeBadge(_ text: String, alpha: CGFloat) -> UIView {
+    static func makeBadge(_ text: String, alpha: CGFloat, filled: Bool = false) -> UIView {
         let label = UILabel()
         label.translatesAutoresizingMaskIntoConstraints = false
         label.text = text
         label.font = .systemFont(ofSize: 15, weight: .bold)
-        label.textColor = UIColor.white.withAlphaComponent(alpha)
+        label.textColor = filled ? .black : UIColor.white.withAlphaComponent(alpha)
         let container = UIView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.layer.borderWidth = 1
+        container.layer.borderWidth = filled ? 0 : 1
         container.layer.borderColor = UIColor.white.withAlphaComponent(alpha * 0.7).cgColor
-        container.layer.cornerRadius = 4
+        container.layer.cornerRadius = 5
+        container.backgroundColor = filled ? UIColor.white.withAlphaComponent(alpha) : .clear
         container.layer.cornerCurve = .continuous
         container.addSubview(label)
         NSLayoutConstraint.activate([

@@ -58,6 +58,11 @@ nonisolated struct EmbyUser: Decodable, Sendable {
     let id: EmbyID?
     let name: String?
     let policy: Policy?
+    let configuration: Configuration?
+
+    nonisolated struct Configuration: Decodable, Sendable {
+        let latestItemsExcludes: [EmbyID]?
+    }
 
     nonisolated struct Policy: Decodable, Sendable {
         let isAdministrator: Bool?
@@ -65,7 +70,25 @@ nonisolated struct EmbyUser: Decodable, Sendable {
         let enableContentDeletionFromFolders: [EmbyID]?
         let enableContentDownloading: Bool?
         let enableLiveTvAccess: Bool?
+        let enableSubtitleDownloading: Bool?
     }
+}
+
+/// `Libraries/AvailableOptions`: the subtitle providers (Open Subtitles) the server has.
+nonisolated struct EmbyLibraryAvailableOptions: Decodable, Sendable {
+    let subtitleFetchers: [Fetcher]?
+    nonisolated struct Fetcher: Decodable, Sendable { let name: String? }
+}
+
+/// `Items/{id}/RemoteSearch/Subtitles/{language}`.
+nonisolated struct EmbyRemoteSubtitle: Decodable, Sendable {
+    let id: String?
+    let name: String?
+    let providerName: String?
+    let format: String?
+    let threeLetterISOLanguageName: String?
+    let isForced: Bool?
+    let isHearingImpaired: Bool?
 }
 
 // MARK: - Items
@@ -157,6 +180,11 @@ nonisolated struct EmbyItem: Decodable, Sendable {
     let primaryImageTag: String?
 
     let mediaSources: [EmbyMediaSource]?
+
+    /// Photos: only when asked for in `Fields`.
+    let width: Int?
+    let height: Int?
+    let path: String?
 
     /// Provider ids come with mixed key case on one server (`Imdb` on a movie, `IMDB` on a series).
     func providerID(_ name: String) -> String? {
@@ -262,6 +290,7 @@ nonisolated struct EmbyMediaStream: Decodable, Sendable {
     let realFrameRate: Double?
     let averageFrameRate: Double?
     let aspectRatio: String?
+    let isAnamorphic: Bool?
     let pixelFormat: String?
     let videoRange: String?
     let colorTransfer: String?

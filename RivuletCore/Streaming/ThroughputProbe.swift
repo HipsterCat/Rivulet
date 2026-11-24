@@ -9,17 +9,22 @@ nonisolated enum ThroughputProbe {
     static let timeLimit: TimeInterval = 2
 
     /// Rate from bytes received after the first byte; nil when too little arrived to judge.
+    /// A read too quick to time counts as 50 ms: a fast link, rated at its floor.
     static func kbps(bytes: Int, seconds: TimeInterval) -> Int? {
-        guard bytes >= 64 * 1024, seconds > 0.05 else { return nil }
-        return Int(Double(bytes) * 8 / seconds / 1000)
+        guard bytes >= 64 * 1024 else { return nil }
+        return Int(Double(bytes) * 8 / max(seconds, 0.05) / 1000)
     }
 
     /// Off the caller's actor: the byte loop runs for up to two seconds.
-    @concurrent static func measure(url: URL, headers: [String: String] = [:], session: URLSession = .shared) async -> Int? {
+    /// `bytes` opens the request; a Plex caller passes its trusting session (raw-IP servers fail TLS on `.shared`).
+    @concurrent static func measure(
+        url: URL, headers: [String: String] = [:],
+        bytes open: @Sendable (URLRequest) async throws -> (URLSession.AsyncBytes, URLResponse) = { try await URLSession.shared.bytes(for: $0) }
+    ) async -> Int? {
         var request = URLRequest(url: url, timeoutInterval: 5)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         request.setValue("bytes=0-\(byteLimit - 1)", forHTTPHeaderField: "Range")
-        guard let (bytes, response) = try? await session.bytes(for: request),
+        guard let (bytes, response) = try? await open(request),
               let status = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(status) else {
             return nil
         }

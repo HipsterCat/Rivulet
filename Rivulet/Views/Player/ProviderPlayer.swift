@@ -40,21 +40,27 @@ enum ProviderPlayer {
 
     /// Play `item` from its own provider. A show or a season resolves to the
     /// episode Play means first, the same way the Plex path does. `playQueue`
-    /// is the playlist `item` starts.
+    /// is the playlist `item` starts. `configure` sees the view model before it
+    /// presents (Watch Together).
     @MainActor
     static func play(_ item: MediaItem, fromBeginning: Bool, sourceID: String? = nil,
-                     playQueue: PlayQueue<PlaylistEntry>? = nil,
-                     from presenter: UIViewController, onDismiss: (() -> Void)?) {
+                     playQueue: PlayQueue<PlaylistEntry>? = nil, explicitStartOffset: TimeInterval? = nil,
+                     configure: ((UniversalPlayerViewModel) -> Void)? = nil,
+                     from presenter: UIViewController, onDismiss: (() -> Void)?,
+                     onFailedToStart: (() -> Void)? = nil) {
         guard let provider = MediaProviderRegistry.shared.provider(for: item.ref.providerID) else {
             presentError(MediaProviderError.notFound, from: presenter)
+            onFailedToStart?()
             return
         }
-        guard claimStart() else { return }
+        guard claimStart() else { onFailedToStart?(); return }
         Task { @MainActor in
             defer { finishStart() }
             var target = item
+            var explicitStartOffset = explicitStartOffset
             if item.kind == .show || item.kind == .season {
                 target = await EpisodePicker.resolvePlayTarget(for: item, provider: provider) ?? item
+                explicitStartOffset = nil  // an offset names a time in one title, not in a show
             }
             // The loading screen's art, fetched while the stream is resolved.
             async let loadingImages = HeroBackdropResolver.shared.playerLoadingImages(
@@ -68,38 +74,43 @@ enum ProviderPlayer {
                     let (art, thumb) = await loadingImages
                     let viewModel = UniversalPlayerViewModel(
                         metadata: metadata, serverURL: plex.serverURL, authToken: plex.authToken,
-                        startOffset: plexStartOffset(metadata, fromBeginning: fromBeginning),
+                        startOffset: explicitStartOffset ?? plexStartOffset(metadata, fromBeginning: fromBeginning),
                         playQueue: playQueue,
                         loadingArtImage: art, loadingThumbImage: thumb, preferredMediaID: sourceID)
+                    configure?(viewModel)
                     PlayerPresenter.present(viewModel: viewModel, from: presenter, onDismiss: onDismiss)
                 } catch {
                     presentError(MediaProviderError.mapping(error), from: presenter)
+                    onFailedToStart?()
                 }
                 return
             }
             do {
                 let playback = try await ProviderPlayback.prepare(
                     item: target, provider: provider, version: sourceID.map(VersionChoice.source) ?? .best,
-                    fromBeginning: fromBeginning, awaitingExtras: false)
+                    fromBeginning: fromBeginning, explicitStartOffset: explicitStartOffset, awaitingExtras: false)
                 let (art, thumb) = await loadingImages
                 let viewModel = UniversalPlayerViewModel(
                     providerPlayback: playback,
-                    startOffset: startOffset(detailOffset: playback.detail.item.userState.viewOffset,
-                                             fromBeginning: fromBeginning),
+                    startOffset: explicitStartOffset ?? startOffset(detailOffset: playback.detail.item.userState.viewOffset,
+                                                                   fromBeginning: fromBeginning),
                     playQueue: playQueue,
                     loadingArtImage: art,
                     loadingThumbImage: thumb,
                     preferredMediaID: sourceID)
+                configure?(viewModel)
                 PlayerPresenter.present(viewModel: viewModel, from: presenter, onDismiss: onDismiss)
             } catch {
                 presentError(error, from: presenter)
+                onFailedToStart?()
             }
         }
     }
 
     /// What the error popup says for a failed start.
     static func errorMessage(for error: Error) -> String {
-        switch error as? MediaProviderError {
+        if let refusal = error as? ServerRefusal { return refusal.message }
+        return switch error as? MediaProviderError {
         case .transcodeRequired: String(localized: "This server can't stream this title to Apple TV.")
         case .unreachable: String(localized: "Couldn't reach the server.")
         case .unauthorized: String(localized: "The server didn't accept your sign-in.")

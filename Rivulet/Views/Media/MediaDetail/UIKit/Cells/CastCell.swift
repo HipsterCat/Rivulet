@@ -75,7 +75,9 @@ final class CastCell: UIView {
                 constant: 32 + Self.nameFont.descender - Self.roleFont.ascender),
             subtitleLabel.leadingAnchor.constraint(equalTo: photoView.leadingAnchor),
             subtitleLabel.trailingAnchor.constraint(equalTo: photoView.trailingAnchor),
-            subtitleLabel.bottomAnchor.constraint(equalTo: bottomAnchor),
+            // At most: an equal pin stretches the name label into the cell's spare height and
+            // its centered text drifts down.
+            subtitleLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
         ])
     }
 
@@ -133,7 +135,7 @@ final class CastCell: UIView {
     /// Aspect-fills `image` into the circle with transparent corners, so the focus effect is round.
     private static func circular(_ image: UIImage) -> UIImage {
         let side = circleSize
-        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { _ in
+        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: .layeredArtwork()).image { _ in
             UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: side, height: side)).addClip()
             let scale = max(side / image.size.width, side / image.size.height)
             let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
@@ -145,7 +147,7 @@ final class CastCell: UIView {
     /// Dark circle with a person glyph, for people with no photo.
     private static let placeholder: UIImage = {
         let side = circleSize
-        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { _ in
+        return UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: .layeredArtwork()).image { _ in
             UIColor(white: 0.15, alpha: 1).setFill()
             UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: side, height: side)).fill()
             let config = UIImage.SymbolConfiguration(pointSize: 60, weight: .light)

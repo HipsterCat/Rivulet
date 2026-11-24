@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-// Poster tile for the Watchlist hub row: 20pt continuous mask, `TVPosterView` focus motion,
+// Poster tile for the Watchlist hub row: view-level corners and native `TVPosterView` focus motion,
 // and a film/tv symbol placeholder when there is no poster. Caption stays nil, as in `PosterCell`.
 
 import UIKit
@@ -17,13 +17,14 @@ final class WatchlistPosterCell: UICollectionViewCell {
     private let placeholderView = UIView()
     private let placeholderGradient = CAGradientLayer()
     private let placeholderIcon = UIImageView()
+    private var caption: PosterCaption!
 
     private var imageLoadTask: Task<Void, Never>?
     private var currentURL: URL?
     /// True once real artwork is showing; `posterView.image` is never nil.
     private var hasArtwork = false
 
-    private let cornerRadius: CGFloat = 20
+    private let cornerRadius = RoundedPoster.cornerRadius
     private let tile = MediaRowMetrics.poster
 
     override init(frame: CGRect) {
@@ -42,6 +43,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
         posterView.translatesAutoresizingMaskIntoConstraints = false
         posterView.image = PosterCell.blankArtwork
         contentView.addSubview(posterView)
+        RoundedPoster.configureImageView(posterView.imageView)
 
         // Placeholder underlay (dark gradient + centred SF symbol). Visible
         // when posterURL is nil or the load fails. Sits behind the poster
@@ -66,8 +68,13 @@ final class WatchlistPosterCell: UICollectionViewCell {
         // Insert placeholder below the poster view so the image covers it.
         contentView.insertSubview(placeholderView, belowSubview: posterView)
 
+        let posterCenterY = posterView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+        caption = PosterCaption(in: contentView, under: posterView,
+                                leading: posterView.imageView.leadingAnchor,
+                                trailing: posterView.imageView.trailingAnchor,
+                                tileCenterY: posterCenterY)
         NSLayoutConstraint.activate([
-            posterView.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            posterCenterY,
             posterView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             posterView.widthAnchor.constraint(equalToConstant: tile.hostSize.width),
             posterView.heightAnchor.constraint(equalToConstant: tile.hostSize.height),
@@ -92,6 +99,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
                       || context.nextFocusedView?.isDescendant(of: self) == true
         coordinator.addCoordinatedAnimations({
             self.posterView.transform = nowFocused ? self.tile.focusScale : .identity
+            self.caption.setFocused(nowFocused)
         }, completion: nil)
     }
 
@@ -105,6 +113,9 @@ final class WatchlistPosterCell: UICollectionViewCell {
         placeholderGradient.frame = placeholderView.bounds
         CATransaction.commit()
     }
+
+    /// The title line (`PosterCaption.set`); call after `configure`.
+    func setCaption(_ text: String?) { caption.set(text) }
 
     func configure(item: PlexWatchlistItem) {
         // `film` for movies, `tv` for shows.
@@ -127,6 +138,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
         clearArtwork()
         placeholderView.isHidden = false
         placeholderIcon.image = nil
+        caption.set(nil)
     }
 
     private func loadImage(from url: URL?, failureIcon: UIImage?) {
@@ -147,7 +159,8 @@ final class WatchlistPosterCell: UICollectionViewCell {
         currentURL = url
         // Memory hit paints in this pass, so a tile realized for the carousel
         // exit has artwork to fly to.
-        if let cached = ImageCacheManager.shared.cachedImage(for: url) {
+        let shape = RoundedPoster.Shape(tile: tile, scale: traitCollection.displayScale)
+        if let cached = RoundedPoster.cached(for: url, shape: shape) {
             posterView.image = cached
             hasArtwork = true
             placeholderView.isHidden = true
@@ -157,7 +170,7 @@ final class WatchlistPosterCell: UICollectionViewCell {
         let key = url.absoluteString as AnyHashable
         imageLoadTask = Task { [weak self] in
             let image: UIImage? = await Perf.interval(.imageDecode, key: key) {
-                await ImageCacheManager.shared.image(for: url)
+                await RoundedPoster.image(for: url, shape: shape)
             }
             await MainActor.run {
                 guard let self, self.currentURL == url else { return }

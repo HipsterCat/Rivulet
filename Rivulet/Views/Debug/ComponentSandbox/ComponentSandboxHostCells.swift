@@ -504,8 +504,8 @@ final class SandboxBadgesCell: UICollectionViewCell {
             qualityRow.addArrangedSubview(makeQualityChip(text))
         }
 
-        let watched = PosterWatchedBadge()
-        watched.setStyle(.unwatchedCount(6))
+        let watched = SourceBadgeView(style: .onArtwork)
+        watched.text = "6"
         let watchedGlyph = WatchedGlyphView()
 
         let miscRow = UIStackView(arrangedSubviews: [watched, watchedGlyph])

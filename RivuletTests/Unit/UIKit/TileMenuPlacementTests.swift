@@ -14,7 +14,7 @@ final class TileMenuPlacementTests: XCTestCase {
         let p = TileMenuPlacement.place(panel: panel, beside: tile, in: screen)
         XCTAssertEqual(p.frame.minY, tile.minY)
         XCTAssertEqual(p.anchor.y, 0, "grows from its top corner, beside the tile's top")
-        XCTAssertEqual(p.frame.minX, tile.maxX + 16)
+        XCTAssertEqual(p.frame.minX, tile.maxX + 19.5)
         XCTAssertEqual(p.anchor.x, 0)
     }
 
@@ -36,7 +36,7 @@ final class TileMenuPlacementTests: XCTestCase {
     func test_rightEdgeTile_opensToTheLeft() {
         let tile = CGRect(x: 1580, y: 200, width: 260, height: 390)
         let p = TileMenuPlacement.place(panel: panel, beside: tile, in: screen)
-        XCTAssertEqual(p.frame.maxX, tile.minX - 16)
+        XCTAssertEqual(p.frame.maxX, tile.minX - 19.5)
         XCTAssertEqual(p.anchor.x, 1)
     }
 
@@ -44,5 +44,28 @@ final class TileMenuPlacementTests: XCTestCase {
         let p = TileMenuPlacement.place(panel: panel, beside: nil, in: screen)
         XCTAssertEqual(p.frame.midX, screen.midX)
         XCTAssertEqual(p.frame.midY, screen.midY)
+    }
+
+    func test_panelTallerThanSafeArea_isCutToIt() {
+        let tile = CGRect(x: 80, y: 600, width: 260, height: 390)
+        let p = TileMenuPlacement.place(panel: CGSize(width: 440, height: 1200), beside: tile, in: screen)
+        XCTAssertEqual(p.frame.minY, 50)
+        XCTAssertEqual(p.frame.maxY, screen.maxY - 50)
+    }
+
+    /// The glass view keeps the geometry UIKit expects; its holder carries the place and the scale (#486).
+    @MainActor
+    func test_effectView_carriesNoPlacementOfItsOwn() throws {
+        let action = TileMenuAction(verbatim: "Play", systemImage: "play.fill", handler: {})
+        let popup = TileMenuPopupViewController(sections: [[action]],
+                                                sourceFrame: CGRect(x: 64, y: 430, width: 354, height: 237))
+        popup.loadViewIfNeeded()
+        let holder = try XCTUnwrap(popup.view.subviews.first)
+        let glass = try XCTUnwrap(holder.subviews.first as? UIVisualEffectView)
+
+        XCTAssertEqual(glass.layer.anchorPoint, CGPoint(x: 0.5, y: 0.5))
+        XCTAssertEqual(glass.frame, holder.bounds)
+        XCTAssertTrue(glass.transform.isIdentity)
+        XCTAssertEqual(holder.layer.position, CGPoint(x: 437.5, y: 430), "grows from the corner beside the tile")
     }
 }

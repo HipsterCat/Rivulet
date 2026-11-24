@@ -165,6 +165,17 @@ extension Array where Element == MediaItem {
         func number(_ item: MediaItem) -> Int { item.episodeNumber ?? item.seasonNumber ?? 0 }
         return enumerated().sorted { (number($0.element), $0.offset) < (number($1.element), $1.offset) }.map(\.element)
     }
+
+    /// A show's episodes split where the season changes, in the order given. No group is empty.
+    nonisolated func groupedBySeason() -> [[MediaItem]] {
+        reduce(into: []) { seasons, episode in
+            if let current = seasons.last, current[0].seasonNumber == episode.seasonNumber {
+                seasons[seasons.count - 1].append(episode)
+            } else {
+                seasons.append([episode])
+            }
+        }
+    }
 }
 
 extension LibrarySortOption {
@@ -182,6 +193,9 @@ extension LibrarySortOption {
         case .resolutionDesc, .resolutionAsc: .addedAtDesc
         }
     }
+
+    /// Where the iOS Browse grid keeps a library's sort.
+    nonisolated static func iosKey(_ libraryKey: String) -> String { "iosLibrarySort.\(libraryKey)" }
 }
 
 /// Whether a title is on the Plex watchlist, answered without a request from the ids a list
@@ -236,17 +250,24 @@ extension Array where Element == MediaLibrary {
     }
 }
 
-/// The sorts the iOS library page offers, in its order.
+/// The sorts the iOS and Mac library pages offer: the provider's, as on tvOS (#599).
 nonisolated enum IOSLibrarySorts {
-    static let all: [LibrarySortOption] = [.titleAsc, .addedAtDesc, .releaseDateDesc, .ratingDesc]
-
-    /// Plex answers every one of them for a movie or TV library; another server offers what it can apply.
+    /// Plex also sorts a TV library by release date, which the seam's list leaves out.
     static func menu(offered: [LibrarySortOption], isPlex: Bool) -> [LibrarySortOption] {
-        isPlex ? all : all.filter { offered.contains($0) }
+        guard isPlex else { return offered }
+        return offered + [.releaseDateDesc, .releaseDateAsc].filter { !offered.contains($0) }
     }
 }
 
 extension MediaItemDetail {
+    /// This detail with more extras (a season's) after its own, deduped by id.
+    nonisolated func adding(extras more: [Extra]) -> MediaItemDetail {
+        var copy = self
+        let have = Set(extras.map(\.id))
+        copy.extras += more.filter { !have.contains($0.id) }
+        return copy
+    }
+
     /// Trailers first, then the other extras by kind, each kind in the server's order.
     nonisolated var orderedExtras: [Extra] {
         extras.enumerated().sorted { ($0.element.subtype, $0.offset) < ($1.element.subtype, $1.offset) }.map(\.element)

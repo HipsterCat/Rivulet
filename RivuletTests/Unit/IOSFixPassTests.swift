@@ -15,11 +15,12 @@ import XCTest
 
 final class IOSFixPassTests: XCTestCase {
     private func item(_ id: String, kind: MediaKind = .movie, provider: String = "plex:a", title: String? = nil, year: Int? = nil,
-                      ids: [String: String]? = nil, played: Bool = false, offset: TimeInterval = 0, runtime: TimeInterval = 6000) -> MediaItem {
+                      ids: [String: String]? = nil, played: Bool = false, offset: TimeInterval = 0, runtime: TimeInterval = 6000,
+                      progress: ChildProgress? = nil) -> MediaItem {
         MediaItem(
             ref: MediaItemRef(providerID: provider, itemID: id), kind: kind, title: title ?? id, sortTitle: nil, overview: nil,
             year: year, runtime: runtime, parentRef: nil, grandparentRef: nil, episodeNumber: nil, seasonNumber: nil,
-            childProgress: nil,
+            childProgress: progress,
             userState: MediaUserState(isPlayed: played, viewOffset: offset, isFavorite: false, lastViewedAt: nil),
             artwork: MediaArtwork(poster: nil, backdrop: nil, thumbnail: nil, logo: nil),
             parentArtwork: nil, grandparentArtwork: nil, externalIDs: ids)
@@ -41,13 +42,25 @@ final class IOSFixPassTests: XCTestCase {
         XCTAssertEqual(MediaItem.nextUp(in: [rewatch, unwatched])?.ref.itemID, "a")
     }
 
+    // MARK: - Unwatched count (#658)
+
+    func test_unwatchedEpisodeCount_onlyForAShowWithEpisodesLeft() {
+        XCTAssertEqual(item("a", kind: .show, progress: ChildProgress(played: 3, total: 10)).unwatchedEpisodeCount, 7)
+        XCTAssertEqual(item("b", kind: .show, progress: ChildProgress(played: 0, total: 4, unplayedOnly: true)).unwatchedEpisodeCount, 4,
+                       "Emby lists carry the unplayed count alone")
+        XCTAssertNil(item("c", kind: .show, played: true, progress: ChildProgress(played: 10, total: 10)).unwatchedEpisodeCount)
+        XCTAssertNil(item("d", kind: .show).unwatchedEpisodeCount, "no count from the server")
+        XCTAssertNil(item("e", kind: .season, progress: ChildProgress(played: 0, total: 8)).unwatchedEpisodeCount, "shows only, as on tvOS")
+        XCTAssertEqual(item("f", kind: .show, progress: ChildProgress(played: 3, total: 10)).watchStateDescription, "7 unwatched episodes")
+    }
+
     // MARK: - Sorts
 
-    func test_librarySorts_plexOffersAllFourEvenOnATVLibrary() {
+    func test_librarySorts_plexOffersTheTVOSListPlusReleaseDate() {
         let showSorts = LibrarySortOption.expressible(for: .shows)
-        XCTAssertFalse(showSorts.contains(.releaseDateDesc), "the premise: the seam's TV list lacks Release Date")
+        XCTAssertTrue(showSorts.contains(.lastEpisodeAddedDesc), "New Episodes, as on tvOS (#599)")
         XCTAssertEqual(IOSLibrarySorts.menu(offered: showSorts, isPlex: true),
-                       [.titleAsc, .addedAtDesc, .releaseDateDesc, .ratingDesc])
+                       showSorts + [.releaseDateDesc, .releaseDateAsc])
     }
 
     func test_librarySorts_anotherServerOffersWhatItCanApply() {

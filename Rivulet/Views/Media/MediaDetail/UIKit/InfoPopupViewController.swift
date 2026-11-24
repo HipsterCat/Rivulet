@@ -15,7 +15,7 @@ struct InfoPopupCardLayout {
     let insetBottom: CGFloat
 
     /// Breathing room for content scrolling in and out of the card's edges.
-    private static let scrollInsetTop: CGFloat = 8
+    static let scrollInsetTop: CGFloat = 8
     private static let scrollInsetBottom: CGFloat = 72
 
     static func make(contentHeight: CGFloat, pad: CGFloat, screenHeight: CGFloat) -> InfoPopupCardLayout {
@@ -100,6 +100,7 @@ final class InfoPopupViewController: UIViewController {
 
         // Match the carousel detail's left margin so the popup padding feels native.
         let pad: CGFloat = PreviewCarouselGeometry.expandedChromeInset
+        let topPad = descriptionTopPad ?? pad
         var constraints: [NSLayoutConstraint] = [
             card.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             card.centerYAnchor.constraint(equalTo: view.centerYAnchor),
@@ -128,7 +129,7 @@ final class InfoPopupViewController: UIViewController {
             cardHeight = card.heightAnchor.constraint(equalToConstant: 320)
             constraints += [
                 cardHeight,
-                scroll.topAnchor.constraint(equalTo: blur.contentView.topAnchor, constant: pad),
+                scroll.topAnchor.constraint(equalTo: blur.contentView.topAnchor, constant: topPad),
                 scroll.leadingAnchor.constraint(equalTo: blur.contentView.leadingAnchor, constant: pad),
                 scroll.trailingAnchor.constraint(equalTo: blur.contentView.trailingAnchor, constant: -pad),
                 scroll.bottomAnchor.constraint(equalTo: blur.contentView.bottomAnchor, constant: -pad),
@@ -155,17 +156,33 @@ final class InfoPopupViewController: UIViewController {
             view.addGestureRecognizer(tap)
         }
 
-        // Arrow presses and swipes both scroll; the card is the only focus target, so swipes steal nothing.
-        if scrollable {
+        // Arrow presses and swipes both drive the popup; the card is the only focus target, so swipes steal nothing.
+        var directions: [DirectionalInputBinding.Direction] = scrollable ? [.up, .down] : []
+        if onHorizontalMove != nil { directions += [.left, .right] }
+        if !directions.isEmpty {
             directionalInput = DirectionalInputBinding(
                 view: view,
-                directions: [.up, .down],
+                directions: directions,
                 onTap: { [weak self] direction in
-                    self?.scrollContent(by: direction == .up ? -440 : 440)
+                    switch direction {
+                    case .up: self?.scrollContent(by: -440)
+                    case .down: self?.scrollContent(by: 440)
+                    case .left, .right: self?.onHorizontalMove?(direction)
+                    }
                 }
             )
         }
     }
+
+    /// Apple anchors the description popup's title cap 70.5 below the card top, not at the side padding.
+    private var descriptionTopPad: CGFloat? {
+        guard cardWidth == Self.descriptionSize.width, fixedHeight == Self.descriptionSize.height else { return nil }
+        let title = InfoPopupContent.descriptionTitleFont
+        return 70.5 - InfoPopupCardLayout.scrollInsetTop - (title.ascender - title.capHeight)
+    }
+
+    /// Left/Right, for content that pages sideways (the ratings popup's reviews). Set before presenting.
+    var onHorizontalMove: ((DirectionalInputBinding.Direction) -> Void)?
 
     private var directionalInput: DirectionalInputBinding?
 
@@ -247,23 +264,43 @@ final class InfoPopupViewController: UIViewController {
 
 enum InfoPopupContent {
 
-    /// Title + genre line + full body (the About "description" popup).
+    static let descriptionTitleFont = UIFont.systemFont(ofSize: 31, weight: .bold)
+
+    /// Title + genre line + full body (the About "description" popup). Spaced by baselines as
+    /// Apple's is: title to genre 48.5, genre to body 66, body to body 32; no genre, title to body 66.
     static func description(title: String, subtitle: String?, body: String?) -> UIView {
-        let stack = verticalStack(spacing: 10)
-        stack.addArrangedSubview(label(title, size: 31, weight: .bold, color: .white, lines: 2))
+        let stack = verticalStack(spacing: 0)
+        let titleFont = descriptionTitleFont
+        let textFont = UIFont.systemFont(ofSize: 25, weight: .medium)
+        let titleLabel = label(title, size: 31, weight: .bold, color: .white, lines: 2)
+        stack.addArrangedSubview(titleLabel)
+        var above = titleLabel
+        var aboveFont = titleFont
+        let baselines: CGFloat = 66
         if let subtitle, !subtitle.isEmpty {
-            let s = label(subtitle, size: 20, weight: .medium, color: .white.withAlphaComponent(0.6), lines: 1)
+            let s = label(subtitle, size: 25, weight: .medium, color: .white.withAlphaComponent(0.65), lines: 1)
             stack.addArrangedSubview(s)
-            stack.setCustomSpacing(20, after: s)
+            stack.setCustomSpacing(48.5 + titleFont.descender - textFont.ascender, after: above)
+            above = s
+            aboveFont = textFont
         }
         if let body, !body.isEmpty {
-            stack.addArrangedSubview(label(body, size: 24, weight: .regular, color: .white.withAlphaComponent(0.9), lines: 0))
+            let paragraph = NSMutableParagraphStyle()
+            let bodyFont = UIFont.systemFont(ofSize: 25, weight: .regular)
+            paragraph.lineSpacing = 32 - bodyFont.lineHeight
+            let text = UILabel()
+            text.numberOfLines = 0
+            text.attributedText = NSAttributedString(string: body, attributes: [
+                .font: bodyFont, .foregroundColor: UIColor.white.withAlphaComponent(0.52), .paragraphStyle: paragraph])
+            stack.addArrangedSubview(text)
+            stack.setCustomSpacing(baselines + aboveFont.descender - bodyFont.ascender, after: above)
         }
         return stack
     }
 
-    /// Every review score, one row each: score, then source and who it's from.
-    static func ratings(_ ratings: [MediaRating]) -> UIView {
+    /// Every review score, one row each: score, then source and who it's from,
+    /// then the critic strip when there is one.
+    static func ratings(_ ratings: [MediaRating], strip: ReviewStripView? = nil) -> UIView {
         let stack = verticalStack(spacing: 22)
         stack.addArrangedSubview(label(String(localized: "Ratings"), size: 30, weight: .semibold, color: .white, lines: 1))
         for rating in ratings {
@@ -278,6 +315,11 @@ enum InfoPopupContent {
             row.alignment = .center
             row.spacing = 20
             stack.addArrangedSubview(row)
+        }
+        if let strip {
+            if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(34, after: last) }
+            stack.addArrangedSubview(label(String(localized: "Critic Reviews"), size: 24, weight: .semibold, color: .white, lines: 1))
+            stack.addArrangedSubview(strip)
         }
         return stack
     }
@@ -360,6 +402,10 @@ enum InfoPopupContent {
         if let rt = detail.item.runtime, rt > 0 { info.append((String(localized: "Run Time"), runtimeString(rt))) }
         if let r = detail.contentRating, !r.isEmpty { info.append((String(localized: "Rated"), r)) }
         if let region = detail.regionOfOrigin, !region.isEmpty { info.append((String(localized: "Region of Origin"), region)) }
+        let video = [source?.resolutionBadge, source?.videoTracks.first.flatMap { VersionPicker.codecName($0.codec) }]
+            .compactMap { $0 }
+        if !video.isEmpty { info.append((String(localized: "Video"), video.joined(separator: " · "))) }
+        if let ratio = source?.aspectRatioLabel { info.append((String(localized: "Aspect Ratio"), ratio)) }
         addSection(title: String(localized: "Information"), rows: info, to: stack)
 
         // Languages
@@ -412,13 +458,9 @@ enum InfoPopupContent {
         if !parts.isEmpty {
             row.addArrangedSubview(label(parts.joined(separator: "  ·  "), size: 20, weight: .semibold, color: .white.withAlphaComponent(0.7), lines: 1))
         }
-        let source = detail.primarySource
-        var badges = source?.qualityBadges() ?? []
-        if source?.subtitleTracks.contains(where: { $0.isHearingImpaired }) ?? false { badges.append("SDH") }
-        if source?.audioTracks.contains(where: { ($0.title ?? $0.extendedTitle ?? "").localizedCaseInsensitiveContains("descri") }) ?? false { badges.append("AD") }
-        for raw in badges {
-            let text = raw.replacingOccurrences(of: "\\([^)]*\\)", with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
-            if !text.isEmpty { row.addArrangedSubview(badgeLabel(text)) }
+        // The detail page's badges, so the two rows match.
+        for text in detail.primarySource?.detailBadges ?? [] {
+            row.addArrangedSubview(badgeLabel(text, filled: MediaSource.filledBadges.contains(text)))
         }
         let spacer = UIView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -426,16 +468,17 @@ enum InfoPopupContent {
         return row
     }
 
-    private static func badgeLabel(_ text: String) -> UIView {
+    private static func badgeLabel(_ text: String, filled: Bool = false) -> UIView {
         let l = UILabel()
         l.text = text
         l.font = .systemFont(ofSize: 16, weight: .semibold)
-        l.textColor = .white.withAlphaComponent(0.9)
+        l.textColor = filled ? .black : .white.withAlphaComponent(0.9)
         l.translatesAutoresizingMaskIntoConstraints = false
         let container = UIView()
-        container.layer.borderWidth = 1
+        container.layer.borderWidth = filled ? 0 : 1
         container.layer.borderColor = UIColor.white.withAlphaComponent(0.35).cgColor
-        container.layer.cornerRadius = 4
+        container.layer.cornerRadius = 5
+        container.backgroundColor = filled ? .white.withAlphaComponent(0.9) : .clear
         container.addSubview(l)
         NSLayoutConstraint.activate([
             l.topAnchor.constraint(equalTo: container.topAnchor, constant: 3),
@@ -515,16 +558,18 @@ enum InfoPopupContent {
         return l
     }
 
-    /// What's New: title, version, bullets and a Done pill that only shows Select (the card
+    /// What's New: title, each version with its bullets, and a Done pill that only shows Select (the card
     /// holds focus). Present content-sized.
-    static func changelog(version: String, features: [String]) -> UIView {
+    static func changelog(_ entries: [(version: String, features: [String])]) -> UIView {
         let stack = verticalStack(spacing: 8)
         stack.addArrangedSubview(label(String(localized: "What's New"), size: 44, weight: .bold, color: .white, lines: 1))
-        let ver = label(String(localized: "Version \(version)"), size: 22, weight: .regular, color: .white.withAlphaComponent(0.5), lines: 1)
-        stack.addArrangedSubview(ver)
-        stack.setCustomSpacing(24, after: ver)
-
-        addChangelogLines(features, to: stack, after: ver)
+        for (i, entry) in entries.enumerated() {
+            if i > 0, let last = stack.arrangedSubviews.last { stack.setCustomSpacing(40, after: last) }
+            let ver = label(String(localized: "Version \(entry.version)"), size: 22, weight: .regular, color: .white.withAlphaComponent(0.5), lines: 1)
+            stack.addArrangedSubview(ver)
+            stack.setCustomSpacing(24, after: ver)
+            addChangelogLines(entry.features, to: stack, after: ver)
+        }
 
         let done = label(String(localized: "Done"), size: 26, weight: .semibold, color: .black, lines: 1)
         done.textAlignment = .center

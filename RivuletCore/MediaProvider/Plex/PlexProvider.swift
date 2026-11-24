@@ -82,7 +82,7 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     func items(in library: MediaLibrary, sort: SortOption, filter: LibraryFilter, page: Page) async throws -> PagedResult<MediaItem> {
         try await plexCall {
             let result = try await libraryMetadataPage(
-                sectionID: library.id, sort: plexSortString(for: sort), filter: filter,
+                sectionID: library.id, kind: library.kind, sort: plexSortString(for: sort), filter: filter,
                 start: page.offset, size: page.limit, followCollections: includesCollections
             )
             let mapped = result.items.map {
@@ -98,18 +98,21 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     /// One page of a section's raw items; `sort` is a Plex sort key. iOS's library grid reads these too.
     /// `followCollections` applies the library's Collections setting, which only a title sort honors.
     func libraryMetadataPage(
-        sectionID: String, sort: String?, filter: LibraryFilter, start: Int, size: Int, followCollections: Bool
+        sectionID: String, kind: MediaLibrary.LibraryKind, sort: String?, filter: LibraryFilter, start: Int, size: Int, followCollections: Bool
     ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
         try await networkManager.getLibraryItemsWithTotal(
             serverURL: serverURL, authToken: authToken, sectionId: sectionID, start: start, size: size, sort: sort,
-            followCollectionMode: followCollections, filters: Self.filterQuery(filter)
+            followCollectionMode: followCollections, filters: Self.filterQuery(filter, showLibrary: kind == .shows)
         )
     }
 
-    /// `/all`'s `unwatched`, `genre` (tag id) and `decade` (first year) parameters.
-    nonisolated static func filterQuery(_ filter: LibraryFilter) -> [URLQueryItem] {
+    /// `/all`'s unwatched, `genre` (tag id) and `decade` (first year) parameters. A show's `unwatched`
+    /// reads the show's own view count, so a show marked watched elsewhere passes; `unwatchedLeaves` counts episodes (#673).
+    nonisolated static func filterQuery(_ filter: LibraryFilter, showLibrary: Bool) -> [URLQueryItem] {
         var query: [URLQueryItem] = []
-        if filter.unwatchedOnly { query.append(URLQueryItem(name: "unwatched", value: "1")) }
+        if filter.unwatchedOnly {
+            query.append(URLQueryItem(name: showLibrary ? "unwatchedLeaves" : "unwatched", value: "1"))
+        }
         if let genre = filter.genre { query.append(URLQueryItem(name: "genre", value: genre.id)) }
         if let decade = filter.decade { query.append(URLQueryItem(name: "decade", value: "\(decade)")) }
         return query
@@ -411,6 +414,16 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
         }
     }
 
+    func promotedHubs(in libraries: [MediaLibrary]) async throws -> [String: [MediaHub]] {
+        try await plexCall {
+            try await networkManager.getPromotedHubs(
+                serverURL: serverURL, authToken: authToken, sectionIDs: libraries.map(\.id)
+            ).mapValues { hubs in
+                hubs.map { PlexMediaMapper.hub($0, providerID: id, serverURL: serverURL, authToken: authToken) }
+            }
+        }
+    }
+
     /// The library's own Recently Added hub, re-keyed to the id Home looks up.
     func recentlyAddedHub(in library: MediaLibrary) async throws -> MediaHub? {
         guard let hub = try await hubs(in: library).first(where: { $0.id.lowercased().contains("recentlyadded") }),
@@ -625,9 +638,12 @@ final class PlexProvider: MediaProvider, @unchecked Sendable {
     private let deletionAllowed = OSAllocatedUnfairLock<Bool?>(initialState: nil)
 
     /// Owner only, and only with the server's "Allow media deletion" on.
+    /// A read the server never answered is not kept, so it is asked again (#561).
     func canDeleteMedia() async -> Bool {
         if let known = deletionAllowed.withLock({ $0 }) { return known }
-        let answer = await networkManager.canDeleteMedia(serverURL: serverURL, authToken: authToken)
+        guard let answer = await networkManager.canDeleteMedia(serverURL: serverURL, authToken: authToken) else {
+            return false
+        }
         deletionAllowed.withLock { $0 = answer }
         return answer
     }

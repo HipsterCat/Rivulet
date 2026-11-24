@@ -20,7 +20,7 @@ final class PlayerRailView: UIView {
     /// Inset of the scrub bar and the pill row from the screen edges.
     static let sideInset: CGFloat = 80
 
-    private enum Metrics {
+    enum Metrics {
         static let titleLeading: CGFloat = 84
         static let subtitleTop: CGFloat = 18
         static let titleTop: CGFloat = 62
@@ -41,12 +41,20 @@ final class PlayerRailView: UIView {
     let audioButton = TransportControlButton(
         icon: UIImage(systemName: "waveform"), accessibilityLabel: String(localized: "Audio"),
         diameter: Metrics.toolDiameter)
+    /// VOD only: playback speed for this item.
+    let speedButton = TransportControlButton(
+        icon: UIImage(systemName: "gauge.with.dots.needle.67percent"), accessibilityLabel: String(localized: "Speed"),
+        diameter: Metrics.toolDiameter)
     let filterButton = TransportControlButton(
         icon: UIImage(systemName: "hand.raised"), accessibilityLabel: String(localized: "Content Filter"),
         diameter: Metrics.toolDiameter)
     /// VOD only: streaming quality for this session.
     let qualityButton = TransportControlButton(
         icon: UIImage(systemName: "dial.medium"), accessibilityLabel: String(localized: "Quality"),
+        diameter: Metrics.toolDiameter)
+    /// VOD only, once a relay is configured: the room menu.
+    let watchTogetherButton = TransportControlButton(
+        icon: UIImage(systemName: "person.2"), accessibilityLabel: String(localized: "Watch Together"),
         diameter: Metrics.toolDiameter)
     /// Live TV only: shown while the viewer is behind the live edge.
     let goLiveButton = TransportControlButton(
@@ -84,6 +92,7 @@ final class PlayerRailView: UIView {
     private let noteLabel = UILabel()
     private var noteHide: DispatchWorkItem?
     var onAudio: (() -> Void)?
+    var onSpeed: (() -> Void)?
     var onInfo: (() -> Void)?
     var onChapters: (() -> Void)?
     var onScores: (() -> Void)?
@@ -94,12 +103,12 @@ final class PlayerRailView: UIView {
     var onUpNext: (() -> Void)?
     var onFilter: (() -> Void)?
     var onQuality: (() -> Void)?
+    var onWatchTogether: (() -> Void)?
     var onGoLive: (() -> Void)?
     var onRecord: (() -> Void)?
     var onMultiview: (() -> Void)?
 
-    private let subtitleLabel = UILabel()
-    private let titleLabel = UILabel()
+    private let (subtitleLabel, titleLabel) = PlayerRailView.makeTitleLabels()
     private let toolRow = UIStackView()
     /// Holds the tool row's room for the host's skip pill while the controls are up (#556).
     /// The pill is the host's view, laid over this; the slot itself draws nothing.
@@ -114,14 +123,6 @@ final class PlayerRailView: UIView {
     init() {
         super.init(frame: .zero)
 
-        // AVKit's title block: a 25pt medium line over a 57pt bold title, each
-        // with a soft wide shadow.
-        subtitleLabel.font = .systemFont(ofSize: 25, weight: .medium)
-        subtitleLabel.textColor = .white
-        titleLabel.font = .systemFont(ofSize: 57, weight: .bold)
-        titleLabel.textColor = .white
-        applyChromeTextShadow([subtitleLabel, titleLabel])
-
         // Up from the video lands on the leftmost tool, so the rarely used ones
         // (Content Filter, then Quality) sit right of Subtitles/Audio.
         toolRow.axis = .horizontal
@@ -129,7 +130,8 @@ final class PlayerRailView: UIView {
         toolRow.alignment = .center
         skipPillSlot.isHidden = true
         skipPillSlot.isUserInteractionEnabled = false
-        [skipPillSlot, multiviewButton, recordButton, goLiveButton, subtitlesButton, audioButton, filterButton, qualityButton].forEach {
+        [skipPillSlot, multiviewButton, recordButton, goLiveButton, subtitlesButton, audioButton, speedButton, filterButton, qualityButton,
+         watchTogetherButton].forEach {
             toolRow.addArrangedSubview($0)
         }
 
@@ -177,6 +179,7 @@ final class PlayerRailView: UIView {
 
         subtitlesButton.onPress = { [weak self] in self?.onSubtitles?() }
         audioButton.onPress = { [weak self] in self?.onAudio?() }
+        speedButton.onPress = { [weak self] in self?.onSpeed?() }
         infoButton.onPress = { [weak self] in self?.onInfo?() }
         chaptersButton.onPress = { [weak self] in self?.onChapters?() }
         scoresButton.onPress = { [weak self] in self?.onScores?() }
@@ -185,6 +188,7 @@ final class PlayerRailView: UIView {
         upNextButton.onPress = { [weak self] in self?.onUpNext?() }
         filterButton.onPress = { [weak self] in self?.onFilter?() }
         qualityButton.onPress = { [weak self] in self?.onQuality?() }
+        watchTogetherButton.onPress = { [weak self] in self?.onWatchTogether?() }
         goLiveButton.onPress = { [weak self] in self?.onGoLive?() }
         recordButton.onPress = { [weak self] in self?.onRecord?() }
         multiviewButton.onPress = { [weak self] in self?.onMultiview?() }
@@ -197,6 +201,8 @@ final class PlayerRailView: UIView {
         // has no content filter.
         filterButton.isHidden = true
         qualityButton.isHidden = true
+        speedButton.isHidden = true
+        watchTogetherButton.isHidden = true
         // Live TV only, and only in the states that give them meaning.
         goLiveButton.isHidden = true
         recordButton.isHidden = true
@@ -208,9 +214,23 @@ final class PlayerRailView: UIView {
         filterButton.isHidden = !available
     }
 
+    /// Show the Speed menu (VOD only; Live TV never does).
+    func setSpeedAvailable(_ available: Bool) {
+        speedButton.isHidden = !available
+    }
+
     /// Show the Quality menu (VOD only; Live TV never does).
     func setQualityAvailable(_ available: Bool) {
         qualityButton.isHidden = !available
+    }
+
+    func setWatchTogetherAvailable(_ available: Bool) {
+        watchTogetherButton.isHidden = !available
+    }
+
+    /// Filled while this device is in a room.
+    func setWatchTogetherActive(_ active: Bool) {
+        watchTogetherButton.setIcon(UIImage(systemName: active ? "person.2.fill" : "person.2"))
     }
 
     /// Reflect whether the content filter is acting in the toggle glyph
@@ -220,6 +240,17 @@ final class PlayerRailView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// AVKit's title block: a 25pt medium eyebrow over a 57pt bold title, each with a soft wide shadow.
+    static func makeTitleLabels() -> (eyebrow: UILabel, title: UILabel) {
+        let eyebrow = UILabel(), title = UILabel()
+        eyebrow.font = .systemFont(ofSize: 25, weight: .medium)
+        eyebrow.textColor = .white
+        title.font = .systemFont(ofSize: 57, weight: .bold)
+        title.textColor = .white
+        applyChromeTextShadow([eyebrow, title])
+        return (eyebrow, title)
+    }
 
     // MARK: - Content
 
@@ -355,32 +386,14 @@ final class PlayerRailView: UIView {
         if available { defaultFocusButton = multiviewButton }
     }
 
-    // MARK: - Ambient pause
-
-    /// During ambient pause the controls fade out, but for a show the episode
-    /// `titleLabel` stays exactly where it is (same place, same size). The
-    /// container holds the rail's own alpha at 1 while ambient so this held
-    /// title can show through. `keepTitle` is false for movies (logo only).
-    ///
-    /// `ambientState` lets the container detect a real change (the sub-view
-    /// alpha shifts here aren't visible to its own top-level `targets` diff).
-    private(set) var ambientState: (ambient: Bool, keepTitle: Bool) = (false, false)
-
-    func setAmbient(_ ambient: Bool, keepTitle: Bool) {
-        ambientState = (ambient, keepTitle)
-        applyAlphas()
-    }
-
     private var isPaneOpen = false
 
-    /// One writer for the sub-view alphas ambient pause and the info pane share.
+    /// One writer for the sub-view alphas the info pane fades.
     private func applyAlphas() {
-        let ambient = ambientState.ambient
-        let chrome: CGFloat = ambient || isPaneOpen ? 0 : 1
+        let chrome: CGFloat = isPaneOpen ? 0 : 1
         subtitleLabel.alpha = chrome
         toolRow.alpha = chrome
-        pillRow.alpha = ambient ? 0 : 1
-        titleLabel.alpha = ambient ? (ambientState.keepTitle ? 1 : 0) : chrome
+        titleLabel.alpha = chrome
     }
 
     // MARK: - Focus
@@ -473,6 +486,7 @@ final class PlayerInfoPillButton: UIControl {
     private enum Metrics {
         static let focusGrowth: CGFloat = 4
     }
+    static let regularHeight: CGFloat = 64
     private let height: CGFloat
 
     var onPress: (() -> Void)?
@@ -486,7 +500,7 @@ final class PlayerInfoPillButton: UIControl {
 
     /// `compact` is the smaller pill Insights' sub-tabs use, so they read as a second level.
     init(title: String, compact: Bool = false) {
-        height = compact ? 52 : 64
+        height = compact ? 52 : Self.regularHeight
         let padding: CGFloat = compact ? 24 : 30
         super.init(frame: .zero)
         accessibilityLabel = title

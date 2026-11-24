@@ -25,6 +25,9 @@ protocol IOSPlaybackSession: AnyObject {
 /// PiP's restore button re-presents it, and closing PiP ends playback.
 @MainActor
 final class IOSPlaybackController: NSObject, ObservableObject {
+    /// One for the app: the phone's screens and the CarPlay scene start the same player.
+    static let shared = IOSPlaybackController()
+
     @Published var isPresented = false
     @Published private(set) var session: (any IOSPlaybackSession)?
     @Published private(set) var isPictureInPicturePossible = false
@@ -34,7 +37,7 @@ final class IOSPlaybackController: NSObject, ObservableObject {
     /// Why the last play failed, for the host's alert.
     @Published var playbackError: String?
 
-    /// Needed by Plex sessions; the host modifier supplies it.
+    /// Needed by Plex sessions; set at launch, because CarPlay can start the app with no window.
     weak var plex: PlexSession?
 
     /// The engine surface, kept here so it survives the view while PiP runs.
@@ -146,7 +149,6 @@ final class IOSPlaybackController: NSObject, ObservableObject {
 
     private func startNowPlaying() {
         guard let session else { return }
-        let player = session.player
         let defaults = UserDefaults.standard
         let back = Double(defaults.object(forKey: SkipLengthKeys.back) as? Int ?? 10)
         let forward = Double(defaults.object(forKey: SkipLengthKeys.forward) as? Int ?? 30)
@@ -154,10 +156,10 @@ final class IOSPlaybackController: NSObject, ObservableObject {
         nowPlaying.start(
             item,
             commands: IOSNowPlaying.Commands(
-                play: { [weak player] in player?.play() },
-                pause: { [weak player] in player?.pause() },
-                skip: { [weak player] seconds in Task { await player?.skip(by: seconds) } },
-                seek: item.isLive ? nil : { [weak player] time in Task { await player?.seek(to: time) } }
+                play: { [weak self] in self?.session.map(IOSWatchTogether.play) },
+                pause: { [weak self] in self?.session.map(IOSWatchTogether.pause) },
+                skip: { [weak self] seconds in self?.session.map { IOSWatchTogether.skip($0, by: seconds) } },
+                seek: item.isLive ? nil : { [weak self] time in self?.session.map { IOSWatchTogether.seek($0, to: time) } }
             ),
             skipBackward: back,
             skipForward: forward
@@ -226,8 +228,7 @@ extension IOSPlaybackController: AVPictureInPictureControllerDelegate {
 }
 
 extension View {
-    /// Applied once at the app root, inside the `PlexSession` environment:
-    /// presents the controller's player full screen.
+    /// Applied once at the app root: presents the controller's player full screen.
     func iosPlaybackHost(_ controller: IOSPlaybackController) -> some View {
         modifier(IOSPlaybackHost(controller: controller))
     }
@@ -235,12 +236,10 @@ extension View {
 
 private struct IOSPlaybackHost: ViewModifier {
     @ObservedObject var controller: IOSPlaybackController
-    @EnvironmentObject private var plex: PlexSession
 
     func body(content: Content) -> some View {
         content
             .environmentObject(controller)
-            .onAppear { controller.plex = plex }
             .alert(
                 "Couldn't Play",
                 isPresented: Binding(get: { controller.playbackError != nil }, set: { if !$0 { controller.playbackError = nil } }),

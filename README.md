@@ -16,6 +16,8 @@ A native Apple TV app for Plex, Jellyfin, Emby, and Live TV.
   <img src="https://img.shields.io/badge/Join_the-TestFlight_Beta-0D96F6?style=for-the-badge&logo=apple&logoColor=white" alt="Join the TestFlight Beta">
 </a>
 
+<sub>The public TestFlight link is capped at 2,200 testers. The App Store release will be updated more frequently going forward.</sub>
+
 </div>
 
 ---
@@ -35,7 +37,7 @@ A native Apple TV app for Plex, Jellyfin, Emby, and Live TV.
 
 ---
 
-<br></br>
+<br></br> 
 
 **Rivulet is built for Apple TV first. I care a lot about its speed, performance, and simplicity in tvOS.**
 
@@ -90,7 +92,7 @@ Playback runs on [AetherEngine](https://github.com/superuser404notfound/AetherEn
 
 - **Containers**: MKV, MP4, WebM, MPEG-TS, AVI, WMV, OGG, FLV, and more.
 - **Video**: H.264 and HEVC (including 10-bit) decode in hardware. AV1, VP9, MPEG-2, VC-1, MPEG-4 Part 2, and almost anything else FFmpeg can decode play in software. Interlaced broadcasts are deinterlaced on the GPU.
-- **HDR**: HDR10, HDR10+, HLG, and Dolby Vision profiles 5, 8.1, and 8.4. On a Dolby Vision TV, Profile 7 plays as 8.1. Without one, it plays its HDR10 base layer.
+- **HDR**: HDR10, HDR10+, HLG, and Dolby Vision profiles 5, 8.1, and 8.4. On a Dolby Vision TV, Profile 7 plays as 8.1, and a FEL title keeps most of its enhancement layer's picture. Without one, it plays its HDR10 base layer.
 - **Audio**: Apple TV can't bitstream audio, so everything goes through tvOS. AAC, AC3, E-AC3, FLAC, and ALAC are handed to tvOS as-is, and it outputs them the same way it does in Apple's own apps. Atmos in E-AC3 reaches an Atmos receiver as Dolby MAT, and everything else goes out as multichannel PCM or Dolby Digital, depending on your Apple TV audio settings. TrueHD, DTS, DTS-HD MA, Opus, Vorbis, and PCM are decoded by Rivulet first and reach tvOS as lossless multichannel audio. TrueHD and DTS-HD MA stay lossless at up to 7.1, but your receiver will show PCM instead of the original format.
 - **Subtitles**: SRT, ASS/SSA, and WebVTT, plus image subtitles (PGS, DVB, DVD/VobSub), CEA-608 closed captions, DVB teletext, and external subtitle files from your server. ASS/SSA renders through libass with its original styling and embedded fonts.
 - **Stream quality**: direct play by default, or pick a transcode quality when bandwidth is tight.
@@ -156,6 +158,8 @@ Found a bug? [Open an issue](../../issues/new/choose) and pick the platform (tvO
 I welcome all contributions from any level of developer. I welcome contributions from LLMs too as long as they are checked and tested.
 
 **If you do contribute, please build and test on an actual Apple TV. The simulator is close, but does not mimic the Apple TV fully.**
+
+**Ask before opening a UI PR.** Rivulet's interface is deliberate. It mostly follows the Apple TV app, and where it departs from it, that is a choice I made on purpose. Before changing how a screen looks or behaves, open an issue or start a discussion so we can agree on the direction first. Bug fixes don't need this.
 
 By submitting a pull request, you agree to license your contribution under the same terms as Rivulet (PolyForm Noncommercial 1.0.0, see [LICENSE](LICENSE)).
 <br></br>

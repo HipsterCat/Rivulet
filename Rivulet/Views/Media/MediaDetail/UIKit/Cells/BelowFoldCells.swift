@@ -43,6 +43,24 @@ final class EpisodeCollectionCell: UICollectionViewCell {
         episodeView.configure(episode: episode, showSeasonPrefix: showSeasonPrefix)
     }
 
+    func configure(searchResult item: MediaItem) {
+        isSearchTile = true
+        episodeView.configure(searchResult: item)
+    }
+
+    /// Search's row focuses this cell as one target; the detail rail focuses the card's parts.
+    private var isSearchTile = false
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        guard isSearchTile else { return }
+        episodeView.setWholeCardFocused(context.nextFocusedView === self, coordinator: coordinator)
+    }
+
+    /// Search's row tile: the rail's card with its description, as tall as the rail's.
+    static let searchTile = MediaRowMetrics.Tile(
+        art: CGSize(width: EpisodeCell.cardWidth, height: EpisodeCell.thumbHeight + EpisodeCell.textBlockHeight), growth: .zero)
+
     /// Trailers render with the SAME episode card so the two rows match exactly.
     func configure(trailer: BelowFoldTrailer) {
         episodeView.configure(trailer: trailer)
@@ -57,6 +75,13 @@ final class EpisodeCollectionCell: UICollectionViewCell {
         onFocusKind = nil
         episodeView.resetFocusVisual()
     }
+}
+
+/// The carousel morph flies the thumbnail alone, not the description under it.
+extension EpisodeCollectionCell: PreviewSourceTile {
+    var previewArtworkView: UIView { episodeView.artworkView }
+    var previewCornerRadius: CGFloat { 16 }
+    var previewArtworkLoaded: Bool { episodeView.artworkLoaded }
 }
 
 // MARK: - Season pill
@@ -250,6 +275,10 @@ final class CastCollectionCell: UICollectionViewCell {
         castView.configure(person: person, fallbackSubtitle: fallbackSubtitle)
     }
 
+    func configure(name: String, subtitle: String?, imageURL: URL?) {
+        castView.configure(name: name, subtitle: subtitle, imageURL: imageURL)
+    }
+
     override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
         let focused = isSelfFocused(context)
         coordinator.addCoordinatedAnimations { [weak self] in self?.castView.setFocused(focused) }
@@ -276,7 +305,7 @@ final class BelowFoldSectionHeader: UICollectionReusableView {
         super.init(frame: frame)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = MediaRowMetrics.headerFont
-        titleLabel.textColor = MediaRowMetrics.headerColor
+        titleLabel.textColor = MediaRowMetrics.pageHeaderColor
         addSubview(titleLabel)
         baselineConstraint = titleLabel.lastBaselineAnchor.constraint(equalTo: bottomAnchor, constant: -Self.cardBaseline)
         NSLayoutConstraint.activate([
@@ -291,6 +320,22 @@ final class BelowFoldSectionHeader: UICollectionReusableView {
     func configure(title: String, baseline: CGFloat = BelowFoldSectionHeader.cardBaseline) {
         titleLabel.text = title
         baselineConstraint.constant = -baseline
+    }
+
+    /// The title's text, not the label's full width.
+    var textFrame: CGRect {
+        CGRect(origin: titleLabel.frame.origin,
+               size: CGSize(width: titleLabel.intrinsicContentSize.width, height: titleLabel.frame.height))
+    }
+
+    /// How far the title sits above its rest, over a focused card (`BelowFoldCollectionView.updateHeaderLift`).
+    var lift: CGFloat = 0 {
+        didSet { titleLabel.transform = CGAffineTransform(translationX: 0, y: -lift) }
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        lift = 0
     }
 }
 
