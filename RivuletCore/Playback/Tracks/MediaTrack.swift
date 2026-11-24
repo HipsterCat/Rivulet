@@ -101,7 +101,7 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
     /// Creates a MediaTrack from a PlexStream
     init(from stream: PlexStream) {
         self.id = stream.id
-        self.name = stream.displayTitle ?? stream.title ?? stream.language ?? "Track \(stream.id)"
+        self.name = stream.displayTitle ?? stream.title ?? stream.language ?? String(localized: "Track \(stream.id)")
         self.language = stream.language
         self.languageCode = stream.languageCode
         self.codec = stream.codec
@@ -125,7 +125,7 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
     /// won't survive this bridge, but Plex/Jellyfin both use numeric IDs.
     init(from track: AudioTrack) {
         self.id = Int(track.id) ?? 0
-        self.name = track.title ?? track.language ?? "Track \(track.id)"
+        self.name = track.title ?? track.language ?? String(localized: "Track \(track.id)")
         self.language = track.language
         self.languageCode = track.language
         self.codec = track.codec
@@ -146,7 +146,7 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
     /// Bridge from agnostic `SubtitleTrack`.
     init(from track: SubtitleTrack) {
         self.id = Int(track.id) ?? 0
-        self.name = track.title ?? track.language ?? "Track \(track.id)"
+        self.name = track.title ?? track.language ?? String(localized: "Track \(track.id)")
         self.language = track.language
         self.languageCode = track.language
         self.codec = track.codec
@@ -191,29 +191,44 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
                    samplingRate: nil, isDefault: false, isForced: false, isSelected: false).qualityLabel
     }
 
-    /// "Commentary" or "Audio Description", the only thing a track's own title
-    /// adds once language and format are parsed; the title itself is never shown.
+    /// "Commentary" or "Audio Description", from the track's flags and title.
     var audioRole: String? {
         guard TrackCommentary.isCommentaryOrDescription(self) else { return nil }
         let text = [extendedDisplayTitle, name].compactMap { $0?.lowercased() }.joined(separator: " ")
         let described = isAudioDescription
             || ["descri", "narration", "dvs", "impaired"].contains(where: text.contains)
-        return described ? "Audio Description" : "Commentary"
+        return described ? String(localized: "Audio Description") : String(localized: "Commentary")
     }
 
-    /// Audio menu row: the language over "TrueHD 7.1 Atmos • Commentary".
-    var audioMenuTitle: String { language ?? "Unknown Language" }
-    var audioMenuSubtitle: String {
-        [codec == nil ? nil : audioFormat, audioRole].compactMap { $0 }.joined(separator: " • ")
+    var describesVideo: Bool { audioRole == String(localized: "Audio Description") }
+
+    /// Audio menu row: the language over "HDrezka 18+ • AC3 2.0" or "Commentary • TrueHD 7.1 Atmos" (#447).
+    var audioMenuTitle: String { language ?? String(localized: "Unknown Language") }
+    func audioMenuSubtitle(among tracks: [MediaTrack]) -> String {
+        let described = audioDescription(among: tracks)
+        // "Commentary by Sam Mendes" already says what the role would.
+        let role = described?.lowercased().contains("commentary") == true ? nil : audioRole
+        return [role, described, codec == nil ? nil : audioFormat].compactMap { $0 }.joined(separator: " • ")
+    }
+
+    /// The track's title, when it tells this row from another with the same language above it.
+    /// The rest is the uploader's ("BTM", "pahe.li"), and only a commentary's speakers stand alone.
+    private func audioDescription(among tracks: [MediaTrack]) -> String? {
+        func described(_ track: MediaTrack) -> String? {
+            AudioTrackTitle.description(of: track.title, language: track.language, languageCode: track.languageCode)
+        }
+        guard let own = described(self) else { return nil }
+        if language == nil || own.lowercased().contains("commentary") { return own }
+        return tracks.contains { $0.id != id && $0.language == language && described($0) != own } ? own : nil
     }
 
     /// Subtitle menu row: the language over "Forced • Signs & Songs • ASS" (#447).
     var subtitleMenuTitle: String { language ?? name }
     var subtitleMenuSubtitle: String {
         var flags: [String] = []
-        if isForced { flags.append("Forced") }
+        if isForced { flags.append(String(localized: "Forced")) }
         if isHearingImpaired { flags.append("SDH") }
-        if isCommentary { flags.append("Commentary") }
+        if isCommentary { flags.append(String(localized: "Commentary")) }
         // The track's own title, unless it only repeats the language and the flags.
         var leftover = title?.lowercased() ?? ""
         for word in [language, languageCode].compactMap({ $0?.lowercased() }) + flags.map({ $0.lowercased() }) {
@@ -225,7 +240,7 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
 
     /// Formatted codec name (e.g., "AAC", "TrueHD", "DTS-HD MA")
     var formattedCodec: String {
-        guard let codec = codec?.lowercased() else { return "Audio" }
+        guard let codec = codec?.lowercased() else { return String(localized: "Audio") }
 
         switch codec {
         case "aac": return "AAC"
@@ -301,8 +316,8 @@ nonisolated struct MediaTrack: Identifiable, Equatable, Sendable {
         guard let channels = inferredChannels else { return "" }
 
         switch channels {
-        case 1: return "Mono"
-        case 2: return "Stereo"
+        case 1: return String(localized: "Mono")
+        case 2: return String(localized: "Stereo")
         case 3: return "2.1"
         case 6: return "5.1"
         case 8: return "7.1"

@@ -29,9 +29,13 @@ final class IOSPlaybackController: NSObject, ObservableObject {
     @Published private(set) var session: (any IOSPlaybackSession)?
     @Published private(set) var isPictureInPicturePossible = false
     @Published private(set) var isPictureInPictureActive = false
+    /// True while a play is preparing; a second press in that window is ignored.
+    @Published private(set) var isPreparing = false
+    /// Why the last play failed, for the host's alert.
+    @Published var playbackError: String?
 
     /// Needed by Plex sessions; the host modifier supplies it.
-    weak var plex: IOSPlexSession?
+    weak var plex: PlexSession?
 
     /// The engine surface, kept here so it survives the view while PiP runs.
     private(set) var surface: UIView?
@@ -44,10 +48,12 @@ final class IOSPlaybackController: NSObject, ObservableObject {
     // MARK: - Caller API
 
     /// Plays a Plex item full screen; a playlist's `queue` replaces Up Next.
-    func play(_ request: IOSPlexPlaybackRequest, queue: PlayQueue<PlexMetadata>? = nil) {
+    func play(_ request: PlexPlaybackRequest, queue: PlayQueue<PlexMetadata>? = nil) {
         guard let plex else { return }
         start(IOSPlexPlayback(request: request, plex: plex, queue: queue))
     }
+
+    func setPreparing(_ preparing: Bool) { isPreparing = preparing }
 
     func start(_ newSession: any IOSPlaybackSession) {
         end()
@@ -142,8 +148,8 @@ final class IOSPlaybackController: NSObject, ObservableObject {
         guard let session else { return }
         let player = session.player
         let defaults = UserDefaults.standard
-        let back = Double(defaults.object(forKey: "playerSkipBackwardSeconds") as? Int ?? 10)
-        let forward = Double(defaults.object(forKey: "playerSkipForwardSeconds") as? Int ?? 30)
+        let back = Double(defaults.object(forKey: SkipLengthKeys.back) as? Int ?? 10)
+        let forward = Double(defaults.object(forKey: SkipLengthKeys.forward) as? Int ?? 30)
         let item = session.nowPlayingItem
         nowPlaying.start(
             item,
@@ -220,7 +226,7 @@ extension IOSPlaybackController: AVPictureInPictureControllerDelegate {
 }
 
 extension View {
-    /// Applied once at the app root, inside the `IOSPlexSession` environment:
+    /// Applied once at the app root, inside the `PlexSession` environment:
     /// presents the controller's player full screen.
     func iosPlaybackHost(_ controller: IOSPlaybackController) -> some View {
         modifier(IOSPlaybackHost(controller: controller))
@@ -229,12 +235,18 @@ extension View {
 
 private struct IOSPlaybackHost: ViewModifier {
     @ObservedObject var controller: IOSPlaybackController
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
 
     func body(content: Content) -> some View {
         content
             .environmentObject(controller)
             .onAppear { controller.plex = plex }
+            .alert(
+                "Couldn't Play",
+                isPresented: Binding(get: { controller.playbackError != nil }, set: { if !$0 { controller.playbackError = nil } }),
+                actions: { Button("OK") {} },
+                message: { Text(controller.playbackError ?? "") }
+            )
             .fullScreenCover(isPresented: $controller.isPresented, onDismiss: controller.presentationDismissed) {
                 if let session = controller.session {
                     session.screen(controller)

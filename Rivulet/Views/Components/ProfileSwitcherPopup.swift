@@ -30,21 +30,25 @@ struct ProfileSwitcherPopup: View {
     ]
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            // Popup card — positioned top-left directly below sidebar pill
-            LazyVGrid(columns: columns, spacing: 10) {
-                ForEach(profileManager.homeUsers) { user in
-                    profileButton(for: user)
-                        .focused($focusedUserId, equals: user.id)
+        GeometryReader { proxy in
+            // Popup card — positioned top-left directly below sidebar pill. It hugs
+            // its rows and scrolls past the screen: Plex Home allows 15 profiles.
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 10) {
+                    ForEach(profileManager.homeUsers) { user in
+                        profileButton(for: user)
+                            .focused($focusedUserId, equals: user.id)
+                    }
                 }
+                .padding(EdgeInsets(top: 14, leading: 14, bottom: 34, trailing: 14))
             }
-            .padding(EdgeInsets(top: 14, leading: 14, bottom: 34, trailing: 14))
             .frame(width: 384)
+            .frame(maxHeight: max(0, proxy.size.height - 70 - 40))
+            .fixedSize(horizontal: false, vertical: true)
+            .clipShape(.rect(cornerRadius: 50))
             .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 50))
             .padding(.top, 70)
-            .padding(.leading, 0)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             focusedUserId = profileManager.selectedUser?.id ?? profileManager.homeUsers.first?.id
         }
@@ -198,7 +202,7 @@ struct ProfileSwitcherPopup: View {
                         isPresented = false
                     } else {
                         isLoading = false
-                        pinEntryError = pinWasInvalid ? "Saved PIN is no longer valid. Please enter your PIN." : nil
+                        pinEntryError = pinWasInvalid ? String(localized: "Saved PIN is no longer valid. Please enter your PIN.") : nil
                         showPinEntry = true
                     }
                 }
@@ -236,7 +240,7 @@ struct ProfileSwitcherPopup: View {
             selectedUserForPin = nil
             isPresented = false
         } else {
-            pinEntryError = "Incorrect PIN. Please try again."
+            pinEntryError = String(localized: "Incorrect PIN. Please try again.")
         }
 
         isLoading = false

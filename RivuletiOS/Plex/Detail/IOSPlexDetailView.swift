@@ -1,32 +1,29 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
+import Combine
 import SwiftUI
 
 /// Movie, show, season or episode page in the TV app's layout: full-bleed
 /// art under a transparent bar, actions, episodes, then related rows.
 struct IOSPlexDetailView: View {
-    let item: PlexMetadata
-    @EnvironmentObject private var plex: IOSPlexSession
+    let item: MediaItem
+    @EnvironmentObject private var browse: BrowseStore
     @Environment(\.plexActions) private var actions
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @ObservedObject private var watchlist = PlexWatchlistService.shared
 
-    @State private var full: PlexMetadata?
-    @State private var seasons: [PlexMetadata] = []
-    @State private var seasonKey: String?
-    @State private var episodes: [PlexMetadata] = []
-    @State private var episodesSeasonKey: String?
-    @State private var related: [PlexMetadata] = []
+    @State private var detail: MediaItemDetail?
+    @State private var seasons: [MediaItem] = []
+    @State private var seasonKey: MediaItemRef?
+    @State private var episodes: [MediaItem] = []
+    @State private var episodesSeasonKey: MediaItemRef?
+    @State private var related: [MediaItem] = []
     @State private var error: String?
     @State private var loadedRevision: Int?
     @State private var summaryExpanded = false
-    /// PlexMetadata's == compares only ratingKey, so SwiftUI keeps children built from the
-    /// stub item; a new identity per load makes them read the loaded one.
-    @State private var loadCount = 0
 
-    private var shown: PlexMetadata { full ?? item }
-    private var isSeries: Bool { shown.type == "show" || shown.type == "season" }
+    private var shown: MediaItem { detail?.item ?? item }
+    private var isSeries: Bool { shown.kind == .show || shown.kind == .season }
     private var regular: Bool { sizeClass == .regular }
 
     var body: some View {
@@ -35,32 +32,32 @@ struct IOSPlexDetailView: View {
                 VStack(alignment: .leading, spacing: 28) {
                     IOSPlexDetailHeader(
                         item: shown,
+                        detail: detail,
                         playTarget: playTarget,
-                        isLoading: full == nil && error == nil,
+                        isLoading: detail == nil && error == nil,
                         size: CGSize(width: proxy.size.width, height: proxy.size.height + proxy.safeAreaInsets.top)
                     )
-                    if full == nil, let error {
+                    if detail == nil, let error {
                         IOSPlexErrorView(title: "Couldn't Load", message: error) { await load() }
                     } else {
                         sections(leading: IOSShelfGeometry.leading)
                     }
                 }
-                .id(loadCount)
                 .padding(.bottom, 32)
             }
             .ignoresSafeArea(edges: .top)
             .refreshable { await load() }
         }
         // The page is dark in both modes, like the header art it continues.
-        .background(.black)
+        .iosPlexAmbient(shown)
         .environment(\.colorScheme, .dark)
         .toolbarColorScheme(.dark, for: .navigationBar)
         .navigationTitle(shown.showTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(removing: .title)
         .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
-        .task(id: plex.watchStateRevision) {
-            guard loadedRevision != plex.watchStateRevision else { return }
+        .task(id: browse.watchStateRevision) {
+            guard loadedRevision != browse.watchStateRevision else { return }
             await load()
         }
         .task(id: seasonKey) { await loadEpisodes() }
@@ -74,25 +71,29 @@ struct IOSPlexDetailView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, leading)
         }
-        if let summary = shown.summary, !summary.isEmpty {
+        if let episode = playTarget.flatMap({
+            EpisodePicker.episodeDescription(for: $0, overview: nil, on: shown.kind)
+        }) {
+            summaryView(episode.body, prefix: episode.prefix).padding(.horizontal, leading)
+        } else if let summary = shown.overview, !summary.isEmpty {
             summaryView(summary).padding(.horizontal, leading)
         }
         if isSeries {
             episodesSection(leading: leading)
         }
-        IOSPlexCastRow(item: shown)
+        IOSPlexExtrasRow(detail: detail)
         if !related.isEmpty {
-            IOSPlexRail(title: "More Like This", kind: .poster, items: related) {
+            IOSPlexRail(title: String(localized: "More Like This"), kind: .poster, items: related) {
                 IOSPlexPosterCard(item: $0, width: $1)
             }
         }
-        IOSPlexExtrasRow(item: shown)
-        IOSPlexInformationSection(item: shown).padding(.horizontal, leading)
+        IOSPlexCastRow(item: shown, detail: detail)
+        IOSPlexInformationSection(item: shown, detail: detail).padding(.horizontal, leading)
     }
 
-    private func summaryView(_ summary: String) -> some View {
+    private func summaryView(_ summary: String, prefix: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(summary)
+            (Text(verbatim: prefix.map { $0 + " " } ?? "").bold() + Text(verbatim: summary))
                 .font(.body)
                 .lineLimit(summaryExpanded ? nil : 3)
             if summary.count > 160 {
@@ -107,14 +108,14 @@ struct IOSPlexDetailView: View {
 
     // MARK: - Episodes
 
-    private var currentSeason: PlexMetadata? { seasons.first { $0.ratingKey == seasonKey } }
+    private var currentSeason: MediaItem? { seasons.first { $0.ref == seasonKey } }
 
     /// Highlighted only when there is something left to watch in this season.
-    private var nextUpID: String? {
-        if let onDeck = full?.OnDeck?.Metadata?.first, episodes.contains(where: { $0.id == onDeck.id }) {
-            return onDeck.id
+    private var nextUpID: MediaItemRef? {
+        if let next = detail?.nextEpisode, episodes.contains(where: { $0.id == next.id }) {
+            return next.id
         }
-        return (episodes.first(where: \.isInProgress) ?? episodes.first(where: { !$0.isWatched }))?.id
+        return (episodes.first(where: \.isInProgress) ?? episodes.first(where: { !$0.countsAsWatched }))?.id
     }
 
     private func episodesSection(leading: CGFloat) -> some View {
@@ -142,15 +143,15 @@ struct IOSPlexDetailView: View {
     /// The season menu: switch seasons, or download the one showing.
     @ViewBuilder
     private var seasonPicker: some View {
-        let title = currentSeason.map(seasonLabel) ?? "Episodes"
-        if seasons.count > 1 || (currentSeason != nil && plex.isConfigured) {
+        let title = currentSeason.map(seasonLabel) ?? String(localized: "Episodes")
+        if seasons.count > 1 || (currentSeason != nil && canDownload) {
             Menu {
                 if seasons.count > 1 {
                     Picker("Season", selection: $seasonKey) {
-                        ForEach(seasons) { Text(seasonLabel($0)).tag($0.ratingKey) }
+                        ForEach(seasons) { Text(seasonLabel($0)).tag(Optional($0.ref)) }
                     }
                 }
-                if let season = currentSeason, plex.isConfigured {
+                if let season = currentSeason, canDownload {
                     Section {
                         Button("Download Season", systemImage: "arrow.down.circle") { actions.download(season) }
                     }
@@ -168,55 +169,57 @@ struct IOSPlexDetailView: View {
         }
     }
 
-    private func seasonLabel(_ season: PlexMetadata) -> String {
-        guard let index = season.index else { return season.displayTitle }
-        return index == 0 ? "Specials" : "Season \(index)"
+    private var canDownload: Bool { browse.canDownload(item) }
+
+    private func seasonLabel(_ season: MediaItem) -> String {
+        guard let index = season.seasonNumber else { return season.displayTitle }
+        return index == 0 ? String(localized: "Specials") : String(localized: "Season \(index)")
     }
 
     // MARK: - Play target
 
     /// Movies and episodes play themselves; a show plays On Deck, then the
     /// next episode of the loaded season.
-    private var playTarget: PlexMetadata? {
+    private var playTarget: MediaItem? {
         if shown.isPlayable { return shown }
-        if shown.type == "show", let onDeck = full?.OnDeck?.Metadata?.first { return onDeck }
+        if shown.kind == .show, let next = detail?.nextEpisode { return next }
         guard episodesSeasonKey != nil else { return nil }
-        return IOSPlexSession.nextUp(in: episodes)
+        return MediaItem.nextUp(in: episodes)
     }
 
     // MARK: - Loading
 
     private func load() async {
         do {
-            let loaded = try await plex.metadata(for: item)
-            full = loaded
+            let provider = try browse.provider(for: item.ref)
+            let loaded = try await provider.fullDetail(for: item.ref)
+            detail = loaded
             error = nil
-            switch loaded.type {
-            case "show":
-                seasons = try await plex.children(of: loaded)
-                let keep = seasons.contains { $0.ratingKey == seasonKey }
+            switch loaded.item.kind {
+            case .show:
+                seasons = try await provider.children(of: loaded.item.ref).filter { $0.kind == .season }.sortedByNumber()
+                let keep = seasons.contains { $0.ref == seasonKey }
                 await selectSeason(keep ? seasonKey : initialSeasonKey(show: loaded))
-            case "season":
-                seasons = [loaded]
-                await selectSeason(loaded.ratingKey)
+            case .season:
+                seasons = [loaded.item]
+                await selectSeason(loaded.item.ref)
             default:
                 break
             }
-            loadedRevision = plex.watchStateRevision
-            loadCount += 1
+            loadedRevision = browse.watchStateRevision
+            if related.isEmpty, loaded.item.kind == .movie || loaded.item.kind == .show {
+                related = (try? await provider.moreLikeThis(for: loaded.item.ref, kind: loaded.item.kind)) ?? []
+            }
         } catch let error where isCancellationError(error) {
             return
         } catch {
             self.error = error.localizedDescription
         }
-        if related.isEmpty, shown.type == "movie" || shown.type == "show" {
-            related = (try? await plex.related(to: shown)) ?? []
-        }
     }
 
     /// Selecting a new season loads it through `.task(id: seasonKey)`; the
     /// same season reloads here so watch state repaints.
-    private func selectSeason(_ key: String?) async {
+    private func selectSeason(_ key: MediaItemRef?) async {
         if key == seasonKey {
             await loadEpisodes(force: true)
         } else {
@@ -224,22 +227,21 @@ struct IOSPlexDetailView: View {
         }
     }
 
-    /// The On Deck episode's season, else the first season with unwatched
+    /// The next episode's season, else the first season with unwatched
     /// episodes, else the first real season.
-    private func initialSeasonKey(show: PlexMetadata) -> String? {
-        if let key = show.OnDeck?.Metadata?.first?.parentRatingKey,
-           seasons.contains(where: { $0.ratingKey == key }) {
+    private func initialSeasonKey(show: MediaItemDetail) -> MediaItemRef? {
+        if let key = show.nextEpisode?.parentRef, seasons.contains(where: { $0.ref == key }) {
             return key
         }
-        let real = seasons.filter { ($0.index ?? 0) > 0 }
-        return (real.first { !$0.isWatched } ?? real.first ?? seasons.first)?.ratingKey
+        let real = seasons.filter { ($0.seasonNumber ?? 0) > 0 }
+        return (real.first { !$0.countsAsWatched } ?? real.first ?? seasons.first)?.ref
     }
 
     private func loadEpisodes(force: Bool = false) async {
         guard let key = seasonKey, force || episodesSeasonKey != key,
-              let season = seasons.first(where: { $0.ratingKey == key }) else { return }
+              let season = seasons.first(where: { $0.ref == key }) else { return }
         do {
-            let loaded = try await plex.children(of: season)
+            let loaded = try await browse.provider(for: season.ref).children(of: season.ref).sortedByNumber()
             guard seasonKey == key else { return }
             episodes = loaded
             episodesSeasonKey = key
@@ -253,14 +255,19 @@ struct IOSPlexDetailView: View {
 // MARK: - Header
 
 private struct IOSPlexDetailHeader: View {
-    let item: PlexMetadata
-    let playTarget: PlexMetadata?
+    let item: MediaItem
+    let detail: MediaItemDetail?
+    let playTarget: MediaItem?
     let isLoading: Bool
     /// Screen size including the area under the navigation bar.
     let size: CGSize
     @Environment(\.plexActions) private var actions
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var browse: BrowseStore
+    /// Asked of the server for the page's title; nil until it answers.
+    @State private var onList: Bool?
+    @State private var onScreen = false
+    @State private var inView = true
 
     private var isWide: Bool { size.width > size.height }
 
@@ -272,7 +279,11 @@ private struct IOSPlexDetailHeader: View {
     var body: some View {
         ZStack(alignment: isWide ? .bottomLeading : .bottom) {
             // The fade is extended with the art, so the strip under a side bar darkens with it.
-            IOSPlexArtwork(item: item, kind: .backdrop, width: size.width, aspectRatio: 16 / 9)
+            IOSItemArtwork(item: item, kind: .backdrop, width: size.width, aspectRatio: 16 / 9)
+                .overlay {
+                    IOSThemeVideoBackdrop(item: item.ref, isActive: onScreen && inView)
+                        .allowsHitTesting(false)
+                }
                 .overlay {
                     LinearGradient(
                         stops: [
@@ -285,19 +296,34 @@ private struct IOSPlexDetailHeader: View {
                     )
                 }
                 .backgroundExtensionEffect()
+                // The art and its scrim fade out into the page's ambient wash.
+                .mask {
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white, location: 0.75),
+                            .init(color: .clear, location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
             titleBlock
                 .frame(maxWidth: isWide ? 560 : .infinity, alignment: isWide ? .leading : .center)
                 .padding(.horizontal, IOSShelfGeometry.leading)
                 .padding(.bottom, 20)
         }
         .frame(height: height)
+        .onAppear { onScreen = true }
+        .onDisappear { onScreen = false }
+        .onScrollVisibilityChange(threshold: 0.3) { inView = $0 }
     }
 
     private var metadataItems: [String] {
-        let date: String? = item.type == "episode"
-            ? item.originallyAvailableAt.flatMap(IOSPlexInformationSection.formattedDate)
+        let date: String? = item.kind == .episode
+            ? item.releaseDate.flatMap(IOSPlexInformationSection.formattedDate)
             : item.year.map(String.init)
-        return [date, item.runtimeText, item.Genre?.prefix(2).compactMap(\.tag).joined(separator: ", ")]
+        let genres = (detail?.genres.nilIfEmpty ?? item.genres)?.prefix(2).joined(separator: ", ")
+        return [date, item.runtimeText, genres]
             .compactMap { $0 }
             .filter { !$0.isEmpty }
     }
@@ -313,7 +339,7 @@ private struct IOSPlexDetailHeader: View {
                 alignment: isWide ? .bottomLeading : .bottom,
                 textAlignment: isWide ? .leading : .center
             )
-            if item.type == "episode" || item.type == "season" {
+            if item.kind == .episode || item.kind == .season {
                 Text([item.episodeCode, item.displayTitle].compactMap { $0 }.joined(separator: " · "))
                     .font(.headline)
                     .foregroundStyle(.white)
@@ -321,7 +347,7 @@ private struct IOSPlexDetailHeader: View {
             }
             HStack(spacing: 8) {
                 Text(metadataItems.joined(separator: " · "))
-                if let rating = item.displayContentRating, !rating.isEmpty {
+                if let rating = detail?.contentRating ?? item.contentRating, !rating.isEmpty {
                     Text(rating).plexPill()
                 }
             }
@@ -332,7 +358,7 @@ private struct IOSPlexDetailHeader: View {
             actionRow.padding(.top, 6)
 
             if let target = playTarget, target.id != item.id, let code = target.episodeCode {
-                Text([code, target.title].compactMap { $0 }.joined(separator: " · "))
+                Text([code, target.title].joined(separator: " · "))
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.75))
                     .lineLimit(1)
@@ -346,20 +372,41 @@ private struct IOSPlexDetailHeader: View {
             ? AnyLayout(VStackLayout(spacing: 12))
             : AnyLayout(HStackLayout(spacing: 12))
         return layout {
-            playButton.layoutPriority(1)
+            // Play shows only where `IOSPlaybackGate` allows it.
+            if canPlay { playButton.layoutPriority(1) }
             HStack(spacing: 12) {
-                if PlexAuthManager.shared.accountContentToken != nil,
-                   ["movie", "show", "season", "episode"].contains(item.type ?? "") {
-                    let onList = plex.isOnWatchlist(item)
+                if canPlay, item.kind == .show {
+                    Button { actions.shuffleShow(item) } label: {
+                        if actions.preparingID == IOSPlexActions.shuffleID(providerID: item.ref.providerID,
+                                                                           itemID: item.ref.itemID) {
+                            ProgressView().frame(width: 22, height: 22)
+                        } else {
+                            Image(systemName: "shuffle").frame(width: 22, height: 22)
+                        }
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .accessibilityLabel("Shuffle")
+                }
+                if browse.supportsWatchlist(item) {
+                    let onList = onList ?? false
                     circleButton(onList ? "checkmark" : "plus", label: onList ? "Remove from Watchlist" : "Add to Watchlist") {
                         actions.setWatchlisted(item, !onList)
                     }
                 }
-                if item.isPlayable {
+                if FavoritesFeed.canFavorite(item) {
+                    let isFavorite = browse.isFavorite(item)
+                    circleButton(isFavorite ? "heart.fill" : "heart",
+                                 label: isFavorite ? "Remove from Favorites" : "Add to Favorites") {
+                        actions.setFavorite(item, !isFavorite)
+                    }
+                }
+                if item.isPlayable, canDownload {
                     IOSDownloadButton(item: item)
                 }
                 Menu {
-                    IOSPlexItemMenu(item: item, showsPlay: false, showsWatchlist: false)
+                    // No Delete: the page would be left showing what it deleted.
+                    IOSPlexItemMenu(item: item, showsPlay: false, showsWatchlist: false, showsFavorite: false, showsDelete: false)
                 } label: {
                     Image(systemName: "ellipsis").frame(width: 22, height: 22)
                 }
@@ -370,6 +417,19 @@ private struct IOSPlexDetailHeader: View {
         }
         .frame(maxWidth: 480)
         .controlSize(.large)
+        .task(id: item.ref) { await loadWatchlistState() }
+        .onReceive(PlexWatchlistService.shared.$watchlistItems.dropFirst()) { _ in
+            Task { await loadWatchlistState() }
+        }
+    }
+
+    private var canPlay: Bool { IOSPlaybackGate.canPlay(item.ref) }
+    private var canDownload: Bool { browse.canDownload(item) }
+
+    /// Plex answers from its watchlist; an episode or season stands for its show.
+    private func loadWatchlistState() async {
+        guard browse.supportsWatchlist(item), let provider = browse.provider(for: item.ref.providerID) else { return }
+        onList = await provider.isOnWatchlist(item.ref)
     }
 
     private var playButton: some View {
@@ -392,7 +452,7 @@ private struct IOSPlexDetailHeader: View {
 
     private func playLabel(bar: Bool, timeLeft: Bool) -> some View {
         HStack(spacing: 8) {
-            if actions.preparingID == playTarget?.id, playTarget != nil {
+            if actions.preparingID == playTarget?.ref.actionKey, playTarget != nil {
                 ProgressView()
             } else {
                 Image(systemName: "play.fill")
@@ -411,7 +471,7 @@ private struct IOSPlexDetailHeader: View {
         }
     }
 
-    private func circleButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+    private func circleButton(_ symbol: String, label: LocalizedStringKey, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol).frame(width: 22, height: 22)
         }

@@ -36,43 +36,43 @@ final class PlayerRailView: UIView {
     }
 
     let subtitlesButton = TransportControlButton(
-        icon: UIImage(systemName: "captions.bubble"), accessibilityLabel: "Subtitles",
+        icon: UIImage(systemName: "captions.bubble"), accessibilityLabel: String(localized: "Subtitles"),
         diameter: Metrics.toolDiameter)
     let audioButton = TransportControlButton(
-        icon: UIImage(systemName: "waveform"), accessibilityLabel: "Audio",
+        icon: UIImage(systemName: "waveform"), accessibilityLabel: String(localized: "Audio"),
         diameter: Metrics.toolDiameter)
     let filterButton = TransportControlButton(
-        icon: UIImage(systemName: "hand.raised"), accessibilityLabel: "Content Filter",
+        icon: UIImage(systemName: "hand.raised"), accessibilityLabel: String(localized: "Content Filter"),
         diameter: Metrics.toolDiameter)
     /// VOD only: streaming quality for this session.
     let qualityButton = TransportControlButton(
-        icon: UIImage(systemName: "dial.medium"), accessibilityLabel: "Quality",
+        icon: UIImage(systemName: "dial.medium"), accessibilityLabel: String(localized: "Quality"),
         diameter: Metrics.toolDiameter)
     /// Live TV only: shown while the viewer is behind the live edge.
     let goLiveButton = TransportControlButton(
-        icon: UIImage(systemName: "forward.end.fill"), accessibilityLabel: "Go to Live",
+        icon: UIImage(systemName: "forward.end.fill"), accessibilityLabel: String(localized: "Go to Live"),
         diameter: Metrics.toolDiameter)
     /// Live TV only: shown when the channel's source can record.
     let recordButton = TransportControlButton(
-        icon: UIImage(systemName: "record.circle"), accessibilityLabel: "Record",
+        icon: UIImage(systemName: "record.circle"), accessibilityLabel: String(localized: "Record"),
         diameter: Metrics.toolDiameter)
     /// Live TV only: opens multiview with this channel in it.
     let multiviewButton = TransportControlButton(
-        icon: UIImage(systemName: "rectangle.split.2x1"), accessibilityLabel: "Multiview",
+        icon: UIImage(systemName: "rectangle.split.2x1"), accessibilityLabel: String(localized: "Multiview"),
         diameter: Metrics.toolDiameter)
 
     // Info pills below the scrub bar, AVKit's place for info tabs: Info and
     // Chapters as in AVKit, then Rivulet's own tabs. Insights goes last so
     // its sub-tabs, right of it, are reached without crossing another pill.
-    let infoButton = PlayerInfoPillButton(title: "Info")
-    let chaptersButton = PlayerInfoPillButton(title: "Chapters")
+    let infoButton = PlayerInfoPillButton(title: String(localized: "Info"))
+    let chaptersButton = PlayerInfoPillButton(title: String(localized: "Chapters"))
     /// Live TV only: shown while the programme on screen is a game.
-    let scoresButton = PlayerInfoPillButton(title: "Scores")
+    let scoresButton = PlayerInfoPillButton(title: String(localized: "Scores"))
     /// "Up Next" on VOD, "Channels" on Live TV.
-    let upNextButton = PlayerInfoPillButton(title: "Up Next")
-    let insightsButton = PlayerInfoPillButton(title: "Insights")
+    let upNextButton = PlayerInfoPillButton(title: String(localized: "Up Next"))
+    let insightsButton = PlayerInfoPillButton(title: String(localized: "Insights"))
     /// Technical media info and live playback stats.
-    let detailsButton = PlayerInfoPillButton(title: "Details")
+    let detailsButton = PlayerInfoPillButton(title: String(localized: "Details"))
 
     var onSubtitles: (() -> Void)?
     /// Holding Subtitles turns them on or off (AVKit).
@@ -101,6 +101,9 @@ final class PlayerRailView: UIView {
     private let subtitleLabel = UILabel()
     private let titleLabel = UILabel()
     private let toolRow = UIStackView()
+    /// Holds the tool row's room for the host's skip pill while the controls are up (#556).
+    /// The pill is the host's view, laid over this; the slot itself draws nothing.
+    let skipPillSlot = UIView()
     private let pillRow = UIStackView()
     /// Insights' sub-tabs, right-aligned on the pill row while its pane is open.
     private let insightsTabRow = UIStackView()
@@ -124,7 +127,9 @@ final class PlayerRailView: UIView {
         toolRow.axis = .horizontal
         toolRow.spacing = Metrics.toolGap
         toolRow.alignment = .center
-        [multiviewButton, recordButton, goLiveButton, subtitlesButton, audioButton, filterButton, qualityButton].forEach {
+        skipPillSlot.isHidden = true
+        skipPillSlot.isUserInteractionEnabled = false
+        [skipPillSlot, multiviewButton, recordButton, goLiveButton, subtitlesButton, audioButton, filterButton, qualityButton].forEach {
             toolRow.addArrangedSubview($0)
         }
 
@@ -252,7 +257,7 @@ final class PlayerRailView: UIView {
     func setChannelListAvailable(_ available: Bool) {
         upNextButton.isHidden = !available
         guard available else { return }
-        upNextButton.setTitle("Channels")
+        upNextButton.setTitle(String(localized: "Channels"))
         defaultFocusButton = upNextButton
     }
 
@@ -339,7 +344,7 @@ final class PlayerRailView: UIView {
     func setRecordState(available: Bool, isRecording: Bool) {
         recordButton.isHidden = !available
         recordButton.setIcon(UIImage(systemName: isRecording ? "record.circle.fill" : "record.circle"))
-        recordButton.accessibilityLabel = isRecording ? "Recording" : "Record"
+        recordButton.accessibilityLabel = isRecording ? String(localized: "Recording") : String(localized: "Record")
         recordButton.glyphColor = isRecording ? .systemRed : nil
     }
 
@@ -406,7 +411,7 @@ final class PlayerRailView: UIView {
     func setFocusLanding(_ button: UIView) { lastFocusedButton = button }
 
     /// The leftmost tool button on screen, where AVKit lands Up from the video.
-    var firstToolButton: UIView? { toolRow.arrangedSubviews.first { !$0.isHidden } }
+    var firstToolButton: UIView? { toolRow.arrangedSubviews.first { !$0.isHidden && $0 !== skipPillSlot } }
 
     /// Drop the remembered button so the next chrome appearance starts on the
     /// scrubber again. Called when controls-focus mode ends — "where you left

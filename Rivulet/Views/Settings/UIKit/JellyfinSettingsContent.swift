@@ -7,9 +7,10 @@
 //
 //  Settings > Servers > Jellyfin Server. Signed out: a form built from the
 //  same rows as the Live TV "My Own Server" page, sharing its draft and its
-//  failure popup. Signed in: the server, the user, and Sign Out.
+//  failure popup. Signed in: the server, the user, Refresh and Sign Out.
 //
 
+import Combine
 import Foundation
 import UIKit
 
@@ -25,12 +26,32 @@ extension SettingsContent {
             ] + (hasLiveTV ? [jellyfinLiveTVToggle(id: "jellyfinLiveTV")] : []) + [
                 SettingsRowItem(id: "jellyfinUserInfo", title: "User",
                                 kind: .info(value: { account.userName })),
+                SettingsRowItem(id: "jellyfinRefresh", title: "Refresh",
+                                kind: .action(destructive: false, handler: { vc in
+                    let page = vc as? SettingsPageViewController
+                    ServerDataStore.shared.reload()
+                    page?.reloadRows()
+                    Task { @MainActor [weak page] in
+                        for await loading in ServerDataStore.shared.$isLoading.values where !loading { break }
+                        page?.reloadRows()
+                    }
+                }), isBusy: { ServerDataStore.shared.isLoading }),
                 SettingsRowItem(id: "jellyfinSignOut", title: "Sign Out",
                                 kind: .action(destructive: true, handler: { vc in
-                    Task { @MainActor in
-                        await JellyfinSession.signOut()
-                        addSourceDraft = AddSourceDraft()
-                        (vc as? SettingsPageViewController)?.reloadRows()
+                    func signOut(_ scope: SignOutScope?) {
+                        Task { @MainActor in
+                            await JellyfinSession.signOut(scope: scope)
+                            addSourceDraft = AddSourceDraft()
+                            (vc as? SettingsPageViewController)?.reloadRows()
+                        }
+                    }
+                    if CloudSync.shared.isSynced(accountID: account.providerID) {
+                        presentSignOutChoice(
+                            on: vc, title: String(localized: "Sign Out of Jellyfin?"),
+                            message: String(localized: "Your Jellyfin sign-in is shared through iCloud. Sign out of this device only, or of every device?"),
+                            thisDevice: { signOut(.thisDevice) }, everywhere: { signOut(.everywhere) })
+                    } else {
+                        signOut(nil)
                     }
                 }))
             ]
@@ -42,6 +63,10 @@ extension SettingsContent {
                             title: draft.status == .checking ? "Signing In…" : "Sign In",
                             kind: .action(destructive: false, handler: { vc in
                                 signInJellyfin(draft, on: vc)
+                            })),
+            SettingsRowItem(id: "jellyfinQuickConnect", title: "Quick Connect",
+                            kind: .action(destructive: false, handler: { vc in
+                                quickConnectJellyfin(draft, on: vc)
                             }))
         ]
     }
@@ -50,8 +75,7 @@ extension SettingsContent {
     static func jellyfinSteps(_ draft: AddSourceDraft) -> [EntryStep] {
         [
             EntryStep(id: "jellyfinURL", title: "Server Address",
-                      message: "Enter your Jellyfin server's address, with its port, "
-                          + "for example http://192.168.1.100:8096.",
+                      message: "Enter your Jellyfin server's address, with its port, for example http://192.168.1.100:8096.",
                       placeholder: "Required", keyboard: .URL, contentType: .URL,
                       value: { draft.serverURL }, set: { draft.serverURL = $0; draft.status = .idle }),
             EntryStep(id: "jellyfinUsername", title: "Username",
@@ -72,7 +96,8 @@ extension SettingsContent {
         let page = vc as? SettingsPageViewController
         let username = draft.username.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: sanitizeURL(draft.serverURL)), !username.isEmpty else {
-            fail(draft, page: page, title: "Couldn't Sign In", message: "Enter your server's address and your username.")
+            fail(draft, page: page, title: String(localized: "Couldn't Sign In"),
+                 message: String(localized: "Enter your server's address and your username."))
             return
         }
         draft.status = .checking
@@ -83,24 +108,50 @@ extension SettingsContent {
                 _ = try await JellyfinSession.signIn(serverURL: url, username: username, password: draft.password)
                 finish(page, draft: draft)
             } catch {
-                fail(draft, page: page, title: "Couldn't Sign In", message: jellyfinFailureCopy(for: error))
+                fail(draft, page: page, title: String(localized: "Couldn't Sign In"), message: JellyfinSession.failureMessage(for: error))
             }
         }
     }
 
-    static func jellyfinFailureCopy(for error: Error) -> String {
-        switch error {
-        case JellyfinSignInError.notJellyfin:
-            "That address isn't a Jellyfin server. Check the port."
-        case JellyfinSignInError.serverTooOld(let version):
-            "This server runs Jellyfin \(version). Rivulet needs "
-                + "\(JellyfinSession.minimumVersion.major).\(JellyfinSession.minimumVersion.minor) or newer."
-        case JellyfinSignInError.untrustedCertificate:
-            "This server's HTTPS certificate isn't trusted. Try its http:// address."
-        case MediaProviderError.unauthorized:
-            "Jellyfin didn't accept that username and password."
-        default:
-            "Couldn't reach that server. Check the address and port."
+    /// Shows the code in a popup while the session polls; leaving the popup cancels the sign-in.
+    private static func quickConnectJellyfin(_ draft: AddSourceDraft, on vc: UIViewController) {
+        guard draft.status != .checking else { return }
+        let page = vc as? SettingsPageViewController
+        guard let url = URL(string: sanitizeURL(draft.serverURL)) else {
+            fail(draft, page: page, title: String(localized: "Couldn't Sign In"),
+                 message: String(localized: "Enter your server's address."))
+            return
         }
+        draft.status = .checking
+        page?.reloadRows()
+
+        let attempt = QuickConnectAttempt()
+        attempt.task = Task { @MainActor in
+            var popup: UIViewController?
+            do {
+                _ = try await JellyfinSession.signInWithQuickConnect(serverURL: url) { code in
+                    let codePopup = ConfirmationPopupViewController(
+                        title: code,
+                        message: String(localized: "On a device signed in to Jellyfin, open Settings, choose Quick Connect and enter this code."),
+                        confirmTitle: String(localized: "Cancel"), cancelTitle: nil,
+                        onConfirm: { attempt.task?.cancel() }, onCancel: { attempt.task?.cancel() })
+                    popup = codePopup
+                    vc.present(codePopup, animated: true)
+                }
+                popup?.dismiss(animated: true)
+                finish(page, draft: draft)
+            } catch where isCancellationError(error) {
+                draft.status = .idle
+                page?.reloadRows()
+            } catch {
+                popup?.dismiss(animated: true)
+                fail(draft, page: page, title: String(localized: "Couldn't Sign In"), message: JellyfinSession.quickConnectFailureMessage(for: error))
+            }
+        }
+    }
+
+    /// Lets the code popup cancel the task that presented it.
+    @MainActor private final class QuickConnectAttempt {
+        var task: Task<Void, Never>?
     }
 }

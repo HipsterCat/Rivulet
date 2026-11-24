@@ -11,7 +11,6 @@
 import Foundation
 import Combine
 import CryptoKit
-import UIKit
 
 @MainActor
 class LiveTVDataStore: ObservableObject {
@@ -65,14 +64,20 @@ class LiveTVDataStore: ObservableObject {
     /// Channels favorited in Rivulet, from any source, in the viewer's order.
     @Published private(set) var favoriteIds: [String] = [] {
         didSet {
-            saveFavorites()
+            if !isLoadingFavorites { saveFavorites() }
         }
     }
+
+    /// Reading the saved lists must not write them: an empty default would look like a choice to iCloud.
+    private var isLoadingFavorites = false
 
     /// Source favorites (Plex account favorites) removed in Rivulet. Hidden
     /// here only; the source's own list is left alone.
     @Published private(set) var unfavoritedIds: Set<String> = [] {
-        didSet { userDefaults.set(Array(unfavoritedIds), forKey: unfavoritedKey) }
+        didSet {
+            guard !isLoadingFavorites else { return }
+            userDefaults.set(unfavoritedIds.sorted(), forKey: unfavoritedKey)
+        }
     }
 
     /// Loading states
@@ -136,13 +141,13 @@ class LiveTVDataStore: ObservableObject {
     /// switching in while a foreground notification lands) run ONE refresh.
     private var staleRefreshTask: Task<Void, Never>?
 
-    private let userDefaults = UserDefaults.standard
+    let userDefaults = UserDefaults.standard
     private let favoritesKey = "liveTVFavoriteChannelIds"
     private let unfavoritedKey = "liveTVUnfavoritedChannelIds"
     private let recentsKey = "liveTVRecentChannelIds"
     private let eventSlotsKey = "liveTVEventSlotChannelIds"
     private let viewingsKey = "liveTVViewings"
-    private let sourcesKey = "liveTVSourceConfigurations"
+    let sourcesKey = "liveTVSourceConfigurations"
 
     // MARK: - Source Configuration (Persistable)
 
@@ -322,7 +327,7 @@ class LiveTVDataStore: ObservableObject {
     /// for long stretches, so this is the most common way the grid goes stale.
     private func observeAppLifecycle() {
         NotificationCenter.default.addObserver(
-            forName: UIApplication.willEnterForegroundNotification,
+            forName: HostPlatform.willEnterForeground,
             object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
@@ -358,17 +363,26 @@ class LiveTVDataStore: ObservableObject {
             m3uURL: m3uURL,
             epgURL: epgURL,
             sourceId: sourceId,
-            displayName: name
+            displayName: uniqueName(name, replacing: sourceId)
         )
         providers[sourceId] = provider
         saveSources()
         await updateSourceInfo()
     }
 
+    /// A second source with a taken name becomes "IPTV 2", so the two stay apart in lists.
+    private func uniqueName(_ name: String, replacing id: String) -> String {
+        let taken = Set(providers.filter { $0.key != id }.map(\.value.displayName))
+        var candidate = name
+        var n = 2
+        while taken.contains(candidate) { candidate = "\(name) \(n)"; n += 1 }
+        return candidate
+    }
+
     /// Add an Xtream Codes source. Re-adding the same login replaces it.
     func addXtreamSource(account: XtreamAccount, name: String) async {
         let sourceId = Self.xtreamSourceId(for: account)
-        providers[sourceId] = IPTVProvider(xtream: account, sourceId: sourceId, displayName: name)
+        providers[sourceId] = IPTVProvider(xtream: account, sourceId: sourceId, displayName: uniqueName(name, replacing: sourceId))
         saveSources()
         await updateSourceInfo()
     }
@@ -404,8 +418,8 @@ class LiveTVDataStore: ObservableObject {
     /// Whether a source with this id is in use.
     func hasSource(id: String) -> Bool { providers[id] != nil }
 
-    /// Installs the source that follows a signed-in server (Plex DVR, Jellyfin
-    /// Live TV) in place of any of `type`, or just removes them. Never saved.
+    /// Installs the source that follows a signed-in server (Plex DVR, another
+    /// kind's Live TV) in place of any of `type`, or just removes them. Never saved.
     func setServerSource(_ provider: (any LiveTVProvider)?, of type: LiveTVSourceType) {
         let stale = Set(providers.filter { $0.value.sourceType == type }.keys)
         guard provider != nil || !stale.isEmpty else { return }
@@ -414,8 +428,15 @@ class LiveTVDataStore: ObservableObject {
         reloadSources()
     }
 
-    /// Remove a source by ID
-    func removeSource(id: String) async {
+    /// Removes a source here. Without a scope, other devices keep it and it stays out of this one.
+    func removeSource(id: String, scope: SignOutScope? = nil) async {
+        // First: the local removal ends in network probes, and a sync that runs before this is recorded would bring the source back.
+        CloudSync.shared.signedOut(accountID: Self.syncID(forSource: id), identity: nil, scope: scope ?? .thisDevice)
+        await removeSourceLocally(id: id)
+    }
+
+    /// Removes a source without telling iCloud (another device removed it).
+    func removeSourceLocally(id: String) async {
         withheldIPTVProviders.removeValue(forKey: id)
         KeychainHelper.delete(Self.apiTokenKey(sourceId: id))
         KeychainHelper.delete(Self.playlistURLKey(sourceId: id))
@@ -516,11 +537,11 @@ class LiveTVDataStore: ObservableObject {
         if configs.contains(where: { $0.type == "plex" }) { saveSources() }
     }
 
-    /// Moves IPTV sources out of a restricted profile's reach, and back. True when that changed anything.
+    /// Moves IPTV sources out of a content-limited profile's reach, and back. True when that changed anything.
     @discardableResult
     private func applyProfileRestrictions() -> Bool {
-        if PlexUserProfileManager.shared.isRestrictedProfile {
-            // Jellyfin's source leaves with the Jellyfin server, which such a profile does not see.
+        if PlexUserProfileManager.shared.isContentLimitedProfile {
+            // A server's source leaves with the server, which such a profile does not see.
             let iptv = providers.filter { !$0.value.sourceType.followsServer }
             guard !iptv.isEmpty else { return false }
             withheldIPTVProviders.merge(iptv) { _, new in new }
@@ -551,7 +572,7 @@ class LiveTVDataStore: ObservableObject {
     /// The Plex content token or the account's servers changed (sign-in,
     /// sign-out, server or profile switch): each server whose `/livetv/dvrs`
     /// lists a DVR is a Plex source, found again under the new tokens. IPTV
-    /// sources hold no Plex token and only move for a restricted profile.
+    /// sources hold no Plex token and only move for a content-limited profile.
     func plexContentTokenChanged() {
         let restrictionsChanged = applyProfileRestrictions()
         let auth = PlexAuthManager.shared
@@ -705,7 +726,7 @@ class LiveTVDataStore: ObservableObject {
                     ))
                 }
 
-            case .plex, .jellyfin:
+            case .plex, .jellyfin, .emby:
                 break  // Follows its server; not saved.
             }
         }
@@ -713,6 +734,7 @@ class LiveTVDataStore: ObservableObject {
         if let data = try? JSONEncoder().encode(configs) {
             userDefaults.set(data, forKey: sourcesKey)
         }
+        CloudSync.shared.accountsChanged()
     }
 
     /// Keychain account holding a source's Dispatcharr API key.
@@ -888,7 +910,8 @@ class LiveTVDataStore: ObservableObject {
             ))
         }
 
-        sources = infos.sorted { $0.displayName < $1.displayName }
+        // A source removed while the probes above were awaited must not come back.
+        sources = infos.filter { providers[$0.id] != nil }.sorted { $0.displayName < $1.displayName }
     }
 
     // MARK: - Channel Loading
@@ -1026,7 +1049,13 @@ class LiveTVDataStore: ObservableObject {
 
     // MARK: - EPG Loading
 
-    /// Load EPG for the specified time range
+    /// How far before now a full EPG load keeps programmes: the live player's
+    /// timeline splits a stream's rewind window at the programmes it reaches
+    /// into, and those have ended (`LiveTimelineLayout.maximumLookback`).
+    static let epgLookback: TimeInterval = 4 * 3_600
+
+    /// Load EPG for the specified time range. The provider fetch also reaches
+    /// back `epgLookback`; the guide drops whatever ended before its timeline.
     func loadEPG(startDate: Date = Date(), hours: Int = 24) async {
         guard !providers.isEmpty, !channels.isEmpty else {
             return
@@ -1086,7 +1115,7 @@ class LiveTVDataStore: ObservableObject {
                         do {
                             let epg = try await provider.fetchEPG(
                                 for: sourceChannels,
-                                startDate: startDate,
+                                startDate: min(startDate, Date().addingTimeInterval(-Self.epgLookback)),
                                 endDate: endDate
                             )
                             return (sourceId, .success(epg))
@@ -1243,11 +1272,11 @@ class LiveTVDataStore: ObservableObject {
         if let xmltv = error as? XMLTVParseError {
             switch xmltv {
             case .httpError(let code):
-                return "EPG server returned HTTP \(code)"
+                return String(localized: "EPG server returned HTTP \(code)")
             case .parseFailed:
-                return "EPG data could not be parsed"
+                return String(localized: "EPG data could not be parsed")
             case .tooLarge:
-                return "EPG data is too large"
+                return String(localized: "EPG data is too large")
             }
         }
 
@@ -1255,30 +1284,30 @@ class LiveTVDataStore: ObservableObject {
         if nsError.domain == NSURLErrorDomain {
             switch nsError.code {
             case NSURLErrorCancelled:
-                return "EPG request cancelled"
+                return String(localized: "EPG request cancelled")
             case NSURLErrorTimedOut:
-                return "EPG server didn't respond in time"
+                return String(localized: "EPG server didn't respond in time")
             case NSURLErrorCannotFindHost:
-                return "EPG server hostname could not be resolved"
+                return String(localized: "EPG server hostname could not be resolved")
             case NSURLErrorCannotConnectToHost:
-                return "Could not connect to EPG server"
+                return String(localized: "Could not connect to EPG server")
             case NSURLErrorNetworkConnectionLost:
-                return "Network connection was lost"
+                return String(localized: "Network connection was lost")
             case NSURLErrorDNSLookupFailed:
-                return "DNS lookup failed for EPG server"
+                return String(localized: "DNS lookup failed for EPG server")
             case NSURLErrorNotConnectedToInternet:
-                return "Not connected to the internet"
+                return String(localized: "Not connected to the internet")
             case NSURLErrorBadServerResponse:
-                return "EPG server returned invalid data"
+                return String(localized: "EPG server returned invalid data")
             case NSURLErrorSecureConnectionFailed,
                  NSURLErrorServerCertificateHasBadDate,
                  NSURLErrorServerCertificateUntrusted,
                  NSURLErrorServerCertificateHasUnknownRoot,
                  NSURLErrorServerCertificateNotYetValid:
-                return "EPG server TLS certificate issue"
+                return String(localized: "EPG server TLS certificate issue")
             case NSURLErrorClientCertificateRejected,
                  NSURLErrorClientCertificateRequired:
-                return "EPG server requires a client certificate"
+                return String(localized: "EPG server requires a client certificate")
             default:
                 break
             }
@@ -1576,15 +1605,21 @@ class LiveTVDataStore: ObservableObject {
         userDefaults.set(Array(eventSlotIds), forKey: eventSlotsKey)
     }
 
-    private func loadFavorites() {
-        if let saved = userDefaults.array(forKey: favoritesKey) as? [String] {
-            favoriteIds = saved
-        }
+    func loadFavorites() {
+        isLoadingFavorites = true
+        defer { isLoadingFavorites = false }
+        favoriteIds = userDefaults.stringArray(forKey: favoritesKey) ?? []
         unfavoritedIds = Set(userDefaults.stringArray(forKey: unfavoritedKey) ?? [])
     }
 
     private func saveFavorites() {
         userDefaults.set(favoriteIds, forKey: favoritesKey)
+    }
+
+    /// iCloud changed these keys under us: reread what is cached.
+    func syncedPreferencesChanged(_ keys: Set<String>) {
+        if keys.contains(favoritesKey) || keys.contains(unfavoritedKey) { loadFavorites() }
+        if keys.contains(Self.hiddenPlexServersKey) { plexContentTokenChanged() }
     }
 
     // MARK: - Recently watched

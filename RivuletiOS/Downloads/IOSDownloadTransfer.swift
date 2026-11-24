@@ -140,7 +140,7 @@ nonisolated final class IOSDownloadTransfer: NSObject, URLSessionDownloadDelegat
             try? files.removeItem(at: destination)
             try files.moveItem(at: location, to: destination)
         } catch {
-            let state = DownloadState.failed(reason: "Couldn't save the file: \(error.localizedDescription)")
+            let state = DownloadState.failed(reason: String(localized: "Couldn't save the file: \(error.localizedDescription)"))
             return send(.interrupted(recordID: recordID, taskID: taskID, state: state))
         }
         Self.excludeFromBackup(destination)
@@ -179,11 +179,8 @@ nonisolated final class IOSDownloadTransfer: NSObject, URLSessionDownloadDelegat
 
     /// The full size the response promised: Content-Range's total, else Content-Length.
     private static func totalLength(_ http: HTTPURLResponse) -> Int64? {
-        if let range = http.value(forHTTPHeaderField: "Content-Range"),
-           let total = range.split(separator: "/").last.flatMap({ Int64($0) }) {
-            return total
-        }
-        return http.statusCode == 200 && http.expectedContentLength > 0 ? http.expectedContentLength : nil
+        DownloadRules.totalLength(status: http.statusCode, contentRange: http.value(forHTTPHeaderField: "Content-Range"),
+                                  contentLength: http.expectedContentLength)
     }
 
     /// Plex names the file in Content-Disposition; a conversion is an MP4.

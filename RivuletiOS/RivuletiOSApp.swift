@@ -3,13 +3,20 @@
 
 import SwiftUI
 import UIKit
+import Sentry
 
 @main
 struct RivuletiOSApp: App {
     @UIApplicationDelegateAdaptor(IOSAppDelegate.self) private var appDelegate
-    @StateObject private var plex: IOSPlexSession
+    @StateObject private var plex: PlexSession
 
     init() {
+        HostPlatform.installUIKit()
+        ClientHost.offline = IOSOfflineHost()
+        ClientHost.prefetchImage = { _ = await IOSArtworkCache.shared.image(for: $0) }
+        #if DEBUG
+        ClientHost.transformHome = { IOSScreenshotMode.isOn ? IOSScreenshotMode.demo($0) : $0 }
+        #endif
         // Order matters: identity and migration must land before anything
         // touches PlexAuthManager.shared (the session does) or builds a request.
         // The manager reads Keychain and UserDefaults in its init, and PlexAPI
@@ -17,18 +24,32 @@ struct RivuletiOSApp: App {
         // A phone joins other people's networks; a LAN address there may be anyone.
         PlexAuthManager.prefersSecureLocalConnections = true
         Self.migrateLegacyIOSSession()
+        SkipLengthKeys.migrateLegacyKeys()
         #if DEBUG
         IOSScreenshotMode.seedSession()
         #endif
-        PlexAPI.platform = "iOS"
-        PlexAPI.deviceName = UIDevice.current.model   // "iPhone" / "iPad"
-        let session = IOSPlexSession()
+        // Designed for iPad on a Mac is this same binary, so without the check
+        // plex.tv lists a Mac as an iPad. Shared code never asks; the host does.
+        let isMac = ProcessInfo.processInfo.isiOSAppOnMac
+        PlexAPI.platform = isMac ? "macOS" : "iOS"
+        PlexAPI.deviceName = isMac ? "Mac" : UIDevice.current.model   // "iPhone" / "iPad"
+        // The iOS library grid lists titles; tvOS also lists a library's collections.
+        MediaProviderRegistry.plexIncludesCollections = false
+        // The signed-in Jellyfin and Emby servers, rebuilt from their stored accounts.
+        MediaProviderRegistry.shared.populateFromCurrentAuth()
+        let session = PlexSession()
         session.installProfileHooks()
         _plex = StateObject(wrappedValue: session)
         // Start the path monitor now; its first reading arrives after a delay.
         _ = NetworkPathMonitor.shared
+        // The Live TV store re-keys old URL-named M3U favorites when it starts. That must finish before the
+        // first sync pass, or a playlist URL with its login could be uploaded as a channel id.
+        _ = LiveTVDataStore.shared
+        // The iOS views read their synced keys live (@AppStorage), so no reload hook is needed.
+        CloudSync.shared.start()
         // Recreates the background session and resumes unfinished downloads.
         IOSDownloadCenter.shared.start()
+        IOSDownloadActivity.shared.start()
         // Folds the old single-source settings into the shared store, then
         // warms the guide so the Live TV tab opens with data.
         Task {
@@ -44,7 +65,10 @@ struct RivuletiOSApp: App {
         Task.detached(priority: .utility) {
             guard SentryConfig.isEnabled else { return }
             try? await Task.sleep(for: .seconds(3))
-            await SentryStartup.start(platform: .iOS)
+            await SentryStartup.start(platform: isMac ? .macOS : .iOS) { options in
+                // Partial stalls were a third of all hang events and never led to a fix.
+                options.enableReportNonFullyBlockingAppHangs = false
+            }
         }
         #endif
     }
@@ -53,6 +77,7 @@ struct RivuletiOSApp: App {
         WindowGroup {
             IOSRootView()
                 .environmentObject(plex)
+                .environmentObject(plex.browse)
                 .environmentObject(IOSDownloadCenter.shared)
         }
     }

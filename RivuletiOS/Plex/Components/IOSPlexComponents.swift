@@ -44,12 +44,12 @@ struct IOSPlexImage: View {
 /// round up to 120px steps so nearby tile sizes share one cache entry.
 struct IOSPlexArtwork: View {
     let item: PlexMetadata
-    let kind: IOSPlexSession.ArtworkKind
+    let kind: PlexSession.ArtworkKind
     /// Display width in points.
     let width: CGFloat
     /// Width over height of the requested image.
     let aspectRatio: CGFloat
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
     @Environment(\.displayScale) private var displayScale
 
     var body: some View {
@@ -57,17 +57,41 @@ struct IOSPlexArtwork: View {
     }
 
     /// The exact URL this view requests, so a prefetch warms the same cache entry.
-    static func url(_ plex: IOSPlexSession, item: PlexMetadata, kind: IOSPlexSession.ArtworkKind,
+    static func url(_ plex: PlexSession, item: PlexMetadata, kind: PlexSession.ArtworkKind,
                     width: CGFloat, aspectRatio: CGFloat, scale: CGFloat) -> URL? {
         let pixels = max(1, Int((width * scale / 120).rounded(.up))) * 120
         return plex.artworkURL(for: item, kind: kind, width: pixels, height: Int(CGFloat(pixels) / aspectRatio))
     }
 }
 
+/// A MediaItem's artwork, resized by its server to the pixel size the tile draws at.
+struct IOSItemArtwork: View {
+    let item: MediaItem
+    let kind: BrowseStore.ArtworkKind
+    /// Display width in points.
+    let width: CGFloat
+    /// Width over height of the requested image.
+    let aspectRatio: CGFloat
+    @EnvironmentObject private var browse: BrowseStore
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        IOSPlexImage(url: Self.url(browse, item: item, kind: kind, width: width, aspectRatio: aspectRatio, scale: displayScale))
+    }
+
+    /// The exact URL this view requests, so a prefetch warms the same cache entry.
+    /// Widths round up to 120px steps so nearby tile sizes share one cache entry.
+    static func url(_ browse: BrowseStore, item: MediaItem, kind: BrowseStore.ArtworkKind,
+                    width: CGFloat, aspectRatio: CGFloat, scale: CGFloat) -> URL? {
+        let pixels = max(1, Int((width * scale / 120).rounded(.up))) * 120
+        return browse.artworkURL(for: item, kind: kind, width: pixels, height: Int(CGFloat(pixels) / aspectRatio))
+    }
+}
+
 /// Clear logo with a text fallback. Always drawn over a dark scrim, so white.
 /// A logo already in the caches draws on the first frame, with no fade.
 struct IOSPlexResolvedLogo: View {
-    let item: PlexMetadata
+    let item: MediaItem
     let fallbackTitle: String
     let maxWidth: CGFloat
     let maxHeight: CGFloat
@@ -78,18 +102,15 @@ struct IOSPlexResolvedLogo: View {
     /// and tall logos read the same weight. Nil fills the max box.
     var targetArea: CGFloat?
 
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var browse: BrowseStore
     @State private var loaded: (identity: String, image: UIImage)?
 
     private var sourceIdentity: String {
-        let key = item.type == "episode"
-            ? item.grandparentRatingKey
-            : (item.type == "season" ? item.parentRatingKey : item.ratingKey)
-        return "\(key ?? item.id)|\(item.clearLogoPath ?? "")"
+        "\(item.logoOwner.providerID)|\(item.logoOwner.itemID)|\(item.artwork.logo?.absoluteString ?? "")"
     }
 
     var body: some View {
-        let cached = plex.cachedLogoURL(for: item).flatMap(IOSArtworkCache.shared.cachedImage(for:))
+        let cached = browse.cachedLogoURL(for: item).flatMap(IOSArtworkCache.shared.cachedImage(for:))
         let logo = cached ?? (loaded?.identity == sourceIdentity ? loaded?.image : nil)
         ZStack(alignment: alignment) {
             if let logo {
@@ -119,7 +140,7 @@ struct IOSPlexResolvedLogo: View {
         .accessibilityAddTraits(.isHeader)
         .task(id: sourceIdentity) {
             let identity = sourceIdentity
-            guard let url = await plex.logoURL(for: item),
+            guard let url = await browse.logoURL(for: item),
                   !Task.isCancelled,
                   let image = await IOSArtworkCache.shared.image(for: url),
                   !Task.isCancelled else { return }
@@ -139,7 +160,7 @@ struct IOSPlexResolvedLogo: View {
 
 extension View {
     /// Progress bar along the bottom, or the watched check when there is no bar.
-    func plexWatchState(_ item: PlexMetadata) -> some View {
+    func plexWatchState(_ item: MediaItem) -> some View {
         overlay(alignment: .bottom) {
             if let fraction = item.progressBarFraction {
                 ProgressView(value: fraction)
@@ -162,19 +183,6 @@ extension View {
     }
 }
 
-extension PlexMetadata {
-    /// VoiceOver value for a tile's watch state.
-    var watchStateDescription: String {
-        if let left = timeLeftText { return left }
-        if let fraction = progressBarFraction { return "\(Int(fraction * 100)) percent watched" }
-        return isWatched ? "Watched" : ""
-    }
-
-    /// PlexMetadata's `==` compares only ratingKey, so SwiftUI skips a tile whose
-    /// watch state changed. Tiles store this so the change reaches their body.
-    var watchStamp: [Int] { [viewOffset ?? 0, viewCount ?? 0, viewedLeafCount ?? 0, lastViewedAt ?? 0] }
-}
-
 // MARK: - Tiles
 
 /// Sizes a tile from a known width, or keeps the aspect ratio when the
@@ -193,26 +201,18 @@ struct TileSize: ViewModifier {
 }
 
 struct IOSPlexPosterCard: View {
-    let item: PlexMetadata
+    let item: MediaItem
     /// Fixed tile width, or nil to fill what the parent offers.
     var width: CGFloat? = nil
     var showsCaption = true
-    private let watchStamp: [Int]
 
-    init(item: PlexMetadata, width: CGFloat? = nil, showsCaption: Bool = true) {
-        self.item = item
-        self.width = width
-        self.showsCaption = showsCaption
-        watchStamp = item.watchStamp
-    }
-
-    private var ratio: CGFloat { item.isMusic ? 1 : 2 / 3 }
+    private var ratio: CGFloat { item.isMusicItem ? 1 : 2 / 3 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            IOSPlexArtwork(
+            IOSItemArtwork(
                 item: item,
-                kind: item.isMusic ? .thumb : .poster,
+                kind: item.isMusicItem ? .thumb : .poster,
                 width: width ?? 180,
                 aspectRatio: ratio
             )
@@ -220,13 +220,14 @@ struct IOSPlexPosterCard: View {
             .plexWatchState(item)
             .overlay(alignment: .topLeading) { editionBadge }
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .tileHover(cornerRadius: 10)
             .plexZoomSource(item)
 
             if showsCaption {
-                Text(item.type == "episode" ? item.showTitle : item.displayTitle)
+                Text(item.kind == .episode ? item.showTitle : item.displayTitle)
                     .font(.footnote.weight(.semibold))
                     .lineLimit(1)
-                if let caption = item.type == "episode" ? item.episodeCode : item.subtitle {
+                if let caption = item.kind == .episode ? item.episodeCode : item.subtitle {
                     Text(caption)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -237,7 +238,7 @@ struct IOSPlexPosterCard: View {
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel([item.showTitle, item.type == "episode" ? item.episodeCode : nil, edition]
+        .accessibilityLabel([item.showTitle, item.kind == .episode ? item.episodeCode : nil, edition]
             .compactMap { $0 }.joined(separator: ", "))
         .accessibilityValue(item.watchStateDescription)
     }
@@ -261,23 +262,51 @@ struct IOSPlexPosterCard: View {
 }
 
 /// Continue Watching, the tvOS card: art at the Apple TV app's ~1.29:1, the
-/// logo centred, and a play icon, progress and "S2, E5 · 12 min left" along
+/// logo placed as on tvOS, and a play icon, progress and "S2, E5 · 12 min left" along
 /// the bottom over a soft blur band.
 struct IOSPlexContinueCard: View {
     /// The tvOS Continue Watching card's ratio (`MediaRowMetrics`).
     static let aspectRatio: CGFloat = 357 / 277
 
-    let item: PlexMetadata
+    let item: MediaItem
     let width: CGFloat
-    private let watchStamp: [Int]
 
-    init(item: PlexMetadata, width: CGFloat) {
-        self.item = item
-        self.width = width
-        watchStamp = item.watchStamp
-    }
+    @EnvironmentObject private var browse: BrowseStore
+    /// The art already shows the title (#450), keyed by the art it was read from.
+    @State private var artShowsTitle: (art: URL, shows: Bool)?
+    @State private var signals = ContinueWatchingCardCompositor.Signals.none
+    @State private var logoSize: CGSize?
 
     private var height: CGFloat { width / Self.aspectRatio }
+
+    /// The title rests leading on the floor and moves clear of faces and busy art, as on tvOS.
+    private var placedLogo: some View {
+        let size = logoSize ?? browse.cachedLogoURL(for: item).flatMap(IOSArtworkCache.shared.cachedImage(for:))?.size
+        let placed = ContinueWatchingTitlePlacer.titleRect(card: CGSize(width: width, height: height), signals: signals, logoSize: size)
+        return IOSPlexResolvedLogo(
+            item: item,
+            fallbackTitle: item.showTitle,
+            maxWidth: placed.rect.width,
+            maxHeight: placed.rect.height,
+            fallbackFont: .title3.bold(),
+            alignment: placed.side == .leading ? .leading : .trailing,
+            textAlignment: placed.side == .leading ? .leading : .trailing
+        )
+        .frame(width: placed.rect.width, height: placed.rect.height)
+        .offset(x: placed.rect.minX, y: placed.rect.minY)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .opacity(hidesLogo ? 0 : 1)
+        .animation(.easeInOut(duration: 0.2), value: hidesLogo)
+    }
+
+    /// The whole backdrop at the size tvOS reads it, not the card's crop.
+    private var checkedArt: URL? { browse.artworkURL(for: item, kind: .backdrop, width: 900, height: 506) }
+
+    private var hidesLogo: Bool {
+        guard let art = checkedArt else { return false }
+        if let checked = artShowsTitle, checked.art == art { return checked.shows }
+        return ArtworkTitleCheck.known(ArtworkTitleCheck.key(still: art, title: item.showTitle)) ?? false
+    }
 
     private var info: String {
         [item.episodeCode, item.timeLeftText ?? item.runtimeText ?? item.year.map(String.init)]
@@ -287,23 +316,13 @@ struct IOSPlexContinueCard: View {
 
     var body: some View {
         ZStack {
-            IOSPlexArtwork(item: item, kind: .backdrop, width: width, aspectRatio: Self.aspectRatio)
+            IOSItemArtwork(item: item, kind: .backdrop, width: width, aspectRatio: Self.aspectRatio)
             Rectangle()
                 .fill(.ultraThinMaterial)
                 .mask(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .init(x: 0.5, y: 0.45)))
                 .frame(height: height * 0.25)
                 .frame(maxHeight: .infinity, alignment: .bottom)
-            // tvOS: 18000 pt² on a 357pt card, at most 75% wide and 45% tall.
-            IOSPlexResolvedLogo(
-                item: item,
-                fallbackTitle: item.showTitle,
-                maxWidth: width * 0.75,
-                maxHeight: height * 0.45,
-                fallbackFont: .title3.bold(),
-                alignment: .center,
-                textAlignment: .center,
-                targetArea: 18000 * pow(width / 357, 2)
-            )
+            placedLogo
             infoBar
                 .padding(.horizontal, 12)
                 .padding(.bottom, 10)
@@ -312,11 +331,38 @@ struct IOSPlexContinueCard: View {
         .frame(width: width, height: height)
         .environment(\.colorScheme, .dark)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .tileHover(cornerRadius: 12)
         .plexZoomSource(item)
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel([item.showTitle, item.episodeCode].compactMap { $0 }.joined(separator: ", "))
         .accessibilityValue(item.watchStateDescription)
+        .task(id: checkedArt) { await checkArt() }
+        .task(id: checkedArt) { await analyseArt() }
+    }
+
+    private func analyseArt() async {
+        guard let art = checkedArt else { return }
+        if let logo = await browse.logoURL(for: item) { logoSize = await IOSArtworkCache.shared.image(for: logo)?.size }
+        let found = await ContinueWatchingTitlePlacer.signals(key: art.absoluteString) {
+            await IOSArtworkCache.shared.image(for: art)?.cgImage
+        }
+        guard !Task.isCancelled else { return }
+        signals = found
+    }
+
+    private func checkArt() async {
+        guard let art = checkedArt else { return }
+        let logo = await browse.logoURL(for: item)
+        let title = item.showTitle
+        let shows = await ArtworkTitleCheck.answer(ArtworkTitleCheck.key(still: art, title: title), title: title) {
+            guard let still = await IOSArtworkCache.shared.image(for: art)?.cgImage else { return nil }
+            guard let logo else { return (still, nil) }
+            guard let image = await IOSArtworkCache.shared.image(for: logo)?.cgImage else { return nil }
+            return (still, image)
+        }
+        guard !Task.isCancelled else { return }
+        artShowsTitle = (art, shows)
     }
 
     private var infoBar: some View {
@@ -345,14 +391,14 @@ struct IOSPlexContinueCard: View {
 
 /// A See All destination: one hub, paged through its own key.
 struct IOSPlexHubRoute: Hashable {
-    let hub: PlexHub
+    let hub: MediaHub
 
-    /// Continue Watching is the cache-busted fetch, and a literal id list is a
-    /// fixed set, so neither pages.
-    var pages: Bool {
-        guard !hub.isContinueWatching, let key = hub.key ?? hub.hubKey else { return false }
-        return !key.hasPrefix("/library/metadata/")
-    }
+    /// Continue Watching is merged across servers, and a literal id list is a
+    /// fixed set, so neither pages (`MediaHub.pagingKey`).
+    var pages: Bool { hub.pagingKey != nil }
+
+    /// Only the merged row, which has no server; a library's own in-progress row keeps its items.
+    var isContinueWatching: Bool { hub.id == BrowseStore.continueWatchingID && hub.providerID.isEmpty }
 }
 
 /// "Title ›" heading that pushes the full grid.
@@ -398,8 +444,8 @@ struct IOSPlexShelfHeader: View {
 }
 
 /// The tvOS shelf equation: width = 2*leading + N*tile + (N-1)*gap with N odd,
-/// so the middle tile is centred and every snap shows a (leading - gap) peek
-/// of each neighbour. Tiles take their width from the row's container.
+/// so every snap shows a (leading - gap) peek of each neighbour. Tiles take
+/// their width from the row's container.
 struct IOSShelfGeometry {
     enum Kind {
         case poster, landscape, person
@@ -413,8 +459,8 @@ struct IOSShelfGeometry {
             }
         }
 
-        /// Largest share of a phone-width row one tile may take; a capped tile
-        /// stays centred with wider, still equal, peeks.
+        /// Largest share of a phone-width row one tile may take; a capped row
+        /// rests on the margin and centres every later tile (`IOSCentredSnap`).
         func maximumShare(wide: Bool) -> CGFloat? {
             self == .landscape && !wide ? 0.64 : nil
         }
@@ -425,8 +471,8 @@ struct IOSShelfGeometry {
     /// system large title and toolbar sit on it too.
     static let leading: CGFloat = 20
     let tileWidth: CGFloat
-    /// The row's content margin: `leading`, or more when a capped tile is centred.
-    let rowLeading: CGFloat
+    /// True when `maximumShare` narrowed the tile below the row equation.
+    let isCapped: Bool
 
     /// `textScale` grows the minimum with Dynamic Type, so larger text gets fewer, wider tiles.
     init(width: CGFloat, kind: Kind, textScale: CGFloat = 1) {
@@ -438,9 +484,30 @@ struct IOSShelfGeometry {
         while tile(count + 2) >= minimum { count += 2 }
         var width0 = tile(count)
         if let share = kind.maximumShare(wide: width >= 600) { width0 = min(width0, width * share) }
+        isCapped = width0 < tile(count)
         tileWidth = max(0, width0)
-        let used = CGFloat(count) * tileWidth + CGFloat(count - 1) * Self.gap
-        rowLeading = max(Self.leading, (width - used) / 2)
+    }
+}
+
+/// A capped row's snap: the first tile rests on the leading margin, every later
+/// one centred, one tile per swipe. Offsets assume the row is padded, not
+/// content-margined.
+struct IOSCentredSnap: ScrollTargetBehavior {
+    let tile: CGFloat
+
+    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        let pitch = tile + IOSShelfGeometry.gap
+        // Tile i >= 1 is centred at `centring + i * pitch`; tile 0 rests at 0.
+        let centring = IOSShelfGeometry.leading + tile / 2 - context.containerSize.width / 2
+        func offset(_ index: Int) -> CGFloat { index == 0 ? 0 : centring + CGFloat(index) * pitch }
+        func nearest(_ x: CGFloat) -> Int {
+            let index = max(1, Int(((x - centring) / pitch).rounded()))
+            return abs(x) < abs(x - offset(index)) ? 0 : index
+        }
+        let from = nearest(context.originalTarget.rect.minX)
+        let index = min(max(nearest(target.rect.minX), from - 1), from + 1)
+        let maxOffset = max(0, context.contentSize.width - context.containerSize.width)
+        target.rect.origin.x = min(max(0, offset(index)), maxOffset)
     }
 }
 
@@ -473,14 +540,27 @@ struct IOSShelfRow<Items: RandomAccessCollection, Header: View, Tile: View>: Vie
         let geometry = IOSShelfGeometry(width: width, kind: kind, textScale: textScale)
         VStack(alignment: .leading, spacing: 10) {
             header().padding(.horizontal, IOSShelfGeometry.leading)
-            if geometry.tileWidth > 0 {
+            if geometry.tileWidth > 0, geometry.isCapped {
+                // Padded, so the snap's offsets start at the first tile's rest.
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: IOSShelfGeometry.gap) {
+                        ForEach(items) { tile($0, geometry.tileWidth) }
+                    }
+                    .scrollTargetLayout()
+                    .padding(.leading, IOSShelfGeometry.leading)
+                    .padding(.trailing, max(IOSShelfGeometry.leading, (width - geometry.tileWidth) / 2))
+                }
+                .scrollTargetBehavior(IOSCentredSnap(tile: geometry.tileWidth))
+                .scrollPosition(id: $anchor, anchor: .center)
+                .scrollIndicators(.hidden)
+            } else if geometry.tileWidth > 0 {
                 ScrollView(.horizontal) {
                     LazyHStack(alignment: .top, spacing: IOSShelfGeometry.gap) {
                         ForEach(items) { tile($0, geometry.tileWidth) }
                     }
                     .scrollTargetLayout()
                 }
-                .contentMargins(.horizontal, geometry.rowLeading, for: .scrollContent)
+                .contentMargins(.horizontal, IOSShelfGeometry.leading, for: .scrollContent)
                 .scrollTargetBehavior(.viewAligned)
                 .scrollPosition(id: $anchor, anchor: .leading)
                 .scrollIndicators(.hidden)
@@ -494,21 +574,24 @@ struct IOSShelfRow<Items: RandomAccessCollection, Header: View, Tile: View>: Vie
 
 /// One Home hub as a titled row.
 struct IOSPlexShelfView: View {
-    let hub: PlexHub
-    @EnvironmentObject private var plex: IOSPlexSession
+    let hub: MediaHub
+    @EnvironmentObject private var browse: BrowseStore
     @Environment(\.displayScale) private var displayScale
+
+    private var items: [MediaItem] { Array(hub.items.prefix(HomeFeed.railLimit)) }
 
     var body: some View {
         let route = IOSPlexHubRoute(hub: hub)
-        if hub.isContinueWatching {
-            // One row across every server, so no badge.
-            IOSPlexRail(title: hub.displayTitle, route: route, kind: .landscape, items: hub.items) { item, width in
+        if route.isContinueWatching || hub.isContinueWatchingFamily {
+            // The merged row spans every server, so no badge.
+            IOSPlexRail(title: hub.title, route: route, kind: .landscape, items: items,
+                        badge: route.isContinueWatching ? nil : browse.labels.badge(providerID: hub.providerID)) { item, width in
                 IOSPlexContinueCard(item: item, width: width)
                     .task(id: width) { await prefetchAhead(of: item, width: width) }
             }
         } else {
-            IOSPlexRail(title: hub.displayTitle, route: route, kind: .poster, items: hub.items,
-                        badge: plex.serverBadge(serverID: hub.serverID)) {
+            IOSPlexRail(title: hub.title, route: route, kind: .poster, items: items,
+                        badge: browse.labels.badge(providerID: hub.providerID)) {
                 IOSPlexPosterCard(item: $0, width: $1)
             }
         }
@@ -517,26 +600,26 @@ struct IOSPlexShelfView: View {
     /// Warms the logos and art of the next few cards past one that just
     /// appeared, so they are drawn before they scroll in. A window, not the
     /// whole hub, so the prefetch never evicts the cards on screen.
-    private func prefetchAhead(of item: PlexMetadata, width: CGFloat) async {
-        guard let index = hub.items.firstIndex(where: { $0.id == item.id }) else { return }
-        await plex.prefetchArtwork(hub.items.dropFirst(index + 1).prefix(6).map {
-            ($0, IOSPlexArtwork.url(plex, item: $0, kind: .backdrop, width: width,
+    private func prefetchAhead(of item: MediaItem, width: CGFloat) async {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        await browse.prefetchArtwork(items.dropFirst(index + 1).prefix(6).map {
+            ($0, IOSItemArtwork.url(browse, item: $0, kind: .backdrop, width: width,
                                     aspectRatio: IOSPlexContinueCard.aspectRatio, scale: displayScale))
         })
     }
 }
 
-/// Titled row of Plex items; each tile pushes its detail and has the item menu.
+/// Titled row of items; each tile pushes its detail and has the item menu.
 struct IOSPlexRail<Tile: View>: View {
     let title: String
     var route: IOSPlexHubRoute?
     let kind: IOSShelfGeometry.Kind
-    let items: [PlexMetadata]
+    let items: [MediaItem]
     var badge: String? = nil
-    @ViewBuilder let tile: (PlexMetadata, CGFloat) -> Tile
+    @ViewBuilder let tile: (MediaItem, CGFloat) -> Tile
 
     /// Each rail owns its zoom sources; an item can sit in several rows.
-    private var zoomScope: String { route?.hub.hubIdentifier ?? title }
+    private var zoomScope: String { route?.hub.id ?? title }
 
     var body: some View {
         IOSShelfRow(kind: kind, items: items) {
@@ -553,20 +636,20 @@ struct IOSPlexRail<Tile: View>: View {
 /// Adaptive poster grid for libraries and See All. A nil slot is an item not
 /// fetched yet and draws as a placeholder; `slotAppeared` reports each index shown.
 struct IOSPlexPosterGrid: View {
-    let slots: [PlexMetadata?]
+    let slots: [MediaItem?]
     var slotAppeared: ((Int) -> Void)?
     @Environment(\.horizontalSizeClass) private var sizeClass
     @ScaledMetric(relativeTo: .body) private var minimumWidth: CGFloat = 104
     /// While iPhone Duo's fold runs down the grid's middle: the adaptive count rounded down to even.
     @State private var evenColumns: Int?
 
-    init(slots: [PlexMetadata?], slotAppeared: ((Int) -> Void)?) {
+    init(slots: [MediaItem?], slotAppeared: ((Int) -> Void)?) {
         self.slots = slots
         self.slotAppeared = slotAppeared
     }
 
     /// A fully loaded list that pages by calling `loadMore` when the last tile appears.
-    init(items: [PlexMetadata], loadMore: (() -> Void)?) {
+    init(items: [MediaItem], loadMore: (() -> Void)?) {
         slots = items
         slotAppeared = { [count = items.count] index in
             if index == count - 1 { loadMore?() }
@@ -632,10 +715,32 @@ extension GeometryProxy {
     }
 }
 
+/// A server that failed to load, named, above the rows of the servers that answered.
+struct IOSServerFailureBanner: View {
+    let failure: BrowseStore.FailedServer
+    @EnvironmentObject private var browse: BrowseStore
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Couldn't load \(failure.name)").font(.subheadline.weight(.semibold))
+                Text(failure.message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            Button("Retry") { Task { await browse.refresh() } }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, IOSShelfGeometry.leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// Error state with Retry, used by every content surface. Home and Library
 /// also offer the Downloads list when there is something in it.
 struct IOSPlexErrorView: View {
-    let title: String
+    let title: LocalizedStringKey
     let message: String
     var offersDownloads = false
     let retry: () async -> Void
@@ -664,6 +769,13 @@ extension View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.secondary, lineWidth: 1))
+    }
+
+    /// The pointer's lift over a tappable tile's artwork, as the TV app's tiles on iPad.
+    /// Plain-style buttons and links get no pointer effect of their own.
+    func tileHover(cornerRadius: CGFloat) -> some View {
+        contentShape(.hoverEffect, .rect(cornerRadius: cornerRadius, style: .continuous))
+            .hoverEffect(.lift)
     }
 }
 

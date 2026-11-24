@@ -124,14 +124,14 @@ enum ExtraSubtype: Int, CaseIterable, Sendable, Comparable {
 
     var displayName: String {
         switch self {
-        case .trailer:          return "Trailer"
-        case .featurette:       return "Featurette"
-        case .behindTheScenes:  return "Behind the Scenes"
-        case .deletedScene:     return "Deleted Scene"
-        case .interview:        return "Interview"
-        case .scene:            return "Scene"
-        case .short:            return "Short"
-        case .unknown:          return "Extra"
+        case .trailer:          return String(localized: "Trailer")
+        case .featurette:       return String(localized: "Featurette")
+        case .behindTheScenes:  return String(localized: "Behind the Scenes")
+        case .deletedScene:     return String(localized: "Deleted Scene")
+        case .interview:        return String(localized: "Interview")
+        case .scene:            return String(localized: "Scene")
+        case .short:            return String(localized: "Short")
+        case .unknown:          return String(localized: "Extra")
         }
     }
 
@@ -583,7 +583,7 @@ extension PlexMetadata {
 
     /// Relative path of the clearLogo image from the Plex `Image` array, if present.
     /// Returns a server-relative path that still needs the server URL + X-Plex-Token to fetch.
-    var clearLogoPath: String? {
+    nonisolated var clearLogoPath: String? {
         Image?.first(where: { $0.type == "clearLogo" })?.url
     }
 
@@ -608,7 +608,7 @@ extension PlexMetadata {
         }
 
         guard let index else { return nil }
-        return index == 0 ? "Specials" : "Season \(index)"
+        return index == 0 ? String(localized: "Specials") : String(localized: "Season \(index)")
     }
 
     /// Extract a TMDB ID from a Plex guid string
@@ -808,11 +808,11 @@ extension PlexMetadata {
     /// Media type for display
     var mediaTypeDisplay: String {
         switch type {
-        case "movie": return "Movie"
-        case "show": return "TV Show"
-        case "season": return "Season"
-        case "episode": return "Episode"
-        default: return type?.capitalized ?? "Unknown"
+        case "movie": return String(localized: "Movie")
+        case "show": return String(localized: "TV Show")
+        case "season": return String(localized: "Season")
+        case "episode": return String(localized: "Episode")
+        default: return type?.capitalized ?? String(localized: "Unknown")
         }
     }
 
@@ -927,9 +927,9 @@ extension PlexMetadata {
             }
             return "5.1"
         } else if channels >= 2 {
-            return "Stereo"
+            return String(localized: "Stereo")
         } else {
-            return "Mono"
+            return String(localized: "Mono")
         }
     }
 
@@ -972,11 +972,6 @@ extension PlexMetadata {
         Marker?.filter { $0.isCredits } ?? []
     }
 
-    /// First credits marker (for post-video trigger timing)
-    var firstCreditsMarker: PlexMarker? {
-        creditsMarkers.first
-    }
-
     /// Commercial markers if available
     var commercialMarkers: [PlexMarker] {
         Marker?.filter { $0.isCommercial } ?? []
@@ -997,7 +992,8 @@ extension PlexMetadata {
 extension PlexMetadata {
     /// `contentRating` for display: Plex stores non-US ratings with an ISO
     /// country prefix ("uk/12A") and its own clients show what follows the
-    /// first slash. The raw value stays in `contentRating`.
+    /// first slash. Germany's read as the Apple TV app shows them, in German
+    /// whatever the app's language (#467). The raw value stays in `contentRating`.
     var displayContentRating: String? {
         Self.displayContentRating(contentRating)
     }
@@ -1006,6 +1002,7 @@ extension PlexMetadata {
         guard let raw else { return nil }
         guard let slash = raw.firstIndex(of: "/") else { return raw }
         let stripped = raw[raw.index(after: slash)...].trimmingCharacters(in: .whitespaces)
+        if raw.lowercased().hasPrefix("de/"), Int(stripped) != nil { return "ab \(stripped) Jahren" }
         return stripped.isEmpty ? raw : stripped
     }
 }

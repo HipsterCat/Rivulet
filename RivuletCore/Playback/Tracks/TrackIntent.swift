@@ -151,9 +151,12 @@ enum TrackLanguage {
         "spa", "swe", "tha", "tur", "ukr", "vie"
     ]
 
-    /// The device's language, the subtitle default.
-    static var device: String {
-        let code = normalize(Locale.current.language.languageCode?.identifier)
+    /// The device's language, the subtitle default. `Locale.current` reports English
+    /// for any language the app has no catalog for, so this reads the system's list.
+    static var device: String { language(fromPreferred: Locale.preferredLanguages) }
+
+    static func language(fromPreferred preferred: [String]) -> String {
+        let code = normalize(preferred.first.flatMap { Locale(identifier: $0).language.languageCode?.identifier })
         return code.isEmpty ? english : code
     }
 
@@ -361,7 +364,17 @@ enum TrackIntentResolver {
     ///   2. Same language, best quality (commentary excluded).
     ///   3. English, best quality (commentary excluded).
     ///   4. File default, else first track (commentary excluded where possible).
-    static func resolveAudio(intent: AudioIntent?, in tracks: [MediaTrack]) -> MediaTrack? {
+    /// With the system's Audio Descriptions on, the result's described twin wins when there is one.
+    static func resolveAudio(intent: AudioIntent?, in tracks: [MediaTrack],
+                             prefersAudioDescription: Bool = SystemMediaAccessibility.prefersAudioDescription) -> MediaTrack? {
+        let pick = resolveAudioIgnoringDescription(intent: intent, in: tracks)
+        guard prefersAudioDescription, let pick, !pick.describesVideo else { return pick }
+        return tracks.first {
+            $0.describesVideo && TrackLanguage.matches($0.languageCode ?? $0.language, pick.languageCode ?? pick.language)
+        } ?? pick
+    }
+
+    private static func resolveAudioIgnoringDescription(intent: AudioIntent?, in tracks: [MediaTrack]) -> MediaTrack? {
         guard !tracks.isEmpty else { return nil }
 
         // Auto-selection tiers never pick commentary / audio description.
@@ -504,7 +517,16 @@ enum TrackIntentStore {
     /// What playback resolves against: Foreign Audio in the device's
     /// language when nothing is stored.
     static var effectiveSubtitleIntent: SubtitleIntent {
-        subtitleIntent ?? .foreignAudio(language: TrackLanguage.device, hearingImpaired: false)
+        effectiveSubtitleIntent(stored: subtitleIntent, captionsAlwaysOn: SystemMediaAccessibility.captionsAlwaysOn)
+    }
+
+    /// The system's Closed Captions + SDH turns full subtitles on, SDH first, in the saved language.
+    static func effectiveSubtitleIntent(stored: SubtitleIntent?, captionsAlwaysOn: Bool) -> SubtitleIntent {
+        guard captionsAlwaysOn else {
+            return stored ?? .foreignAudio(language: TrackLanguage.device, hearingImpaired: false)
+        }
+        return .track(language: stored?.language ?? TrackLanguage.device, forced: false,
+                      hearingImpaired: true, codec: nil)
     }
 
     // MARK: Audio
@@ -657,9 +679,9 @@ extension TrackIntentResolver {
         return track.id
     }
 
-    /// The Plex stream ids a title starts on, subtitle 0 being off: Plex's per-item picks,
-    /// then the stored intents. `audioOverride` is a pick made before playback.
-    static func startingPlexSelection(streams: [PlexStream], audioOverride: Int? = nil) -> (audio: Int?, subtitle: Int) {
+    /// The stream ids a title starts on: Plex's per-item picks, then the stored intents.
+    /// The subtitle is always decided. `audioOverride` is a pick made before playback.
+    static func startingPlexSelection(streams: [PlexStream], audioOverride: Int? = nil) -> TrackPicks {
         let audio = streams.filter(\.isAudio).map { MediaTrack(from: $0) }
         let subtitles = streams.filter(\.isSubtitle).map { MediaTrack(from: $0) }
         let chosenAudio = audioOverride
@@ -667,11 +689,13 @@ extension TrackIntentResolver {
         let audioID = chosenAudio.flatMap { id in audio.contains { $0.id == id } ? id : nil }
             ?? resolveAudio(intent: TrackIntentStore.effectiveAudioIntent, in: audio)?.id
         let intent = TrackIntentStore.effectiveSubtitleIntent
-        if let chosen = plexChosenSubtitleStreamID(in: streams, intent: intent) { return (audioID, chosen) }
+        if let chosen = plexChosenSubtitleStreamID(in: streams, intent: intent) {
+            return TrackPicks(audio: audioID, subtitle: .track(chosen))
+        }
         let playing = audio.first { $0.id == audioID }
         let subtitle = resolveSubtitle(intent: intent, in: subtitles,
                                        audioLanguage: playing?.languageCode ?? playing?.language)
-        return (audioID, subtitle?.id ?? 0)
+        return TrackPicks(audio: audioID, subtitle: SubtitlePick(subtitle?.id))
     }
 }
 
@@ -695,6 +719,15 @@ enum SubtitleMode: String, CaseIterable {
     }
 
     static var current: SubtitleMode { SubtitleMode(TrackIntentStore.effectiveSubtitleIntent) }
+
+    var title: String {
+        switch self {
+        case .foreignAudio: return String(localized: "Foreign Audio")
+        case .always: return String(localized: "Always")
+        case .off: return String(localized: "Off")
+        case .forcedOnly: return String(localized: "Forced Only")
+        }
+    }
 }
 
 extension TrackIntentStore {
@@ -728,8 +761,8 @@ extension TrackIntentStore {
 extension TrackLanguage {
     /// The Audio Language setting's name for a stored code; nil follows the Plex account.
     static func audioSettingName(_ code: String?) -> String {
-        guard let code else { return "Plex Account" }
-        if code == original { return "Original" }
+        guard let code else { return String(localized: "Plex Account") }
+        if code == original { return String(localized: "Original") }
         // An untagged or unknown pick resolves to English (see resolveAudio).
         return isKnown(code) ? displayName(code) : displayName(english)
     }

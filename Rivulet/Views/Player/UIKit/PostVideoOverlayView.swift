@@ -121,8 +121,8 @@ final class PostVideoOverlayView: UIView {
     func configure(nextEpisode: PlexMetadata?, serverURL: String, authToken: String,
                    thumbnailURL: URL? = nil, errorMessage: String? = nil) {
         hasNextEpisode = nextEpisode != nil
-        headerLabel.text = hasNextEpisode ? "Up Next" : "End of Series"
-        headerSubtitleLabel.text = errorMessage ?? "You've watched all available episodes"
+        headerLabel.text = hasNextEpisode ? String(localized: "Up Next") : String(localized: "End of Series")
+        headerSubtitleLabel.text = errorMessage ?? String(localized: "You've watched all available episodes")
         headerSubtitleLabel.isHidden = hasNextEpisode && errorMessage == nil
         card.isHidden = !hasNextEpisode
         if let nextEpisode {
@@ -132,13 +132,48 @@ final class PostVideoOverlayView: UIView {
         applyButtonState()
     }
 
+    /// Set before the card shows: it grows out of this rect (the Up Next pill, in superview space)
+    /// instead of sliding in from the edge.
+    var growOrigin: CGRect?
+
+    /// How long the card takes to fold into the pill or grow out of it.
+    static let morphDuration: TimeInterval = 0.45
+
     /// The card stays off screen while the next episode is fetched, then slides in.
     func setLoading(_ loading: Bool) {
         guard !loading, !isOnScreen else { return }
         isOnScreen = true
-        UIView.animate(withDuration: 0.5, delay: 0, usingSpringWithDamping: 0.9, initialSpringVelocity: 0) {
+        if let origin = growOrigin {
+            superview?.layoutIfNeeded()
+            transform = fitting(origin)
+            alpha = 0
+            // Alpha is set in an animation, so the model is 1 at once and the card can take focus.
+            UIView.animate(withDuration: 0.2) { self.alpha = 1 }
+        }
+        UIView.animate(withDuration: growOrigin == nil ? 0.5 : Self.morphDuration, delay: 0,
+                       usingSpringWithDamping: 0.9, initialSpringVelocity: 0) {
             self.transform = .identity
         }
+    }
+
+    /// Shrinks the card into `rect` (the Up Next pill, in superview space), then removes it.
+    func shrink(into rect: CGRect, completion: @escaping () -> Void) {
+        isUserInteractionEnabled = false
+        UIView.animate(withDuration: 0.25, delay: Self.morphDuration - 0.3) { self.alpha = 0 }
+        UIView.animate(withDuration: Self.morphDuration, delay: 0, usingSpringWithDamping: 1,
+                       initialSpringVelocity: 0, animations: {
+            self.transform = self.fitting(rect)
+        }, completion: { _ in
+            self.removeFromSuperview()
+            completion()
+        })
+    }
+
+    /// The transform that lays this card over `rect`, from its untransformed frame.
+    private func fitting(_ rect: CGRect) -> CGAffineTransform {
+        guard bounds.width > 0, bounds.height > 0 else { return .identity }
+        return CGAffineTransform(translationX: rect.midX - center.x, y: rect.midY - center.y)
+            .scaledBy(x: rect.width / bounds.width, y: rect.height / bounds.height)
     }
 
     /// Slides the card back off the edge, then removes it.
@@ -165,11 +200,11 @@ final class PostVideoOverlayView: UIView {
     private func applyButtonState() {
         playNextButton.isHidden = !hasNextEpisode
         playNextButton.configure(
-            title: countdownActive ? "Play Now" : "Play Next", systemImage: "play.fill")
+            title: countdownActive ? String(localized: "Play Now") : String(localized: "postVideo.playNext", defaultValue: "Play Next"), systemImage: "play.fill")
         // With a countdown running, Dismiss means "stop the countdown"; with
         // none, it means "close the card".
         dismissButton.configure(
-            title: "Dismiss", systemImage: countdownActive ? nil : "xmark")
+            title: String(localized: "Dismiss"), systemImage: countdownActive ? nil : "xmark")
         dismissButton.setPrimaryLook(!hasNextEpisode)
     }
 
@@ -279,11 +314,11 @@ final class NextEpisodeCardView: UIView {
             ? String(format: "S%02dE%02d", episode.parentIndex ?? 0, episode.index ?? 0)
             : episode.year.map(String.init)
         numberLabel.isHidden = numberLabel.text == nil
-        titleLabel.text = episode.title ?? "Episode"
+        titleLabel.text = episode.title ?? String(localized: "Episode")
         summaryLabel.text = episode.summary
         summaryLabel.isHidden = (episode.summary ?? "").isEmpty
         if let duration = episode.duration {
-            durationLabel.text = "\(duration / 60000) min"
+            durationLabel.text = String(localized: "\(duration / 60000) min")
             durationLabel.isHidden = false
         } else {
             durationLabel.isHidden = true

@@ -43,12 +43,14 @@ struct LiveCardItem: Hashable, Identifiable {
                      program: program, recording: nil)
     }
 
-    /// An upcoming card's start: the time alone today, with the weekday after.
+    /// An upcoming card's start: the time alone today, with the weekday after. Formatted in
+    /// `calendar`'s zone, the one that decided "today".
     static func startLabel(_ program: UnifiedProgram, now: Date = Date(), calendar: Calendar = .current) -> String {
         let start = program.eventStart
+        let style = Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone)
         return calendar.isDate(start, inSameDayAs: now)
-            ? start.formatted(.dateTime.hour().minute())
-            : start.formatted(.dateTime.weekday().hour().minute())
+            ? start.formatted(style.hour().minute())
+            : start.formatted(style.weekday().hour().minute())
     }
 
     static func upcoming(_ program: UnifiedProgram, on channel: UnifiedChannel, section: String = "soon") -> LiveCardItem {
@@ -167,7 +169,7 @@ enum LiveShelves {
         // Channels played lately, newest first, to go straight back to one.
         let recent = chosen(input.recentChannelIds.compactMap { channelsById[$0] }, section: "recent")
         if !recent.isEmpty {
-            shelves.append(LiveShelf(id: "recent", title: "Recently Watched", items: recent))
+            shelves.append(LiveShelf(id: "recent", title: String(localized: "Recently Watched"), items: recent))
         }
 
         // Like what this viewer watches at this hour, from what is on now.
@@ -181,7 +183,7 @@ enum LiveShelves {
             }
             let picks = LiveSuggestions.rank(candidates, history: input.viewings, now: now).prefix(20)
             if picks.count >= 3 {
-                shelves.append(LiveShelf(id: "foryou", title: "For You", items: onNow(Array(picks), section: "foryou")))
+                shelves.append(LiveShelf(id: "foryou", title: String(localized: "For You"), items: onNow(Array(picks), section: "foryou")))
             }
         }
 
@@ -195,17 +197,17 @@ enum LiveShelves {
                 LiveCardItem.recording(recording, channel: recording.channelId.flatMap { channelsById[$0] })
             }
         if !recordings.isEmpty {
-            shelves.append(LiveShelf(id: "recordings", title: "Recordings", items: recordings))
+            shelves.append(LiveShelf(id: "recordings", title: String(localized: "Recordings"), items: recordings))
         }
 
         let favourites = chosen(LiveTVDataStore.favorites(in: all, order: input.favoriteIds,
                                                          unfavorited: input.unfavoritedIds), section: "favorites")
         if !favourites.isEmpty {
-            shelves.append(LiveShelf(id: "favorites", title: "Favorites", items: favourites))
+            shelves.append(LiveShelf(id: "favorites", title: String(localized: "Favorites"), items: favourites))
         }
 
         if !airing.isEmpty {
-            shelves.append(LiveShelf(id: "now", title: "On Now", items: onNow(Array(airing.prefix(150)), section: "now")))
+            shelves.append(LiveShelf(id: "now", title: String(localized: "On Now"), items: onNow(Array(airing.prefix(150)), section: "now")))
         }
 
         // The next programme on each channel that starts within the next
@@ -228,7 +230,7 @@ enum LiveShelves {
             .prefix(40)
             .compactMap { candidate, _ in candidate.program.map { LiveCardItem.upcoming($0, on: candidate.channel) } }
         if !soon.isEmpty {
-            shelves.append(LiveShelf(id: "soon", title: "Starting Soon", items: soon))
+            shelves.append(LiveShelf(id: "soon", title: String(localized: "Starting Soon"), items: soon))
         }
 
         // A shelf per genre, when the lineup spans more than one, by what each
@@ -243,7 +245,7 @@ enum LiveShelves {
             for genre in genres {
                 let id = "genre|\(genre.rawValue)"
                 let list = Array((byGenre[genre] ?? []).prefix(60))
-                shelves.append(LiveShelf(id: id, title: genre.rawValue, items: onNow(list, section: id)))
+                shelves.append(LiveShelf(id: id, title: genre.title, items: onNow(list, section: id)))
             }
         }
 

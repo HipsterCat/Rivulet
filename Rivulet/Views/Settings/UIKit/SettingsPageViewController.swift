@@ -16,7 +16,7 @@ import Combine
 import UIKit
 
 @MainActor
-final class SettingsPageViewController: UIViewController {
+final class SettingsPageViewController: UIViewController, SidebarTabReselecting {
 
     let page: SettingsPage
     /// A navigation row was selected → container pushes this page.
@@ -38,6 +38,7 @@ final class SettingsPageViewController: UIViewController {
     /// Move mode for a grabbed row: Up/Down slide it, Select drops it.
     private var reorder: GrabReorderController!
     private var speechModelState: AnyCancellable?
+    private var homeRowsUpdates: AnyCancellable?
 
     init(page: SettingsPage) {
         self.page = page
@@ -117,6 +118,18 @@ final class SettingsPageViewController: UIViewController {
                 .throttle(for: .milliseconds(250), scheduler: DispatchQueue.main, latest: true)
                 .sink { [weak self] _ in self?.refreshVisibleValues() }
         }
+
+        // Home Rows: a favorites or playlist row just switched on can move once
+        // its row has loaded. Never mid-move: the list would shift under the grab.
+        if page == .homeRows {
+            homeRowsUpdates = PersonalHomeRows.shared.$rows
+                .dropFirst()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    guard let self, !reorder.isMoving else { return }
+                    reloadRows()
+                }
+        }
     }
 
     @objc private func handleGrab(_ gr: UILongPressGestureRecognizer) {
@@ -156,7 +169,7 @@ final class SettingsPageViewController: UIViewController {
 
     private func section(of id: String) -> String? {
         guard let index = rows.firstIndex(where: { $0.id == id }) else { return nil }
-        return rows[..<index].last(where: \.isHeader)?.title
+        return rows[..<index].last(where: \.isHeader)?.id
     }
 
     /// Rebuild the row models for this page from current manager/UserDefaults
@@ -165,7 +178,7 @@ final class SettingsPageViewController: UIViewController {
     private func rebuildRows() {
         rows = SettingsContent.rows(for: page)
         if rows.isEmpty {
-            rows = [SettingsRowItem(id: "placeholder_\(page.title)",
+            rows = [SettingsRowItem(id: "placeholder_\(page)",
                                     title: "\(page.title) — coming soon",
                                     kind: .action(destructive: false, handler: { _ in }))]
         }
@@ -202,12 +215,36 @@ final class SettingsPageViewController: UIViewController {
     /// that mutate this page's OWN data and need the list to refresh in place
     /// (e.g. Libraries' Add All / Remove All).
     func reloadRows() {
+        let oldIDs = rows.map(\.id)
+        let focusedID = focusedIndexPath.flatMap { oldIDs.indices.contains($0.item) ? oldIDs[$0.item] : nil }
         rebuildRows()
-        collectionView?.reloadData()
+        let newIDs = rows.map(\.id)
+        guard let collectionView else { return }
+        // Rows that moved (Home Rows: a toggle sends its row across "Hidden
+        // from Home") move as cells, so focus moves with the focused one. A
+        // full reload left focus on the old index, which could be a header.
+        guard oldIDs != newIDs, Set(oldIDs).count == oldIDs.count, Set(newIDs).count == newIDs.count else {
+            collectionView.reloadData()
+            return
+        }
+        let path: (Int) -> IndexPath = { IndexPath(item: $0, section: 0) }
+        collectionView.performBatchUpdates({
+            collectionView.deleteItems(at: oldIDs.indices.filter { !newIDs.contains(oldIDs[$0]) }.map(path))
+            collectionView.insertItems(at: newIDs.indices.filter { !oldIDs.contains(newIDs[$0]) }.map(path))
+            for (from, id) in oldIDs.enumerated() {
+                if let to = newIDs.firstIndex(of: id), to != from { collectionView.moveItem(at: path(from), to: path(to)) }
+            }
+        }, completion: { [weak self] _ in self?.refreshVisibleValues() })
+        focusedIndexPath = focusedID.flatMap { newIDs.firstIndex(of: $0) }.map(path)
     }
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
         collectionView == nil ? super.preferredFocusEnvironments : [collectionView]
+    }
+
+    func reselectSidebarTab() {
+        let first = rows.firstIndex(where: \.isFocusable).map { IndexPath(item: $0, section: 0) }
+        SidebarReselection.returnToTop(in: collectionView, focusing: first)
     }
 }
 
@@ -254,7 +291,7 @@ extension SettingsPageViewController: UICollectionViewDataSource, UICollectionVi
             onPush?(target)
         case .toggle(let get, let set, let didChange):
             set(!get())
-            (collectionView.cellForItem(at: indexPath) as? SettingsCell)?.updateValue(get() ? "On" : "Off")
+            (collectionView.cellForItem(at: indexPath) as? SettingsCell)?.updateValue(get() ? String(localized: "On") : String(localized: "Off"))
             refreshDimmedRows()
             didChange?(get(), self)
         case .cycle(let value, let next):

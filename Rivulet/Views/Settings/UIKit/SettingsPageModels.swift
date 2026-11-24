@@ -84,8 +84,8 @@ struct SettingsRowItem {
     /// mode). Called with `up` to move it one slot and persist the new order.
     var onReorder: ((_ up: Bool) -> Void)?
     var isReorderable: Bool { onReorder != nil }
-    /// Reorder only slides between rows of the same group (Plex vs Jellyfin
-    /// libraries, each ordered within its own server). nil == nil as before.
+    /// Reorder only slides between rows of the same group (each server's
+    /// libraries, ordered within its own server). nil == nil as before.
     var reorderGroup: String? = nil
     /// A row whose meaning depends on another row's state renders dimmed and
     /// unfocusable while that state is off. Evaluated live (not cached at build
@@ -96,12 +96,39 @@ struct SettingsRowItem {
     /// True = this "row" is really a group caption (see `header(_:)`).
     var isHeader = false
 
+    /// A literal `title` is extracted to the string catalog; text that is not ours
+    /// (server, library, channel names) goes through `verbatim:`.
+    init(id: String, title: String.LocalizationValue, kind: Kind, onReorder: ((_ up: Bool) -> Void)? = nil,
+         reorderGroup: String? = nil, isEnabled: @escaping () -> Bool = { true },
+         isBusy: @escaping () -> Bool = { false }, isHeader: Bool = false) {
+        self.init(id: id, verbatim: String(localized: title), kind: kind, onReorder: onReorder,
+                  reorderGroup: reorderGroup, isEnabled: isEnabled, isBusy: isBusy, isHeader: isHeader)
+    }
+
+    init(id: String, verbatim title: String, kind: Kind, onReorder: ((_ up: Bool) -> Void)? = nil,
+         reorderGroup: String? = nil, isEnabled: @escaping () -> Bool = { true },
+         isBusy: @escaping () -> Bool = { false }, isHeader: Bool = false) {
+        self.id = id
+        self.title = title
+        self.kind = kind
+        self.onReorder = onReorder
+        self.reorderGroup = reorderGroup
+        self.isEnabled = isEnabled
+        self.isBusy = isBusy
+        self.isHeader = isHeader
+    }
+
     /// A group caption between row runs, Apple TV Settings style: small
     /// uppercase gray text, no capsule, never focusable. Deliberately NOT a
     /// `Kind` case — it reuses `.info`, which is already unfocusable and
     /// chevron-less, so every existing `switch kind` keeps working untouched.
-    static func header(_ title: String) -> SettingsRowItem {
-        SettingsRowItem(id: "hdr_\(title)", title: title, kind: .info(value: { "" }), isHeader: true)
+    /// The id keeps the English key, so it holds in every language.
+    static func header(_ title: LocalizedStringResource) -> SettingsRowItem {
+        SettingsRowItem(id: "hdr_\(title.key)", verbatim: String(localized: title), kind: .info(value: { "" }), isHeader: true)
+    }
+
+    static func header(verbatim title: String) -> SettingsRowItem {
+        SettingsRowItem(id: "hdr_\(title)", verbatim: title, kind: .info(value: { "" }), isHeader: true)
     }
 
     var isFocusable: Bool {
@@ -135,7 +162,7 @@ struct SettingsRowItem {
         switch kind {
         case .navigationValue(_, let value): return value()
         case .navigationAction(_, let value, _): return value?()
-        case .toggle(let get, _, _): return get() ? "On" : "Off"
+        case .toggle(let get, _, _): return get() ? String(localized: "On") : String(localized: "Off")
         case .cycle(let value, _): return value()
         case .info(let value): return value()
         case .selectable(_, let value, _): return value()
@@ -143,8 +170,8 @@ struct SettingsRowItem {
         // when empty.
         case .textEntry(let value, let placeholder, _, _, _, let isSecure, _, _):
             let current = value()
-            if current.isEmpty { return placeholder.isEmpty ? "Not set" : placeholder }
-            return isSecure ? "Set" : current
+            if current.isEmpty { return placeholder.isEmpty ? String(localized: "Not set") : placeholder }
+            return isSecure ? String(localized: "Set") : current
         case .navigation, .action, .option: return nil
         }
     }
@@ -170,13 +197,13 @@ enum SettingsContent {
     private static var serverRuns: [(name: String, kind: MediaProviderKind, providerID: String?)] {
         [(PlexAuthManager.shared.savedServerName ?? "Plex", .plex, nil)]
             + ServerDataStore.shared.sources.map { source in
-                (source.name, source.providerID.hasPrefix("jellyfin:") ? .jellyfin : .plex, source.providerID)
+                (source.name, MediaProviderRegistry.shared.kind(of: source.providerID) ?? .plex, source.providerID)
             }
     }
 
     /// Rows a restricted (managed) Plex profile does not get: other servers,
     /// sources, sign-out, and the parental controls themselves.
-    static let ownerOnlyRowIDs: Set<String> = ["cat_servers", "liveTVSources", "hdr_Filtering", "cat_contentFilter", "profilePickerOnLaunch"]
+    static let ownerOnlyRowIDs: Set<String> = ["cat_servers", "liveTVSources", "hdr_Filtering", "cat_contentFilter", "profilePickerOnLaunch", "iCloudSync"]
 
     static func rows(for page: SettingsPage) -> [SettingsRowItem] {
         let rows = allRows(for: page)
@@ -195,6 +222,7 @@ enum SettingsContent {
         case .plex:        return plex
         case .plexServerDetail: return plexServerDetail
         case .jellyfin:    return jellyfin
+        case .emby:        return emby
         case .libraries:   return libraries
         case .homeRows:    return homeRows
         case .cache:       return cache
@@ -214,7 +242,6 @@ enum SettingsContent {
         case .autoplayCountdownPicker: return autoplayCountdownPicker
         case .skipIntervalPicker:     return skipIntervalPicker
         case .skipBackIntervalPicker: return skipBackIntervalPicker
-        case .heightSpeakersPicker:   return heightSpeakersPicker
         case .subtitleModePicker:     return subtitleModePicker
         case .autoplayLimitPicker:    return autoplayLimitPicker
         case .homeQualityPicker:      return qualityPicker(home: true)
@@ -231,41 +258,82 @@ enum SettingsContent {
 
     private static var appIconPicker: [SettingsRowItem] {
         AppIcon.allCases.map { icon in
-            SettingsRowItem(id: "ai_\(icon.rawValue)", title: icon.title, kind: .option(
+            SettingsRowItem(id: "ai_\(icon.rawValue)", verbatim: icon.title, kind: .option(
                 isSelected: { AppIcon.current == icon },
                 select: { icon.apply() }))
         }
     }
 
-    private static let homeHeroOptions: [(id: String, title: String)] = [
-        ("off", "Off"), ("trending", "Trending"), ("continueWatching", "Continue Watching"),
-        ("recentlyAdded", "Recently Added"), ("watchlist", "Watchlist"),
-    ]
-
-    /// Off, or the hero on with what it shows: `showHomeHero` plus `homeHeroContent`.
-    private static var homeHeroPicker: [SettingsRowItem] {
-        homeHeroOptions.map { option in
-            SettingsRowItem(id: "hh_\(option.id)", title: option.title, kind: .option(
-                isSelected: { homeHeroChoice == option.id },
-                select: {
-                    SettingsStore.setBool("showHomeHero", option.id != "off")
-                    if option.id != "off" { SettingsStore.setString("homeHeroContent", option.id) }
-                }))
+    private static func heroTitle(_ source: HeroSources.Source) -> String {
+        switch source {
+        case .trending: String(localized: "Trending")
+        case .continueWatching: String(localized: "Continue Watching")
+        case .recentlyAdded: String(localized: "Recently Added")
+        case .watchlist: String(localized: "Watchlist")
+        case .favoriteMovies: String(localized: "Favorite Movies")
+        case .favoriteShows: String(localized: "Favorite TV Shows")
         }
     }
 
-    private static var homeHeroChoice: String {
-        guard SettingsStore.bool("showHomeHero", default: true) else { return "off" }
-        return PlexHomeViewController.heroContent.rawValue
+    /// What the hero shows (`HeroSources`): a toggle per list, then per
+    /// playlist. Several are mixed; none turns the hero off.
+    private static var homeHeroPicker: [SettingsRowItem] {
+        let sources = HeroSources.Source.allCases.filter { source in
+            ![.favoriteMovies, .favoriteShows].contains(source) || PersonalHomeRows.offersFavorites
+        }
+        var rows = [SettingsRowItem(id: "resetHomeHero", title: "Reset", kind: .action(destructive: true, handler: { vc in
+            presentConfirm(on: vc, title: "Reset the Hero?",
+                           message: "The hero shows Trending only, with no playlists.",
+                           confirmTitle: "Reset", destructive: true) {
+                HeroSources.reset()
+                (vc as? SettingsPageViewController)?.reloadRows()
+            }
+        }))]
+        rows += sources.map { source in
+            SettingsRowItem(id: "hh_\(source.rawValue)", verbatim: heroTitle(source), kind: .toggle(
+                get: { HeroSources.isOn(source) },
+                set: { HeroSources.set(source, on: $0) }))
+        }
+        let playlists = homePlaylists()
+        if !playlists.isEmpty { rows.append(.header("Playlists")) }
+        for entry in playlists {
+            let ref = MediaItemRef(providerID: entry.providerID, itemID: entry.playlistID)
+            rows.append(SettingsRowItem(id: "hh_playlist_\(entry.providerID)/\(entry.playlistID)",
+                                        verbatim: serverLabeled(entry.title, providerID: entry.providerID), kind: .toggle(
+                get: { HomePlaylistPins.isPinned(ref, in: .hero) },
+                set: { shown in
+                    if shown {
+                        HomePlaylistPins.pin(.init(providerID: entry.providerID, playlistID: entry.playlistID,
+                                                   title: entry.title), in: .hero)
+                    } else {
+                        HomePlaylistPins.unpin(ref, in: .hero)
+                    }
+                })))
+        }
+        return rows
     }
 
+    /// The Home section's value: Off, the one source, or Mixed.
     private static var homeHeroTitle: String {
-        homeHeroOptions.first { $0.id == homeHeroChoice }?.title ?? "Trending"
+        let titles = HeroSources.Source.allCases.filter(HeroSources.isOn).map(heroTitle)
+            + HomePlaylistPins.pins(in: .hero).map(\.title)
+        switch titles.count {
+        case 0: return String(localized: "Off")
+        case 1: return titles[0]
+        default: return String(localized: "Mixed")
+        }
+    }
+
+    /// With more than one server, a row names its own.
+    private static func serverLabeled(_ title: String, providerID: String?) -> String {
+        guard ServerDataStore.shared.labelsServers, let providerID else { return title }
+        let kind = MediaProviderRegistry.shared.kind(of: providerID) ?? .plex
+        return "\(title) (\(PlexHomeViewController.serverName(providerID: providerID, kind: kind)))"
     }
 
     private static var detailRatingPicker: [SettingsRowItem] {
         MediaRating.Source.allCases.filter { $0 != .unknown }.map { source in
-            SettingsRowItem(id: "dr_\(source.rawValue)", title: source.name, kind: .option(
+            SettingsRowItem(id: "dr_\(source.rawValue)", verbatim: source.name, kind: .option(
                 isSelected: { MediaRating.detailSource == source },
                 select: { UserDefaults.standard.set(source.rawValue, forKey: MediaRating.detailSourceKey) }))
         }
@@ -273,7 +341,7 @@ enum SettingsContent {
 
     private static var autoplayCountdownPicker: [SettingsRowItem] {
         AutoplayCountdown.allCases.map { opt in
-            SettingsRowItem(id: "ac_\(opt.rawValue)", title: opt.description, kind: .option(
+            SettingsRowItem(id: "ac_\(opt.rawValue)", verbatim: opt.description, kind: .option(
                 isSelected: { SettingsStore.int("autoplayCountdown", default: AutoplayCountdown.fiveSeconds.rawValue) == opt.rawValue },
                 select: { SettingsStore.setInt("autoplayCountdown", opt.rawValue) }))
         }
@@ -281,7 +349,7 @@ enum SettingsContent {
 
     private static var skipIntervalPicker: [SettingsRowItem] {
         SkipInterval.allCases.map { opt in
-            SettingsRowItem(id: "si_\(opt.rawValue)", title: opt.description, kind: .option(
+            SettingsRowItem(id: "si_\(opt.rawValue)", verbatim: opt.description, kind: .option(
                 isSelected: { SettingsStore.int(SkipInterval.storageKey, default: SkipInterval.defaultValue.rawValue) == opt.rawValue },
                 select: { SettingsStore.setInt(SkipInterval.storageKey, opt.rawValue) }))
         }
@@ -289,7 +357,7 @@ enum SettingsContent {
 
     private static var skipBackIntervalPicker: [SettingsRowItem] {
         SkipInterval.allCases.map { opt in
-            SettingsRowItem(id: "sbi_\(opt.rawValue)", title: opt.description, kind: .option(
+            SettingsRowItem(id: "sbi_\(opt.rawValue)", verbatim: opt.description, kind: .option(
                 isSelected: { Int(InputConfig.tapSeekBackSeconds) == opt.rawValue },
                 select: { SettingsStore.setInt(SkipInterval.backStorageKey, opt.rawValue) }))
         }
@@ -298,7 +366,7 @@ enum SettingsContent {
     /// Forced Only is set only by a player pick, so it is listed only while it is current.
     private static var subtitleModePicker: [SettingsRowItem] {
         SubtitleMode.choices.map { mode in
-            SettingsRowItem(id: "sm_\(mode)", title: mode.rawValue, kind: .option(
+            SettingsRowItem(id: "sm_\(mode)", verbatim: mode.title, kind: .option(
                 isSelected: { SubtitleMode.current == mode },
                 select: { TrackIntentStore.setSubtitles(mode: mode) }))
         }
@@ -306,20 +374,9 @@ enum SettingsContent {
 
     private static var autoplayLimitPicker: [SettingsRowItem] {
         AutoplayLimit.allCases.map { opt in
-            SettingsRowItem(id: "alim_\(opt.rawValue)", title: opt.description, kind: .option(
+            SettingsRowItem(id: "alim_\(opt.rawValue)", verbatim: opt.description, kind: .option(
                 isSelected: { AutoplayLimit.current == opt },
                 select: { SettingsStore.setInt(AutoplayLimit.storageKey, opt.rawValue) }))
-        }
-    }
-
-    /// "" is Off; the rest are the layouts the engine renders heights into.
-    private static var heightSpeakersPicker: [SettingsRowItem] {
-        ["", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "9.1.6"].map { layout in
-            SettingsRowItem(id: "hs_\(layout.isEmpty ? "off" : layout)", title: layout.isEmpty ? "Off" : layout,
-                            kind: .selectable(isSelected: { heightSpeakers == layout }, value: { nil }, handler: { vc in
-                SettingsStore.setString(AetherPlayer.heightSpeakersKey, layout)
-                (vc as? SettingsPageViewController)?.onPop?()
-            }))
         }
     }
 
@@ -327,7 +384,7 @@ enum SettingsContent {
     private static func qualityPicker(home: Bool) -> [SettingsRowItem] {
         let key = home ? StreamingQuality.homeKey : StreamingQuality.awayKey
         return StreamingQuality.allChoices.map { choice in
-            SettingsRowItem(id: "sq_\(choice.rawValue)", title: choice.label, kind: .option(
+            SettingsRowItem(id: "sq_\(choice.rawValue)", verbatim: choice.label, kind: .option(
                 isSelected: { StreamingQuality.setting(home: home) == choice },
                 select: { SettingsStore.setString(key, choice.rawValue) }))
         }
@@ -336,11 +393,11 @@ enum SettingsContent {
     private static var audioLanguagePicker: [SettingsRowItem] {
         let languages = TrackLanguage.sortedChoices
         // No stored intent follows the Plex account's audio language (#382).
-        let account = SettingsRowItem(id: "al_account", title: TrackLanguage.audioSettingName(nil), kind: .option(
+        let account = SettingsRowItem(id: "al_account", verbatim: TrackLanguage.audioSettingName(nil), kind: .option(
             isSelected: { TrackIntentStore.audioIntent == nil },
             select: { TrackIntentStore.audioIntent = nil }))
         return [account] + ([TrackLanguage.original] + languages).map { code in
-            SettingsRowItem(id: "al_\(code)", title: TrackLanguage.audioSettingName(code), kind: .option(
+            SettingsRowItem(id: "al_\(code)", verbatim: TrackLanguage.audioSettingName(code), kind: .option(
                 isSelected: { TrackIntentStore.audioIntent.map { TrackLanguage.normalize($0.language) } == code },
                 select: { TrackIntentStore.audioIntent = AudioIntent(language: code) }))
         }
@@ -348,16 +405,10 @@ enum SettingsContent {
 
     private static var subtitleLanguagePicker: [SettingsRowItem] {
         TrackLanguage.sortedChoices.map { code in
-            SettingsRowItem(id: "sl_\(code)", title: TrackLanguage.displayName(code), kind: .option(
+            SettingsRowItem(id: "sl_\(code)", verbatim: TrackLanguage.displayName(code), kind: .option(
                 isSelected: { TrackLanguage.normalize(TrackIntentStore.subtitleLanguage) == code },
                 select: { TrackIntentStore.setSubtitles(language: code) }))
         }
-    }
-
-    // MARK: Audio and subtitles (read and written through TrackIntentStore)
-
-    private static var heightSpeakers: String {
-        SettingsStore.string(AetherPlayer.heightSpeakersKey, default: "")
     }
 
     // MARK: Root
@@ -374,8 +425,22 @@ enum SettingsContent {
             SettingsRowItem(id: "cat_liveTV",     title: "Live TV",    kind: .navigation(.liveTV)),
             SettingsRowItem(id: "cat_servers",    title: "Servers",    kind: .navigation(.servers)),
             SettingsRowItem(id: "cache",          title: "Cache & Storage", kind: .navigation(.cache)),
+            SettingsRowItem(id: "iCloudSync",     title: "iCloud Sync",
+                            kind: .cycle(value: { iCloudSyncValue },
+                                         next: { CloudSync.shared.setEnabled(!CloudSync.shared.isEnabled) })),
             SettingsRowItem(id: "cat_about",      title: "About",      kind: .navigation(.about))
         ]
+    }
+
+    private static var iCloudSyncValue: String {
+        if CloudSync.shared.status == .on, CloudSync.shared.blockedAccountIDs.contains(PlexAuthManager.syncID) {
+            return String(localized: "iCloud has a different Plex account")
+        }
+        switch CloudSync.shared.status {
+        case .on: return String(localized: "On")
+        case .off: return String(localized: "Off")
+        case .noAccount: return String(localized: "Sign in to iCloud on this device")
+        }
     }
 
     // MARK: Appearance
@@ -393,7 +458,7 @@ enum SettingsContent {
                                 get: { PlexUserProfileManager.shared.showProfilePickerOnLaunch },
                                 set: { PlexUserProfileManager.shared.showProfilePickerOnLaunch = $0 })),
             SettingsRowItem(id: "topShelfStyle", title: "Top Shelf",
-                            kind: .cycle(value: { TopShelfCache.shared.fullScreen ? "Full Screen" : "Posters" },
+                            kind: .cycle(value: { TopShelfCache.shared.fullScreen ? String(localized: "Full Screen") : String(localized: "Posters") },
                                          next: { TopShelfCache.shared.fullScreen.toggle() })),
             toggle("skipPreview", "Skip Preview", key: "skipPreviewCarousel", default: false),
 
@@ -447,7 +512,7 @@ enum SettingsContent {
                                 TrackLanguage.audioSettingName(TrackIntentStore.audioIntent.map { TrackLanguage.normalize($0.language) })
                             })),
             SettingsRowItem(id: "subtitleMode", title: "Subtitles",
-                            kind: .navigationValue(.subtitleModePicker, value: { SubtitleMode.current.rawValue })),
+                            kind: .navigationValue(.subtitleModePicker, value: { SubtitleMode.current.title })),
             SettingsRowItem(id: "subtitleLanguage", title: "Subtitle Language",
                             kind: .navigationValue(.subtitleLanguagePicker, value: {
                                 TrackLanguage.displayName(TrackLanguage.normalize(TrackIntentStore.subtitleLanguage))
@@ -474,7 +539,7 @@ enum SettingsContent {
             toggle("promptResumeOrRestart", "Resume or Restart Prompt", key: "promptResumeOrRestart", default: false,
                    enabledWhen: { SettingsStore.bool("continueWatchingInstantResume", default: true) }),
             .header("Streaming Quality"),
-            SettingsRowItem(id: "homeStreamingQuality", title: "Home",
+            SettingsRowItem(id: "homeStreamingQuality", verbatim: String(localized: "streaming.home", defaultValue: "Home"),
                             kind: .navigationValue(.homeQualityPicker, value: {
                                 StreamingQuality.setting(home: true).label
                             })),
@@ -505,21 +570,25 @@ enum SettingsContent {
             SettingsRowItem(id: "autoplayLimit", title: "Limit",
                             kind: .navigationValue(.autoplayLimitPicker, value: { AutoplayLimit.current.description })),
             toggle("showPostVideoUpNext", "Up Next Panel", key: "showPostVideoUpNext", default: true),
+            SettingsRowItem(id: "cinemaTrailers", title: "Trailers Before Movies",
+                            kind: .cycle(value: { CinemaExtras.count == 0 ? String(localized: "Off") : "\(CinemaExtras.count)" },
+                                         next: {
+                                             SettingsStore.setInt(CinemaExtras.countKey,
+                                                                  CinemaExtras.count == CinemaExtras.countOptions.upperBound
+                                                                      ? 0 : CinemaExtras.count + 1)
+                                         })),
             .header("Home Theater"),
             toggle("upscaleLowResolution", "Upscale SD and 720p", key: AetherPlayer.upscaleKey, default: false),
-            toggle("dolbyVisionFEL", "Dolby Vision FEL", key: AetherPlayer.dolbyVisionFELKey, default: false),
-            SettingsRowItem(id: "heightSpeakers", title: "Height Speakers",
-                            kind: .navigationValue(.heightSpeakersPicker, value: { heightSpeakers.isEmpty ? "Off" : heightSpeakers })),
             .header("Filtering"),
             SettingsRowItem(id: "cat_contentFilter", title: "Content Filtering",
                             kind: .navigationValue(.contentFilter, value: {
-                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? "On" : "Off"
+                                SettingsStore.bool(ContentFilterManager.Keys.enabled, default: false) ? String(localized: "On") : String(localized: "Off")
                             })),
         ]
     }
 
     private static var generatedSubtitlesValue: String {
-        guard SettingsStore.bool(UniversalPlayerViewModel.generatedSubtitlesFallbackKey, default: false) else { return "Off" }
+        guard SettingsStore.bool(UniversalPlayerViewModel.generatedSubtitlesFallbackKey, default: false) else { return String(localized: "Off") }
         return SpeechModelStore.shared.statusText
     }
 
@@ -545,7 +614,7 @@ enum SettingsContent {
         rows.append(.header("Audio"))
         rows.append(SettingsRowItem(id: "cf_profanity", title: "Profanity",
                                     kind: .navigationValue(.contentFilterStrength, value: {
-                                        profanityOn ? strengthLabel(currentProfanityStrength()) : "Off"
+                                        profanityOn ? strengthLabel(currentProfanityStrength()) : String(localized: "Off")
                                     })))
         rows.append(categoryToggle(.blasphemy, id: "cf_blasphemy"))
         rows.append(categoryToggle(.slur, id: "cf_slur"))
@@ -553,7 +622,7 @@ enum SettingsContent {
         rows.append(SettingsRowItem(id: "cf_customWords", title: "Custom Words",
                                     kind: .navigationValue(.contentFilterWords, value: {
                                         let count = ContentFilterManager.customWords.count
-                                        return count == 0 ? "None" : "\(count)"
+                                        return count == 0 ? String(localized: "None") : "\(count)"
                                     })))
 
         // Scene categories (require an imported filter list)
@@ -567,8 +636,8 @@ enum SettingsContent {
         rows.append(SettingsRowItem(id: "cf_sourceURL", title: "Filter List URL",
                                     kind: .textEntry(
                                         value: { SettingsStore.string(ContentFilterManager.Keys.listSourceURL, default: "") },
-                                        placeholder: "Optional",
-                                        hint: "A folder or URL with per-title MCF or EDL files. A folder is searched by video file name, IMDb id, then Plex rating key. A URL can use {file}, {imdb}, {tmdb}, {tvdb} or {id}.",
+                                        placeholder: String(localized: "Optional"),
+                                        hint: String(localized: "A folder or URL with per-title MCF or EDL files. A folder is searched by video file name, IMDb id, then Plex rating key. A URL can use {file}, {imdb}, {tmdb}, {tvdb} or {id}."),
                                         suggestions: [],
                                         keyboardType: .URL,
                                         set: { SettingsStore.setString(ContentFilterManager.Keys.listSourceURL, $0) })))
@@ -583,13 +652,13 @@ enum SettingsContent {
     private static var contentFilterWords: [SettingsRowItem] {
         var rows = [SettingsRowItem(id: "cfw_add", title: "Add Word", kind: .textEntry(
             value: { "" },
-            placeholder: "Word or Phrase",
+            placeholder: String(localized: "Word or Phrase"),
             hint: nil,
             suggestions: [],
             keyboardType: .default,
             set: { ContentFilterManager.addCustomWord($0) }))]
         rows += ContentFilterManager.customWords.map { word in
-            SettingsRowItem(id: "cfw_\(word)", title: word, kind: .action(destructive: false, handler: { vc in
+            SettingsRowItem(id: "cfw_\(word)", verbatim: word, kind: .action(destructive: false, handler: { vc in
                 presentConfirm(on: vc, title: "Remove \"\(word)\"?",
                                message: "The filter will stop muting this word.",
                                confirmTitle: "Remove", destructive: true) {
@@ -608,7 +677,7 @@ enum SettingsContent {
             isSelected: { !profanityOn },
             select: { SettingsStore.setBool(key, false) }))
         return [off] + FilterSeverity.allCases.map { severity in
-            SettingsRowItem(id: "cfs_\(severity.rawValue)", title: strengthLabel(severity),
+            SettingsRowItem(id: "cfs_\(severity.rawValue)", verbatim: strengthLabel(severity),
                             kind: .option(
                                 isSelected: { profanityOn && currentProfanityStrength() == severity },
                                 select: {
@@ -630,14 +699,14 @@ enum SettingsContent {
     /// The stored value is the *minimum* severity that gets muted.
     private static func strengthLabel(_ severity: FilterSeverity) -> String {
         switch severity {
-        case .mild: return "Mild and up"
-        case .moderate: return "Moderate and up"
-        case .strong: return "Strong only"
+        case .mild: return String(localized: "Mild and up")
+        case .moderate: return String(localized: "Moderate and up")
+        case .strong: return String(localized: "Strong only")
         }
     }
 
     private static func categoryToggle(_ category: FilterCategory, id: String) -> SettingsRowItem {
-        SettingsRowItem(id: id, title: category.displayName, kind: .toggle(
+        SettingsRowItem(id: id, verbatim: category.displayName, kind: .toggle(
             get: { SettingsStore.bool(category.enabledDefaultsKey, default: category.defaultEnabled) },
             set: { SettingsStore.setBool(category.enabledDefaultsKey, $0) }))
     }
@@ -659,9 +728,9 @@ enum SettingsContent {
                 didChange: { isOn, vc in
                     guard !isOn else { return }
                     vc.present(ConfirmationPopupViewController(
-                        title: "Erase What For You Learned?",
-                        message: "Suggestions are off. Erase what Rivulet learned from what you watch, or keep it for if you turn them back on.",
-                        confirmTitle: "Erase", cancelTitle: "Keep", destructive: true,
+                        title: String(localized: "Erase What For You Learned?"),
+                        message: String(localized: "Suggestions are off. Erase what Rivulet learned from what you watch, or keep it for if you turn them back on."),
+                        confirmTitle: String(localized: "Erase"), cancelTitle: String(localized: "Keep"), destructive: true,
                         onConfirm: { LiveTVDataStore.shared.forgetViewings() }), animated: true)
                 })),
             toggle("confirmExitMultiview", "Confirm Exit Multiview", key: "confirmExitMultiview", default: true)
@@ -688,7 +757,7 @@ enum SettingsContent {
             let title = [channel.channelNumber.map(String.init), channel.name, sourceNames[channel.sourceId].map { "· \($0)" }]
                 .compactMap { $0 }
                 .joined(separator: " ")
-            return SettingsRowItem(id: "fav_\(channel.id)", title: title,
+            return SettingsRowItem(id: "fav_\(channel.id)", verbatim: title,
                                    kind: .action(destructive: false, handler: { vc in
                 presentConfirm(on: vc, title: "Remove \"\(channel.name)\"?",
                                message: "This removes the channel from your favorites. You can add it again by holding Select on it in What's On or the guide.",
@@ -725,6 +794,11 @@ enum SettingsContent {
                 id: "jellyfinServer", title: "Jellyfin Server",
                 kind: .navigationAction(.jellyfin,
                                         value: { JellyfinSession.account?.serverName ?? "" },
+                                        prepare: { addSourceDraft = AddSourceDraft() })),
+            SettingsRowItem(
+                id: "embyServer", title: "Emby Server",
+                kind: .navigationAction(.emby,
+                                        value: { EmbySession.account?.serverName ?? "" },
                                         prepare: { addSourceDraft = AddSourceDraft() }))
         ]
     }
@@ -749,6 +823,15 @@ enum SettingsContent {
         return plexServerRows + [
             SettingsRowItem(id: "signOut", title: "Sign Out",
                             kind: .action(destructive: true, handler: { vc in
+                let page = vc as? SettingsPageViewController
+                if CloudSync.shared.isSynced(accountID: PlexAuthManager.syncID) {
+                    presentSignOutChoice(
+                        on: vc, title: String(localized: "Sign Out of Plex?"),
+                        message: String(localized: "Your Plex sign-in is shared through iCloud. Sign out of this device only, or of every device?"),
+                        thisDevice: { PlexAuthManager.shared.signOut(scope: .thisDevice); page?.reloadRows() },
+                        everywhere: { PlexAuthManager.shared.signOut(scope: .everywhere); page?.reloadRows() })
+                    return
+                }
                 // Ask first. An accidental Select must not sign out.
                 presentConfirm(on: vc, title: "Sign Out of Plex?",
                                message: "This signs out of every Plex server on your account.",
@@ -785,9 +868,9 @@ enum SettingsContent {
                                     kind: .action(destructive: false, handler: { _ in }))]
         }
         return servers.map { server in
-            SettingsRowItem(id: "plexServer_\(server.clientIdentifier)", title: server.name,
+            SettingsRowItem(id: "plexServer_\(server.clientIdentifier)", verbatim: server.name,
                             kind: .navigationAction(.plexServerDetail,
-                                                    value: { isPlexServerEnabled(server) ? (server.owned == false ? server.sourceTitle ?? "" : "") : "Off" },
+                                                    value: { isPlexServerEnabled(server) ? (server.owned == false ? server.sourceTitle ?? "" : "") : String(localized: "Off") },
                                                     prepare: { pendingPlexServer = server }))
         }
     }
@@ -802,26 +885,26 @@ enum SettingsContent {
         var rows: [SettingsRowItem] = [
             SettingsRowItem(id: "plexServerEnabled", title: "Use This Server", kind: .selectable(
                 isSelected: { false },
-                value: { isPlexServerEnabled(server) ? "On" : "Off" },
+                value: { isPlexServerEnabled(server) ? String(localized: "On") : String(localized: "Off") },
                 handler: { vc in togglePlexServer(server, on: vc) }),
                 isBusy: { busyPlexServerID == server.clientIdentifier }),
-            info("plexServerStatus", "Status", server.presence == false ? "Offline" : "Online"),
-            info("plexServerOwner", "Owner", server.owned == false ? (server.sourceTitle ?? "Shared") : "You"),
+            info("plexServerStatus", "Status", server.presence == false ? String(localized: "Offline") : String(localized: "Online")),
+            info("plexServerOwner", "Owner", server.owned == false ? (server.sourceTitle ?? String(localized: "Shared")) : String(localized: "You")),
             info("plexServerVersion", "Version", server.productVersion)
         ]
         if let platform = server.platform {
             rows.append(info("plexServerPlatform", "Platform", [platform, server.platformVersion].compactMap { $0 }.joined(separator: " ")))
         }
         if let connection {
-            let kind = connection.relay ? "Relay" : connection.local ? "Local" : "Remote"
-            rows.append(info("plexServerConnection", "Connection", connection.protocolType == "https" ? "\(kind), Secure" : kind))
+            let kind = connection.relay ? String(localized: "Relay") : connection.local ? String(localized: "Local") : String(localized: "connection.remote", defaultValue: "Remote")
+            rows.append(info("plexServerConnection", "Connection", connection.protocolType == "https" ? String(localized: "\(kind), Secure") : kind))
         }
         let ds = LiveTVDataStore.shared
         if let id = server.machineIdentifier, ds.plexMachineIDs.values.contains(id) {
             rows.insert(plexLiveTVToggle(id: "plexServerLiveTV", machineID: id), at: 1)
             if let liveTV { rows.append(info("plexServerChannels", "Channels", "\(liveTV.channelCount)")) }
         } else {
-            rows.append(info("plexServerLiveTV", "Live TV", "No DVR"))
+            rows.append(info("plexServerLiveTV", "Live TV", String(localized: "No DVR")))
         }
         if let created = ISO8601DateFormatter().date(from: server.createdAt) {
             rows.append(info("plexServerCreated", "On Plex Since", created.formatted(date: .abbreviated, time: .omitted)))
@@ -853,10 +936,21 @@ enum SettingsContent {
 
     /// The Jellyfin server's counterpart of `plexLiveTVToggle`.
     static func jellyfinLiveTVToggle(id: String) -> SettingsRowItem {
+        serverLiveTVToggle(id: id, hiddenKey: JellyfinLiveTVProvider.hiddenKey, setHidden: JellyfinLiveTVProvider.setHidden)
+    }
+
+    /// The Emby server's counterpart.
+    static func embyLiveTVToggle(id: String) -> SettingsRowItem {
+        serverLiveTVToggle(id: id, hiddenKey: EmbyLiveTVProvider.hiddenKey, setHidden: EmbyLiveTVProvider.setHidden)
+    }
+
+    private static func serverLiveTVToggle(
+        id: String, hiddenKey: String, setHidden: @escaping @MainActor (Bool) -> Task<Void, Never>?
+    ) -> SettingsRowItem {
         var sync: Task<Void, Never>?
         return SettingsRowItem(id: id, title: "Show in Live TV", kind: .toggle(
-            get: { !UserDefaults.standard.bool(forKey: JellyfinLiveTVProvider.hiddenKey) },
-            set: { sync = JellyfinLiveTVProvider.setHidden(!$0) },
+            get: { !UserDefaults.standard.bool(forKey: hiddenKey) },
+            set: { sync = setHidden(!$0) },
             didChange: { _, vc in
                 Task {
                     await sync?.value
@@ -882,9 +976,9 @@ enum SettingsContent {
         let isSelected = PlexAuthManager.shared.isCurrentServer(server)
         if turningOff, isSelected, others.isEmpty {
             vc.present(ConfirmationPopupViewController(
-                title: "Only Server in Use",
-                message: "Turn on another server first, or sign out of Plex.",
-                confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
+                title: String(localized: "Only Server in Use"),
+                message: String(localized: "Turn on another server first, or sign out of Plex."),
+                confirmTitle: String(localized: "OK"), cancelTitle: nil, onConfirm: {}), animated: true)
             return
         }
         busyPlexServerID = server.clientIdentifier
@@ -909,14 +1003,14 @@ enum SettingsContent {
             page.reloadRows()
             if !changed {
                 page.present(ConfirmationPopupViewController(
-                    title: "Couldn’t Turn Off",
-                    message: "No other server is reachable right now, so \(server.name) stays on.",
-                    confirmTitle: "OK", cancelTitle: nil, onConfirm: {}), animated: true)
+                    title: String(localized: "Couldn’t Turn Off"),
+                    message: String(localized: "No other server is reachable right now, so \(server.name) stays on."),
+                    confirmTitle: String(localized: "OK"), cancelTitle: nil, onConfirm: {}), animated: true)
             }
         }
     }
 
-    private static func info(_ id: String, _ title: String, _ value: String) -> SettingsRowItem {
+    private static func info(_ id: String, _ title: String.LocalizationValue, _ value: String) -> SettingsRowItem {
         SettingsRowItem(id: id, title: title, kind: .info(value: { value }))
     }
 
@@ -937,53 +1031,35 @@ enum SettingsContent {
 
     // MARK: Home Rows (local subtractive filter over the server's row set)
 
-    /// Jellyfin's Home rows for the Home Rows page, titled the way Home titles
-    /// them: Continue Watching, then each sidebar-visible library's row in
-    /// sidebar order. Rows hidden here stay listed so they can be switched
-    /// back on; rows of libraries hidden from the sidebar never draw on Home,
-    /// so they are not offered.
-    static func serverHomeRowEntries(providerID: String) -> [(id: String, title: String)] {
-        ServerDataStore.shared.homeRowsInSidebarOrder.compactMap { row in
-            guard row.id.hasPrefix("\(providerID)|") else { return nil }
-            return row.hubIdentifier.map { ($0, row.title) }
-        }
+    /// Every row Home can draw, hidden ones included, in Home's order: one per
+    /// `HomeRowOrder` key, so every server's Continue Watching is one row and a
+    /// kind's favorites rows are one. Pinned collections have their own group.
+    static func orderedHomeRows() -> [(row: CachedHomeHub, kind: MediaProviderKind)] {
+        let rail = PlexHomeViewController.homeRail(
+            plex: plexHomeRows.filter { !($0.hubIdentifier ?? "").hasPrefix("rivulet.pin.") },
+            otherServers: ServerDataStore.shared.homeRowsInSidebarOrder,
+            personal: PersonalHomeRows.shared.homeRows,
+            libraryOrder: PlexHomeViewController.sidebarLibraryOrder(),
+            kindOf: { MediaProviderRegistry.shared.kind(of: $0) })
+        var seen = Set<String>()
+        return HomeRowOrder.arrange(rail, key: { HomeRowOrder.key(for: $0.row) })
+            .filter { seen.insert(HomeRowOrder.key(for: $0.row)).inserted }
     }
 
-    /// One toggle per row Plex offers Home, in Home's order. Built from
-    /// `PlexDataStore.homeItems`, the projection Home renders, so titles match
-    /// the shelves; hidden rows are added back so they can be switched on.
-    private static var homeRows: [SettingsRowItem] {
+    /// The selected Plex server's rows, hidden ones included (only the visible
+    /// ones before the first projection after a warm launch).
+    private static var plexHomeRows: CachedHomeRail {
         let store = PlexDataStore.shared
-        let visible = store.homeItems
-        // Hidden rows are absent from the projection by definition, so recover
-        // them from the hubs the projection was built from.
-        let hiddenRows: [(id: String, title: String)] = store.librariesPinnedToHome
-            .flatMap { store.libraryHubs[$0.key] ?? [] }
-            .filter { $0.promoted == true && HomeRowSettings.isHidden($0.hubIdentifier) }
-            .compactMap { hub in
-                guard let id = hub.hubIdentifier else { return nil }
-                return (id, hub.title ?? id)
-            }
-        let continueWatching: [(id: String, title: String)] = {
-            guard let cw = store.continueWatchingHub, let id = cw.hubIdentifier,
-                  HomeRowSettings.isHidden(id) else { return [] }
-            return [(id, cw.title ?? id)]
-        }()
+        return store.allHomeItems.isEmpty ? store.homeItems : store.allHomeItems
+    }
 
-        let plexEntries: [(id: String, title: String)] =
-            continueWatching
-            + visible.compactMap { row in
-                // Pinned collections are listed below with an Unpin action,
-                // never as a hide toggle.
-                guard let id = row.hubIdentifier, !id.hasPrefix("rivulet.pin.") else { return nil }
-                return (id, row.title)
-            }
-            + hiddenRows
-        let runs = serverRuns
-        let entriesByRun = runs.map { run in run.providerID.map(serverHomeRowEntries(providerID:)) ?? plexEntries }
-
-        let pinRows = pinnedCollectionRows(store: store)
-        guard entriesByRun.contains(where: { !$0.isEmpty }) else {
+    /// The Home Rows list: every row that is on, in Home's order (hold Select
+    /// to move one), then, under "Hidden from Home", every row that is off. A toggle
+    /// moves its row across at once.
+    private static var homeRows: [SettingsRowItem] {
+        let ordered = orderedHomeRows()
+        let pinRows = pinnedCollectionRows(store: PlexDataStore.shared)
+        guard !ordered.isEmpty || PlexAuthManager.shared.hasCredentials || ServerDataStore.shared.isSignedIn else {
             // A pin can outlive every Plex row (its library taken off Home),
             // and this page is the only place left to unpin it.
             guard pinRows.isEmpty else { return pinRows }
@@ -992,29 +1068,167 @@ enum SettingsContent {
                                     kind: .info(value: { "" }))]
         }
 
-        var rows: [SettingsRowItem] = [
-            SettingsRowItem(id: "showAllHomeRows", title: "Show All",
-                            kind: .action(destructive: false, handler: { vc in
-                HomeRowSettings.showAll()
-                (vc as? SettingsPageViewController)?.reloadRows()
-            }))
-        ]
-        // Several servers listed: each run under its server's name, as Sidebar
-        // Libraries does.
-        let labelsRuns = entriesByRun.filter { !$0.isEmpty }.count > 1
-        // De-dupe defensively: Continue Watching can be reported by both the
-        // dedicated hub and the projection.
-        var seen = Set<String>()
-        let headers = serverRunHeaders(runs.map { ($0.name, $0.kind) })
-        for (header, entries) in zip(headers, entriesByRun) where !entries.isEmpty {
-            if labelsRuns { rows.append(.header(header)) }
-            for entry in entries where seen.insert(entry.id).inserted {
-                rows.append(SettingsRowItem(id: "homeRow_\(entry.id)", title: entry.title, kind: .toggle(
-                    get: { !HomeRowSettings.isHidden(entry.id) },
-                    set: { shown in HomeRowSettings.setHidden(!shown, for: entry.id) })))
+        let move = { (key: String) -> (Bool) -> Void in
+            { up in HomeRowOrder.move(key, up: up, among: shownHomeRowKeys()) }
+        }
+        let labelsServers = ServerDataStore.shared.labelsServers
+
+        var on: [SettingsRowItem] = []
+        var off: [SettingsRowItem] = []
+        var listedFavorites: Set<MediaLibrary.LibraryKind> = []
+        var listedPlaylists: Set<String> = []
+        func add(_ item: SettingsRowItem, isOn: Bool) {
+            if isOn { on.append(item) } else { off.append(item) }
+        }
+        for (row, kind) in ordered {
+            let key = HomeRowOrder.key(for: row)
+            let isOn = isHomeRowOn(row)
+            if row.isContinueWatching {
+                let ids = continueWatchingIDs
+                add(SettingsRowItem(
+                    id: "homeRow_\(key)", title: "Continue Watching", kind: .toggle(
+                        get: { ids.contains { !HomeRowSettings.isHidden($0) } },
+                        set: { shown in
+                            if shown { HomeRowOrder.placeLast(key, among: shownHomeRowKeys()) }
+                            ids.forEach { HomeRowSettings.setHidden(!shown, for: $0) }
+                        },
+                        didChange: reloadPage),
+                    onReorder: isOn ? move(key) : nil, reorderGroup: isOn ? "homeRows" : nil), isOn: isOn)
+            } else if let favoriteKind = PersonalRows.favoriteKinds.first(where: {
+                PersonalRows.favoritesIdentifier($0) == key
+            }) {
+                listedFavorites.insert(favoriteKind)
+                add(favoritesRow(favoriteKind, onReorder: isOn ? move(key) : nil), isOn: isOn)
+            } else if row.id.hasPrefix(PersonalRows.playlistRowPrefix) {
+                // A playlist just switched off can outlive its pin for a moment:
+                // it is listed with the others under "Hidden from Home".
+                guard let pin = HomePlaylistPins.pins.first(where: {
+                    PersonalRows.playlistRowID(providerID: $0.providerID, playlistID: $0.playlistID) == row.id
+                }) else { continue }
+                listedPlaylists.insert(pin.id)
+                on.append(playlistToggle(providerID: pin.providerID, playlistID: pin.playlistID,
+                                         title: row.title, label: serverLabeled(row.title, providerID: pin.providerID),
+                                         onReorder: move(key)))
+            } else if let id = row.hubIdentifier {
+                let server = PlexHomeViewController.serverName(providerID: row.items.first?.ref.providerID, kind: kind)
+                add(SettingsRowItem(
+                    id: "homeRow_\(id)", verbatim: labelsServers ? "\(row.title) (\(server))" : row.title,
+                    kind: .toggle(
+                        get: { !HomeRowSettings.isHidden(id) },
+                        set: { shown in
+                            if shown { HomeRowOrder.placeLast(key, among: shownHomeRowKeys()) }
+                            HomeRowSettings.setHidden(!shown, for: id)
+                        },
+                        didChange: reloadPage),
+                    onReorder: isOn ? move(key) : nil, reorderGroup: isOn ? "homeRows" : nil), isOn: isOn)
             }
         }
-        return rows + pinRows
+        // A favorites kind or playlist that is on but has no row yet (still
+        // loading, or nothing in it) sits at the end of the on rows, unmovable.
+        // Favorites are offered only where a server has them.
+        for kind in PersonalRows.favoriteKinds
+        where PersonalHomeRows.offersFavorites && !listedFavorites.contains(kind) {
+            add(favoritesRow(kind, onReorder: nil), isOn: PersonalRows.showsFavorites(kind))
+        }
+        for entry in homePlaylists() where !listedPlaylists.contains("\(entry.providerID)/\(entry.playlistID)") {
+            add(playlistToggle(providerID: entry.providerID, playlistID: entry.playlistID,
+                               title: entry.title, label: serverLabeled(entry.title, providerID: entry.providerID), onReorder: nil),
+                isOn: HomePlaylistPins.isPinned(MediaItemRef(providerID: entry.providerID, itemID: entry.playlistID)))
+        }
+
+        let reset = SettingsRowItem(id: "resetHomeRows", title: "Reset",
+                                    kind: .action(destructive: true, handler: { vc in
+            presentConfirm(on: vc, title: "Reset Home Rows?",
+                           message: "Every row from your servers comes back in the original order. Favorites and playlists are turned off.",
+                           confirmTitle: "Reset", destructive: true) {
+                HomeRowSettings.showAll()
+                HomeRowOrder.reset()
+                PersonalRows.favoriteKinds.forEach { PersonalRows.setShowsFavorites(false, $0) }
+                HomePlaylistPins.removeAll()
+                (vc as? SettingsPageViewController)?.reloadRows()
+            }
+        }))
+        return [reset] + on + (off.isEmpty ? [] : [.header("Hidden from Home")] + off) + pinRows
+    }
+
+    /// The page's rows as `HomeRowOrder` keys: those that are on, as listed,
+    /// then the hidden ones. A move swaps with a neighbour that is on, never a
+    /// hidden row between them.
+    private static func shownHomeRowKeys() -> [String] {
+        let keys = orderedHomeRows().map(\.row).map { (key: HomeRowOrder.key(for: $0), isOn: isHomeRowOn($0)) }
+        return keys.filter(\.isOn).map(\.key) + keys.filter { !$0.isOn }.map(\.key)
+    }
+
+    /// Every server's Continue Watching is one row here, as on Home: its toggle covers them all.
+    private static var continueWatchingIDs: [String] {
+        Array(Set((plexHomeRows + ServerDataStore.shared.homeRowsInSidebarOrder)
+            .filter(\.isContinueWatching).compactMap(\.hubIdentifier)))
+    }
+
+    /// Whether a row of `orderedHomeRows` is on, which puts it above "Hidden from Home".
+    private static func isHomeRowOn(_ row: CachedHomeHub) -> Bool {
+        if row.isContinueWatching { return continueWatchingIDs.contains { !HomeRowSettings.isHidden($0) } }
+        if let kind = PersonalRows.favoriteKinds.first(where: { PersonalRows.favoritesIdentifier($0) == row.hubIdentifier }) {
+            return PersonalRows.showsFavorites(kind)
+        }
+        if row.id.hasPrefix(PersonalRows.playlistRowPrefix) {
+            return HomePlaylistPins.pins.contains {
+                PersonalRows.playlistRowID(providerID: $0.providerID, playlistID: $0.playlistID) == row.id
+            }
+        }
+        return row.hubIdentifier.map { !HomeRowSettings.isHidden($0) } ?? false
+    }
+
+    /// Moves a toggled row across the "Hidden from Home" line.
+    private static let reloadPage: (Bool, UIViewController) -> Void = { _, vc in
+        (vc as? SettingsPageViewController)?.reloadRows()
+    }
+
+    private static func favoritesRow(_ kind: MediaLibrary.LibraryKind, onReorder: ((Bool) -> Void)?) -> SettingsRowItem {
+        SettingsRowItem(id: kind == .shows ? "homeFavoriteShows" : "homeFavoriteMovies",
+                        title: kind == .shows ? "Favorite TV Shows" : "Favorite Movies", kind: .toggle(
+            get: { PersonalRows.showsFavorites(kind) },
+            set: { shown in
+                if shown { HomeRowOrder.placeLast(PersonalRows.favoritesIdentifier(kind), among: shownHomeRowKeys()) }
+                PersonalRows.setShowsFavorites(shown, kind)
+            },
+            didChange: reloadPage),
+            onReorder: onReorder, reorderGroup: onReorder == nil ? nil : "homeRows")
+    }
+
+    /// `title` is the playlist's own, stored with the pin; `label` may add its server.
+    private static func playlistToggle(providerID: String, playlistID: String, title: String, label: String,
+                                       onReorder: ((Bool) -> Void)?) -> SettingsRowItem {
+        let ref = MediaItemRef(providerID: providerID, itemID: playlistID)
+        return SettingsRowItem(id: "homePlaylist_\(providerID)/\(playlistID)", verbatim: label, kind: .toggle(
+            get: { HomePlaylistPins.isPinned(ref) },
+            set: { shown in
+                if shown {
+                    HomeRowOrder.placeLast(PersonalRows.playlistRowID(providerID: providerID, playlistID: playlistID),
+                                           among: shownHomeRowKeys())
+                    HomePlaylistPins.pin(.init(providerID: providerID, playlistID: playlistID, title: title))
+                } else {
+                    HomePlaylistPins.unpin(ref)
+                }
+            },
+            didChange: reloadPage),
+            onReorder: onReorder, reorderGroup: onReorder == nil ? nil : "homeRows")
+    }
+
+    /// Every server's video playlists, plus any pin whose playlist is no longer
+    /// listed, so it can still be switched off.
+    private static func homePlaylists() -> [(providerID: String, playlistID: String, title: String)] {
+        let listed = PlaylistAvailability.shared.playlistsByProvider
+        let providerIDs = ([MediaProviderRegistry.shared.plexProvider?.id].compactMap { $0 }
+            + ServerDataStore.shared.sources.map(\.providerID)).filter { listed[$0] != nil }
+        var entries = providerIDs.flatMap { id in
+            (listed[id] ?? []).map { (providerID: id, playlistID: $0.item.ref.itemID, title: $0.item.title) }
+        }
+        for pin in HomePlaylistPins.pins
+        where !entries.contains(where: { $0.providerID == pin.providerID && $0.playlistID == pin.playlistID }) {
+            entries.append((pin.providerID, pin.playlistID, pin.title))
+        }
+        return entries
     }
 
     /// The Pinned Collections group: every pin on the current server, not only
@@ -1031,10 +1245,12 @@ enum SettingsContent {
         for pin in pins {
             // Same as the sidebar libraries: hold Select to reorder, Select
             // asks before unpinning.
-            rows.append(SettingsRowItem(id: "pinnedCollection_\(destination)_\(pin.id)", title: pin.title,
+            rows.append(SettingsRowItem(id: "pinnedCollection_\(destination)_\(pin.id)", verbatim: pin.title,
                                         kind: .action(destructive: false, handler: { vc in
                 presentConfirm(on: vc, title: "Unpin \"\(pin.title)\"?",
-                               message: "This removes the row from \(destination == .home ? "Home" : "its library"). You can pin it again from the collection in its library.",
+                               message: destination == .home
+                                ? "This removes the row from Home. You can pin it again from the collection in its library."
+                                : "This removes the row from its library. You can pin it again from the collection in its library.",
                                confirmTitle: "Unpin", destructive: true) {
                     HomeCollectionPins.unpin(ratingKey: pin.ratingKey, libraryUUID: pin.libraryUUID, in: destination)
                     (vc as? SettingsPageViewController)?.reloadRows()
@@ -1052,7 +1268,8 @@ enum SettingsContent {
             libraries: SidebarLibrary.current(includeHidden: true),
             liveTVSources: LiveTVDataStore.shared.sources,
             combineLiveTV: SettingsStore.bool("combineLiveTVSources", default: true),
-            showDiscover: true, showWatchlist: true,
+            showDiscover: PlexAuthManager.shared.hasCredentials, showWatchlist: PlexAuthManager.shared.hasCredentials,
+            showFavorites: PersonalHomeRows.offersFavorites,
             playlistServers: PlaylistServer.current(PlaylistAvailability.shared.providerIDs))
         let byKey = Dictionary(rows.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
         return SidebarArrangement.arrange(rows.map(\.key), order: LibrarySettingsManager.shared.libraryOrder)
@@ -1073,6 +1290,7 @@ enum SettingsContent {
                     LibrarySettingsManager.shared.resetSidebar()
                     SettingsStore.setBool("showDiscoverTab", true)
                     SettingsStore.setBool("showWatchlistTab", true)
+                    SettingsStore.setBool("showFavoritesTab", false)
                     (vc as? SettingsPageViewController)?.reloadRows()
                 }
             }))
@@ -1105,6 +1323,9 @@ enum SettingsContent {
             case SidebarArrangement.watchlist:
                 kind = .toggle(get: { SettingsStore.bool("showWatchlistTab", default: true) },
                                set: { SettingsStore.setBool("showWatchlistTab", $0) })
+            case SidebarArrangement.favorites:
+                kind = .toggle(get: { SettingsStore.bool("showFavoritesTab", default: false) },
+                               set: { SettingsStore.setBool("showFavoritesTab", $0) })
             case _ where SidebarArrangement.isLiveTV(key):
                 // Live TV leaves the sidebar only with its sources: no toggle, nothing
                 // to open, but focusable so it can be held and moved.
@@ -1118,7 +1339,7 @@ enum SettingsContent {
             }
             // Hold Select to grab + reorder (Apple-Home style). The page VC
             // animates the slot change; this persists it, over the list as it is now.
-            return SettingsRowItem(id: SidebarArrangement.isAppRow(key) ? "sb_\(key)" : "lib_\(key)", title: title, kind: kind,
+            return SettingsRowItem(id: SidebarArrangement.isAppRow(key) ? "sb_\(key)" : "lib_\(key)", verbatim: title, kind: kind,
                                    onReorder: { up in
                                        mgr.moveSidebarRow(key: key, up: up, visible: sidebarSettingsRows().map(\.key))
                                    }, reorderGroup: "sidebar")
@@ -1153,6 +1374,7 @@ enum SettingsContent {
                     Task {
                         await ImageCacheManager.shared.clearAll()
                         ContinueWatchingCardCompositor.clearDisk()
+                        ArtworkTitleCheck.clearDisk()
                         await CacheManager.shared.clearAllCache()
                         await reloadFromServer()
                     }
@@ -1172,12 +1394,24 @@ enum SettingsContent {
     /// Canonical confirm/cancel prompt: the Liquid-Glass card
     /// (`ConfirmationPopupViewController`) shared with the rest of the app, not a
     /// system `UIAlertController`. Use this for every Settings confirmation.
-    private static func presentConfirm(on vc: UIViewController, title: String, message: String,
-                                       confirmTitle: String, destructive: Bool, action: @escaping () -> Void) {
+    private static func presentConfirm(on vc: UIViewController, title: String.LocalizationValue,
+                                       message: String.LocalizationValue,
+                                       confirmTitle: String.LocalizationValue, destructive: Bool, action: @escaping () -> Void) {
         let popup = ConfirmationPopupViewController(
-            title: title, message: message, confirmTitle: confirmTitle,
-            cancelTitle: "Cancel", destructive: destructive, onConfirm: action)
+            title: String(localized: title), message: String(localized: message),
+            confirmTitle: String(localized: confirmTitle),
+            cancelTitle: String(localized: "Cancel"), destructive: destructive, onConfirm: action)
         vc.present(popup, animated: true)
+    }
+
+    /// The sign-out question when the item is shared through iCloud: this device only, or all of them.
+    /// Menu and Cancel do nothing.
+    static func presentSignOutChoice(on vc: UIViewController, title: String, message: String,
+                                     thisDevice: @escaping () -> Void, everywhere: @escaping () -> Void) {
+        vc.present(ConfirmationPopupViewController(
+            title: title, message: message, confirmTitle: String(localized: "All Devices"),
+            alternateTitle: String(localized: "This Device Only"), onAlternate: thisDevice,
+            destructive: true, width: 1160, onConfirm: everywhere), animated: true)
     }
 
     // MARK: Live TV Sources
@@ -1189,12 +1423,12 @@ enum SettingsContent {
 
     private static var iptv: [SettingsRowItem] {
         let ds = LiveTVDataStore.shared
-        let hiddenSources = ds.hiddenPlexSources + [JellyfinLiveTVProvider.hiddenSource].compactMap { $0 }
+        let hiddenSources = ds.hiddenPlexSources + [JellyfinLiveTVProvider.hiddenSource, EmbyLiveTVProvider.hiddenSource].compactMap { $0 }
         let hidden = Set(hiddenSources.map(\.id))
         var rows: [SettingsRowItem] = (ds.sources + hiddenSources).sorted { $0.displayName < $1.displayName }.map { source in
-            SettingsRowItem(id: "src_\(source.id)", title: source.displayName,
+            SettingsRowItem(id: "src_\(source.id)", verbatim: source.displayName,
                             kind: .navigationAction(.liveTVSourceDetail,
-                                                    value: { hidden.contains(source.id) ? "Off" : source.isConnected ? "\(source.channelCount) ch" : "Offline" },
+                                                    value: { hidden.contains(source.id) ? String(localized: "Off") : source.isConnected ? String(localized: "\(source.channelCount) ch") : String(localized: "Offline") },
                                                     prepare: { pendingSourceDetail = source }))
         }
         rows.append(SettingsRowItem(id: "addLiveTVSource", title: "Add Live TV Source",
@@ -1215,14 +1449,16 @@ enum SettingsContent {
         if let plexToggle, let machineID, LiveTVDataStore.shared.isPlexLiveTVHidden(machineID: machineID) {
             return [plexToggle]
         }
-        if source.sourceType == .jellyfin {
-            guard JellyfinLiveTVProvider.hiddenSource == nil else { return [jellyfinLiveTVToggle(id: "src_showInLiveTV")] }
+        let serverToggle: (row: SettingsRowItem, isHidden: Bool)? = switch source.sourceType {
+        case .jellyfin: (jellyfinLiveTVToggle(id: "src_showInLiveTV"), JellyfinLiveTVProvider.hiddenSource != nil)
+        case .emby: (embyLiveTVToggle(id: "src_showInLiveTV"), EmbyLiveTVProvider.hiddenSource != nil)
+        default: nil
         }
-        var rows: [SettingsRowItem] = plexToggle.map { [$0] }
-            ?? (source.sourceType == .jellyfin ? [jellyfinLiveTVToggle(id: "src_showInLiveTV")] : [])
+        if let serverToggle, serverToggle.isHidden { return [serverToggle.row] }
+        var rows: [SettingsRowItem] = plexToggle.map { [$0] } ?? serverToggle.map { [$0.row] } ?? []
         rows += [
             SettingsRowItem(id: "src_status", title: "Status",
-                            kind: .info(value: { source.isConnected ? "Connected" : "Disconnected" })),
+                            kind: .info(value: { source.isConnected ? String(localized: "Connected") : String(localized: "Disconnected") })),
             SettingsRowItem(id: "src_channels", title: "Channels",
                             kind: .info(value: { "\(source.channelCount)" }))
         ]
@@ -1253,6 +1489,20 @@ enum SettingsContent {
         guard !source.sourceType.followsServer else { return rows }
         rows.append(SettingsRowItem(id: "removeSource", title: "Remove Source",
                                     kind: .action(destructive: true, handler: { vc in
+            let page = vc as? SettingsPageViewController
+            if CloudSync.shared.isSynced(accountID: LiveTVDataStore.syncID(forSource: source.id)) {
+                func remove(_ scope: SignOutScope) {
+                    Task { @MainActor in
+                        await LiveTVDataStore.shared.removeSource(id: source.id, scope: scope)
+                        page?.onPop?()
+                    }
+                }
+                presentSignOutChoice(
+                    on: vc, title: String(localized: "Remove Source?"),
+                    message: String(localized: "\"\(source.displayName)\" is shared through iCloud. Remove it from this device only, or from every device?"),
+                    thisDevice: { remove(.thisDevice) }, everywhere: { remove(.everywhere) })
+                return
+            }
             presentConfirm(on: vc, title: "Remove Source?",
                            message: "This will remove \"\(source.displayName)\" and all its channels from Live TV.",
                            confirmTitle: "Remove", destructive: true) {
@@ -1324,13 +1574,13 @@ enum SettingsContent {
                     page?.reloadRows()
                     let popup = code.map {
                         ConfirmationPopupViewController(
-                            title: "Diagnostics Sent",
-                            message: "Your code is \($0). Include it in your GitHub issue or message so the report can be found.",
-                            confirmTitle: "OK", cancelTitle: nil, onConfirm: {})
+                            title: String(localized: "Diagnostics Sent"),
+                            message: String(localized: "Your code is \($0). Include it in your GitHub issue or message so the report can be found."),
+                            confirmTitle: String(localized: "OK"), cancelTitle: nil, onConfirm: {})
                     } ?? ConfirmationPopupViewController(
-                        title: "Couldn't Send Diagnostics",
-                        message: "Diagnostics are not available in this build.",
-                        confirmTitle: "OK", cancelTitle: nil, onConfirm: {})
+                        title: String(localized: "Couldn't Send Diagnostics"),
+                        message: String(localized: "Diagnostics are not available in this build."),
+                        confirmTitle: String(localized: "OK"), cancelTitle: nil, onConfirm: {})
                     vc.present(popup, animated: true)
                 }
             }), isBusy: { DiagnosticsReport.isSending })
@@ -1376,7 +1626,7 @@ enum SettingsContent {
     /// `enabledWhen` marks the row as depending on another setting: while it
     /// returns false the row renders dimmed and cannot be focused or toggled.
     /// Cycles one marker kind through Button, Automatic and Off (#381).
-    private static func skipModeRow(_ id: String, _ title: String, marker: String) -> SettingsRowItem {
+    private static func skipModeRow(_ id: String, _ title: String.LocalizationValue, marker: String) -> SettingsRowItem {
         SettingsRowItem(id: id, title: title, kind: .cycle(
             value: { MarkerSkipMode.current(for: marker).label },
             next: {
@@ -1386,7 +1636,7 @@ enum SettingsContent {
             }))
     }
 
-    private static func toggle(_ id: String, _ title: String, key: String, default def: Bool,
+    private static func toggle(_ id: String, _ title: String.LocalizationValue, key: String, default def: Bool,
                                enabledWhen: (() -> Bool)? = nil) -> SettingsRowItem {
         SettingsRowItem(id: id, title: title, kind: .toggle(
             get: { SettingsStore.bool(key, default: def) },

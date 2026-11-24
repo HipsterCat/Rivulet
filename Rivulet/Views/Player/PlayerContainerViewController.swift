@@ -25,6 +25,9 @@ class PlayerContainerViewController: UIViewController {
     private var progressBar: PlayerProgressBarView?
     private var scrubberProxy: ScrubberFocusProxyView?
     private var skipPill: SkipPillButton?
+    /// The pill's two homes: bottom right over the video, or in the rail's tool row (#556).
+    private var floatingPillConstraints: [NSLayoutConstraint] = []
+    private var railPillConstraints: [NSLayoutConstraint] = []
     private var pausedDimView: UIView?
     private var chromeScrim = ChromeScrimView()
     private var ambientScrim: BottomScrimView?
@@ -51,6 +54,8 @@ class PlayerContainerViewController: UIViewController {
     private var postVideoOverlay: PostVideoOverlayView?
     /// Darkens the video behind the Up Next card, as `chromeScrim` does behind the rail.
     private var postVideoScrim: SideScrimView?
+    /// The Up Next pill's frame when it was selected: the page grows back out of it.
+    private var upNextGrowOrigin: CGRect?
     /// Snapshot of the last `$insightsCast` emission, read when the rail's
     /// Insights panel is presented.
     private var insightsCastCache: [MediaPerson] = []
@@ -202,7 +207,13 @@ class PlayerContainerViewController: UIViewController {
             // makes the pill non-focusable, so it can't steal focus while hidden.
             pill.alpha = 0
             pill.onSelect = { [weak self] in
-                Task { await self?.viewModel?.skipActiveMarker() }
+                guard let self, let vm = self.viewModel else { return }
+                if vm.upNextCollapsed {
+                    self.upNextGrowOrigin = self.skipPill?.frame
+                    vm.reopenUpNext()
+                } else {
+                    Task { await vm.skipActiveMarker() }
+                }
             }
             // Up/Down while the pill owns focus (chrome hidden) surfaces the
             // controls; while the chrome is up, let the engine move focus back
@@ -276,11 +287,22 @@ class PlayerContainerViewController: UIViewController {
                 proxy.topAnchor.constraint(equalTo: bar.topAnchor, constant: -8),
                 proxy.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: 56),
 
-                // Skip pill: AVKit's contextual-action spot, bottom right. Like
-                // AVKit's it shows only while the controls are hidden.
+            ])
+            // Skip pill: AVKit's contextual-action spot, bottom right, while the
+            // controls are hidden; with them up it sits in the rail's tool row.
+            floatingPillConstraints = [
                 pill.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -11),
                 pill.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -56),
-            ])
+            ]
+            let slotWidth = railView.skipPillSlot.widthAnchor.constraint(equalTo: pill.widthAnchor)
+            // Below required: the stack view zeroes a hidden slot's width.
+            slotWidth.priority = .defaultHigh
+            slotWidth.isActive = true
+            railPillConstraints = [
+                pill.centerXAnchor.constraint(equalTo: railView.skipPillSlot.centerXAnchor),
+                pill.centerYAnchor.constraint(equalTo: railView.skipPillSlot.centerYAnchor),
+            ]
+            NSLayoutConstraint.activate(floatingPillConstraints)
             // The proxy is a sibling of the rail, so the rail can't reach it
             // through the view tree — hand it over so its preferredFocus can
             // make the scrubber the first landing.
@@ -408,7 +430,7 @@ class PlayerContainerViewController: UIViewController {
             // had to restart the episode. A second press then exits, through
             // the checks below.
             if vm.postVideoState != .hidden {
-                vm.dismissPostVideo()
+                vm.closePostVideo()
                 return
             }
             if vm.isScrubbing {
@@ -421,14 +443,14 @@ class PlayerContainerViewController: UIViewController {
             }
             // Ambient pause backdrop: back returns to the paused frame, it
             // does not exit the player.
-            if vm.showPausedPoster {
+            if vm.backReturnsToPausedFrame {
                 vm.hidePausedPoster()
                 return
             }
             // Back from the transport buttons closes the whole chrome in one
             // press (not first de-focusing onto the scrubber). Hiding
             // showControls cascades to clear controlsFocusActive via its didSet.
-            if vm.controlsFocusActive || vm.showControls {
+            if (vm.controlsFocusActive || vm.showControls) && !vm.showPausedPoster {
                 withAnimation(.easeOut(duration: 0.25)) {
                     vm.showControls = false
                 }
@@ -682,9 +704,10 @@ class PlayerContainerViewController: UIViewController {
         guard let focusedView = focused as? UIView else { return false }
         if focusedView === contentAnchor { return true }
         if focusedView === skipPill {
-            // Only Left/Right seek behind the pill. An Up here is usually the
+            // Only Left/Right seek behind the floating pill. An Up here is usually the
             // press that just moved focus onto it, so claiming it bounces focus back.
-            return type == .leftArrow || type == .rightArrow
+            // In the rail's tool row the engine moves focus instead.
+            return vm.skipPillOwnsFocus && (type == .leftArrow || type == .rightArrow)
         }
         return false
     }
@@ -852,8 +875,8 @@ class PlayerContainerViewController: UIViewController {
     }
 
     /// Handle Menu button press with priority:
-    /// 1. Cancel auto-skip countdown if active
-    /// 2. Dismiss post-video overlay if showing
+    /// 1. Fold the Up Next page into its pill if showing
+    /// 2. Cancel auto-skip countdown if active
     /// 3. Cancel scrubbing if active
     /// 4. Close an open pill popup (Subtitles/Audio/Info) if any
     /// 5. Hide controls if visible
@@ -871,9 +894,24 @@ class PlayerContainerViewController: UIViewController {
             return
         }
 
+        // Up Next folds into its pill. The block matters: the system's own dismiss for this
+        // press lands after the page is gone, finds nothing to close, and exits the player.
+        if vm.postVideoState != .hidden {
+            vm.closePostVideo()
+            blockDismissTemporarily()
+            return
+        }
+
         // Cancel auto-skip countdown if active (highest priority)
         if vm.skipCountdownSeconds > 0 {
             vm.cancelSkipCountdown()
+            blockDismissTemporarily()
+            return
+        }
+
+        // Menu on the floating pill hides it for this marker; the controls still offer it (#556).
+        if vm.skipPillOwnsFocus {
+            vm.dismissSkipPill()
             blockDismissTemporarily()
             return
         }
@@ -889,13 +927,7 @@ class PlayerContainerViewController: UIViewController {
         }
 
         if inputCoordinator.target == nil {
-            if vm.postVideoState != .hidden {
-                // Return to the still-playing fullscreen video rather than
-                // exiting the player (see handleInputAction(.back)). This is
-                // the target-less fallback; the primary path routes .back
-                // through the coordinator to the same behavior.
-                vm.dismissPostVideo()
-            } else if vm.isScrubbing {
+            if vm.isScrubbing {
                 vm.cancelScrub()
             } else if let panel = activeRailPanel {
                 // Edge case only: while focus is inside the panel, Menu is
@@ -907,8 +939,10 @@ class PlayerContainerViewController: UIViewController {
                 if !panel.contentHandlesMenuPress() {
                     panel.dismissPanel()
                 }
-            } else if vm.showPausedPoster {
+            } else if vm.backReturnsToPausedFrame {
                 vm.hidePausedPoster()
+            } else if vm.showPausedPoster {
+                dismissPlayer()
             } else if vm.controlsFocusActive {
                 vm.exitControlsFocus()
             } else if vm.showControls {
@@ -926,8 +960,8 @@ class PlayerContainerViewController: UIViewController {
         // returning to the paused frame, and by the time the fallback dismiss
         // fires the poster flag is already cleared — without this term the
         // fallback would exit the player anyway.
-        let shouldBlockDismiss = vm.postVideoState == .hidden
-            && (vm.isScrubbing || vm.showControls || vm.showPausedPoster)
+        let shouldBlockDismiss = vm.isScrubbing || vm.backReturnsToPausedFrame
+            || (vm.showControls && !vm.showPausedPoster)
         if shouldBlockDismiss {
             blockDismissTemporarily()
         }
@@ -1229,7 +1263,7 @@ class PlayerContainerViewController: UIViewController {
         // Pill title + visibility + focus-ownership all react to the skip
         // button toggling and to the live countdown ticking.
         vm.$showSkipButton
-            .combineLatest(vm.$skipCountdownSeconds)
+            .combineLatest(vm.$skipCountdownSeconds, vm.$upNextCollapsed, vm.$skipPillDismissed)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshSkipPill() }
             .store(in: &cancellables)
@@ -1247,7 +1281,8 @@ class PlayerContainerViewController: UIViewController {
                     self?.applyPostVideoState(state)
                     self?.applyChromeVisibility()
                 } else {
-                    self?.applyChromeVisibility()
+                    // Also takes the pill's label, held while the page was up.
+                    self?.refreshSkipPill()
                     self?.applyPostVideoState(state)
                 }
             }
@@ -1277,7 +1312,7 @@ class PlayerContainerViewController: UIViewController {
                 self.upNextEpisodesCache = episodes
                 if let queue = vm.playQueue {
                     // A playlist of any type gets the pane, titled for what it lists.
-                    self.rail?.upNextButton.setTitle("Playlist")
+                    self.rail?.upNextButton.setTitle(String(localized: "Playlist"))
                     self.rail?.setUpNextAvailable(queue.entries.count > 1)
                 } else {
                     self.rail?.setUpNextAvailable(!episodes.isEmpty && vm.metadata.type == "episode")
@@ -1352,7 +1387,7 @@ class PlayerContainerViewController: UIViewController {
                     tracks: vm.subtitleMenuTracks,
                     selectedTrackId: vm.currentSubtitleTrackId, onTrackId: vm.subtitleOnTrackId,
                     actions: vm.canSearchSubtitles ? [
-                        CardActionConfig(title: "Search for Subtitles") { [weak self] row in
+                        CardActionConfig(title: String(localized: "Search for Subtitles")) { [weak self] row in
                             self?.searchSubtitles(from: row)
                         },
                     ] : [],
@@ -1362,7 +1397,7 @@ class PlayerContainerViewController: UIViewController {
                             title: "Delay",
                             value: { [weak vm] in SubtitleAdjustments.formattedDelay(vm?.subtitleDelaySeconds ?? 0) },
                             onStep: { [weak vm] step in vm?.adjustSubtitleDelay(bySteps: step) }),
-                        // Height: sticky per title, like Delay above.
+                        // Height: one global setting (#461).
                         CardStepperConfig(
                             title: "Height",
                             value: { [weak vm] in
@@ -1393,12 +1428,12 @@ class PlayerContainerViewController: UIViewController {
             guard let self, let vm = self.viewModel else { return }
             if vm.currentSubtitleTrackId != nil {
                 vm.selectSubtitleTrack(id: nil)
-                self.rail?.showNote("Subtitles off")
+                self.rail?.showNote(String(localized: "Subtitles off"))
             } else if let id = vm.subtitleOnTrackId,
                       // A hold never starts the generated model's download.
                       id != UniversalPlayerViewModel.generatedSubtitleId || SpeechModelStore.shared.state == .ready {
                 vm.selectSubtitleTrack(id: id)
-                self.rail?.showNote("Subtitles on")
+                self.rail?.showNote(String(localized: "Subtitles on"))
             }
         }
         rail.onAudio = { [weak self] in
@@ -1436,9 +1471,9 @@ class PlayerContainerViewController: UIViewController {
             guard let self, let vm = self.viewModel else { return }
             let filter = vm.contentFilter
             self.presentRailPanel(
-                content: CardTrackListView(header: "Content Filter", rows: [
-                    .init(title: "Filtering On", subtitle: vm.contentFilterNotice, trackId: 0, isSelected: !filter.isPaused),
-                    .init(title: "Pause for This Title", subtitle: nil, trackId: 1, isSelected: filter.isPaused),
+                content: CardTrackListView(header: String(localized: "Content Filter"), rows: [
+                    .init(title: String(localized: "Filtering On"), subtitle: vm.contentFilterNotice, trackId: 0, isSelected: !filter.isPaused),
+                    .init(title: String(localized: "Pause for This Title"), subtitle: nil, trackId: 1, isSelected: filter.isPaused),
                 ], onSelect: { [weak self, weak filter] choice in
                     filter?.setPaused(choice == 1)
                     self?.activeRailPanel?.dismissPanel()
@@ -1450,7 +1485,7 @@ class PlayerContainerViewController: UIViewController {
         rail.onQuality = { [weak self] in
             guard let self, let vm = self.viewModel else { return }
             let choices = StreamingQuality.allChoices
-            let playing = "Playing " + (vm.activeStreamPlan.step?.label ?? "Original")
+            let playing = String(localized: "Playing \(vm.activeStreamPlan.step?.label ?? String(localized: "Original"))")
             let rows = choices.enumerated().map { index, choice in
                 CardTrackListView.Row(
                     title: choice.label,
@@ -1459,7 +1494,7 @@ class PlayerContainerViewController: UIViewController {
                     isSelected: choice == vm.qualityChoice)
             }
             self.presentRailPanel(
-                content: CardTrackListView(header: "Quality", rows: rows, onSelect: { [weak vm, weak self] index in
+                content: CardTrackListView(header: String(localized: "Quality"), rows: rows, onSelect: { [weak vm, weak self] index in
                     if let index, choices.indices.contains(index) { vm?.selectQuality(choices[index]) }
                     self?.activeRailPanel?.dismissPanel()
                 }),
@@ -1512,28 +1547,28 @@ class PlayerContainerViewController: UIViewController {
     private func searchSubtitles(from row: CardTrackRowButton) {
         guard let vm = viewModel, subtitleSearchTask == nil else { return }
         let origin = activeRailPanel
-        row.setTitle("Searching…")
+        row.setTitle(String(localized: "Searching…"))
         subtitleSearchTask = Task { [weak self, weak vm, weak row] in
             let results = try? await vm?.searchSubtitles()
             guard let self else { return }
             self.subtitleSearchTask = nil
-            row?.setTitle("Search for Subtitles")
+            row?.setTitle(String(localized: "Search for Subtitles"))
             guard let vm, let origin, self.activeRailPanel === origin else { return }
             let found = results ?? []
             let rows = found.isEmpty
-                ? [CardTrackListView.Row(title: results == nil ? "Search Failed" : "No Subtitles Found",
+                ? [CardTrackListView.Row(title: results == nil ? String(localized: "Search Failed") : String(localized: "No Subtitles Found"),
                                          subtitle: nil, trackId: nil, isSelected: false)]
                 : found.enumerated().map { index, result in
                     CardTrackListView.Row(
-                        title: result.title ?? result.displayTitle ?? "Subtitle",
+                        title: result.title ?? result.displayTitle ?? String(localized: "Subtitle"),
                         subtitle: [result.language, result.codec?.uppercased(),
                                    result.hearingImpaired == true ? "SDH" : nil,
-                                   result.forced == true ? "Forced" : nil]
+                                   result.forced == true ? String(localized: "Forced") : nil]
                             .compactMap { $0 }.joined(separator: " • "),
                         trackId: index, isSelected: false)
                 }
             _ = self.presentRailPanel(
-                content: CardTrackListView(header: "Search Results", rows: rows, onSelect: { [weak vm, weak self] index in
+                content: CardTrackListView(header: String(localized: "Search Results"), rows: rows, onSelect: { [weak vm, weak self] index in
                     self?.activeRailPanel?.dismissPanel()
                     guard let index, let vm else { return }
                     Task { await vm.installSubtitle(found[index]) }
@@ -1692,12 +1727,12 @@ class PlayerContainerViewController: UIViewController {
                 return PlayerCardRowView.Card(
                     imageURL: vm.chapterThumbnailURL(chapter),
                     stillLoader: { [weak vm] in await vm?.chapterStill(at: start) },
-                    eyebrow: watching ? "Watching" : nil,
-                    title: chapter.tag ?? "Chapter \(index + 1)",
+                    eyebrow: watching ? String(localized: "Watching") : nil,
+                    title: chapter.tag ?? String(localized: "Chapter \(index + 1)"),
                     isCurrent: watching,
                     onSelect: { [weak self, weak vm] in
                         self?.activeRailPanel?.dismissPanel()
-                        Task { await vm?.seek(to: start) }
+                        Task { await vm?.seek(to: start, exact: true) }
                     })
             }
             let row = PlayerCardRowView(cards: cards)
@@ -1712,10 +1747,10 @@ class PlayerContainerViewController: UIViewController {
                 let state = UpNextRowState.state(for: episode, in: episodes, currentRatingKey: currentKey)
                 let isCurrent = state == .nowPlaying
                 let eyebrow: String? = switch state {
-                case .nowPlaying: "Watching"
-                case .upNext: "Up Next"
-                case .watched: "Watched"
-                case .future: episode.index.map { "Episode \($0)" }
+                case .nowPlaying: String(localized: "Watching")
+                case .upNext: String(localized: "Up Next")
+                case .watched: String(localized: "Watched")
+                case .future: episode.index.map { String(localized: "Episode \($0)") }
                 }
                 let thumb = vm.providerThumbnailURL(for: episode) ?? episode.thumb.flatMap {
                     PlexNetworkManager.shared.buildThumbnailURL(
@@ -1724,7 +1759,7 @@ class PlayerContainerViewController: UIViewController {
                 return PlayerCardRowView.Card(
                     imageURL: thumb,
                     eyebrow: eyebrow,
-                    title: episode.title ?? "Episode",
+                    title: episode.title ?? String(localized: "Episode"),
                     isCurrent: isCurrent,
                     onSelect: { [weak self, weak vm] in
                         self?.activeRailPanel?.dismissPanel()
@@ -1737,10 +1772,12 @@ class PlayerContainerViewController: UIViewController {
 
         case .insights:
             guard insightsButtonShouldBeAvailable else { return nil }
-            return (InsightsPanelContainerView(
+            let insights = InsightsPanelContainerView(
                 cast: insightsCastCache,
                 trivia: insightsTriviaCache,
-                suppressedTriviaIDs: suppressedTriviaIDsCache), nil)
+                suppressedTriviaIDs: suppressedTriviaIDsCache)
+            insights.onReadBio = { [weak self] in self?.presentDescription($0) }
+            return (insights, nil)
 
         case .details:
             // Live stats exist only on the aether route (an AetherPlayer is present).
@@ -1749,7 +1786,6 @@ class PlayerContainerViewController: UIViewController {
             let details = PlayerDetailsPaneView(
                 media: PlayerDetailsPaneView.mediaSections(metadata: vm.metadata, modes: vm.streamingModeInfo,
                                                            dolbyVision: vm.aetherPlayer?.dolbyVisionPlayback,
-                                                           enhancementLayer: vm.aetherPlayer?.dolbyVisionEnhancementLayer,
                                                            enhanceDialogue: SystemAudioAdjustment.dialogueSummary,
                                                            upscale: vm.aetherPlayer?.upscaleSummary),
                 statsProvider: statsProvider)
@@ -1764,11 +1800,11 @@ class PlayerContainerViewController: UIViewController {
             let item = queue.entries[index].item
             let isCurrent = UpNextRowState.queueState(at: index, currentIndex: queue.index) == .nowPlaying
             let eyebrow: String? = if isCurrent {
-                "Watching"
+                String(localized: "Watching")
             } else if item.kind == .movie {
-                "Movie"
+                String(localized: "Movie")
             } else if item.kind == .episode, let season = item.seasonNumber, let episode = item.episodeNumber {
-                "S\(season) E\(episode)"
+                String(localized: "S\(season) E\(episode)")
             } else {
                 nil
             }
@@ -1839,7 +1875,7 @@ class PlayerContainerViewController: UIViewController {
             rail?.setTitle(vm.title, eyebrow: vm.subtitle)
             return
         }
-        let number = [meta.parentIndex.map { "S\($0)" }, meta.index.map { "E\($0)" }]
+        let number = [meta.parentIndex.map { String(localized: "S\($0)") }, meta.index.map { String(localized: "E\($0)") }]
             .compactMap { $0 }.joined(separator: ", ")
         let eyebrow = [number, meta.title ?? ""].filter { !$0.isEmpty }.joined(separator: " • ")
         rail?.setTitle(show, eyebrow: eyebrow.isEmpty ? nil : eyebrow)
@@ -1871,7 +1907,9 @@ class PlayerContainerViewController: UIViewController {
                     overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -PlayerRailView.sideInset),
                     overlay.centerYAnchor.constraint(equalTo: view.centerYAnchor),
                 ])
+                overlay.growOrigin = upNextGrowOrigin
             }
+            upNextGrowOrigin = nil
             refreshPostVideoContent()
         } else if let overlay = postVideoOverlay {
             // A departing card is not the focus owner; the next presentation builds a new one.
@@ -1880,9 +1918,23 @@ class PlayerContainerViewController: UIViewController {
             postVideoScrim = nil
             UIView.animate(withDuration: 0.35, animations: { scrim?.alpha = 0 },
                            completion: { _ in scrim?.removeFromSuperview() })
-            overlay.slideOut { [weak self] in
+            let refocus = { [weak self] in
                 self?.setNeedsFocusUpdate()
                 self?.updateFocusIfNeeded()
+            }
+            if viewModel?.upNextCollapsed == true, let pill = skipPill {
+                // The card shrinks into the pill, which shows up as it arrives.
+                view.layoutIfNeeded()
+                let target = pill.frame
+                if pill.alpha > 0 {
+                    // Model alpha stays 1 so the pill takes focus now; the delay hides it until then.
+                    pill.layer.removeAllAnimations()
+                    pill.alpha = 0
+                    UIView.animate(withDuration: 0.2, delay: PostVideoOverlayView.morphDuration - 0.15) { pill.alpha = 1 }
+                }
+                overlay.shrink(into: target, completion: refocus)
+            } else {
+                overlay.slideOut(completion: refocus)
             }
         }
         setNeedsFocusUpdate()
@@ -1898,11 +1950,11 @@ class PlayerContainerViewController: UIViewController {
         overlay.onDismiss = { [weak self] in
             guard let vm = self?.viewModel else { return }
             // Mid-countdown the button stops the countdown and leaves the page
-            // up; with no countdown it returns to fullscreen video.
+            // up; with no countdown it folds into the Up Next pill.
             if vm.countdownSeconds > 0 && !vm.isCountdownPaused {
                 vm.cancelCountdown()
             } else {
-                vm.dismissPostVideo()
+                vm.closePostVideo()
             }
         }
         overlay.onUserFocusMove = { [weak self] in
@@ -1915,7 +1967,6 @@ class PlayerContainerViewController: UIViewController {
 
     private func refreshPostVideoContent() {
         guard let vm = viewModel, let overlay = postVideoOverlay, overlay.superview != nil else { return }
-        overlay.setLoading(vm.postVideoState == .loading)
         overlay.configure(
             nextEpisode: vm.nextEpisode,
             serverURL: vm.serverURL,
@@ -1928,6 +1979,9 @@ class PlayerContainerViewController: UIViewController {
             total: vm.countdownTotalSeconds,
             isPaused: vm.isCountdownPaused
         )
+        // After the content, which sets the card's size for a grow from the pill. Reads the live
+        // state, already past `.loading` if the fetch finished: only a real card comes in.
+        overlay.setLoading(vm.postVideoState != .showingEpisodeSummary)
     }
 
     /// Single writer for every chrome alpha and focus gate, so no two sinks fight
@@ -1993,9 +2047,12 @@ class PlayerContainerViewController: UIViewController {
             contentSelectPending = false
         }
 
-        // The skip pill shows whenever a marker is active, independent of the rail.
-        let skipVisible = vm.showSkipButton && !isLoading && !ambient && vm.postVideoState == .hidden
-            && !chromeVisible
+        // The skip pill: over the video while the controls are hidden (unless Menu
+        // dismissed it), in the rail's tool row while they are up (#556).
+        let skipAvailable = vm.showsSkipPill && !isLoading && !ambient && vm.postVideoState == .hidden
+        let pillInRail = skipAvailable && railVisible && !paneOpen
+        let skipVisible = pillInRail || (skipAvailable && !chromeVisible && !vm.skipPillDismissed)
+        let pillHomeChanged = pillInRail == (rail?.skipPillSlot.isHidden ?? !pillInRail)
 
         // Whether the pill owns focus. Re-resolved after the alpha write below.
         let ownsFocus = vm.skipPillOwnsFocus
@@ -2028,7 +2085,7 @@ class PlayerContainerViewController: UIViewController {
         captionOverlay?.controlsVisible = chromeVisible
         captionOverlay?.paneOpen = paneOpen
         guard targetsChanged || railAmbientChanged || ownershipChanged
-                || captionLiftChanged else {
+                || captionLiftChanged || pillHomeChanged else {
             if anchorNeedsFocusUpdate {
                 setNeedsFocusUpdate()
                 updateFocusIfNeeded()
@@ -2039,6 +2096,12 @@ class PlayerContainerViewController: UIViewController {
             for (view, alpha) in targets { view?.alpha = alpha }
             self.rail?.setAmbient(ambient, keepTitle: keepRailTitle)
             if captionLiftChanged { self.captionOverlay?.layoutIfNeeded() }
+            if pillHomeChanged {
+                self.rail?.skipPillSlot.isHidden = !pillInRail
+                NSLayoutConstraint.deactivate(pillInRail ? self.floatingPillConstraints : self.railPillConstraints)
+                NSLayoutConstraint.activate(pillInRail ? self.railPillConstraints : self.floatingPillConstraints)
+                self.view.layoutIfNeeded()
+            }
         }
         // Model alpha is now 1 for a visible pill, so the engine will accept it
         // as a focus target. Re-resolve toward/away from the pill (or off the
@@ -2081,7 +2144,10 @@ class PlayerContainerViewController: UIViewController {
     /// visibility and focus ownership. A mid-countdown re-show fills from the
     /// remaining seconds so the sweep still ends with the skip.
     private func refreshSkipPill() {
-        skipPill?.setTitle(viewModel?.skipButtonDisplayLabel, for: .normal)
+        // Held while Up Next is up, so the pill it grew from doesn't change its label as it fades.
+        if viewModel?.postVideoState == .hidden {
+            skipPill?.setTitle(viewModel?.skipButtonDisplayLabel, for: .normal)
+        }
         // Apply visibility BEFORE measuring for the fill: beginFill reads the
         // pill's laid-out width, which is only correct once it's on screen.
         applyChromeVisibility()
@@ -2120,10 +2186,10 @@ class PlayerContainerViewController: UIViewController {
         paneIdleTimer?.invalidate()
         paneIdleTimer = nil
         guard let pane = activeRailPanel, pane.isPane else { return }
-        // Measured in AVKit: 8s with focus on the pills, 20s inside the pane's content.
+        // Closes 8s after the last move on the pills; never while focus is in the pane.
         let focused = UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView
-        let delay: TimeInterval = focused?.isDescendant(of: pane) == true ? 20 : 8
-        paneIdleTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+        if focused?.isDescendant(of: pane) == true { return }
+        paneIdleTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 // The full summary is its own screen; closing it moves focus and re-arms.
                 guard let self, let vm = self.viewModel, let pane = self.activeRailPanel, pane.isPane,
@@ -2142,6 +2208,8 @@ class PlayerContainerViewController: UIViewController {
         guard let view else { return false }
         if let proxy = scrubberProxy, view === proxy { return true }
         if let rail, view.isDescendant(of: rail) { return true }
+        // The skip pill while it sits in the rail's tool row (#556).
+        if let pill = skipPill, view === pill, rail?.skipPillSlot.isHidden == false { return true }
         // A presented panel counts as the rail, or its dismiss loses the button
         // that opened it.
         if let panel = activeRailPanel, panel.window != nil, view.isDescendant(of: panel) { return true }

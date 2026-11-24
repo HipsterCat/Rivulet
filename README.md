@@ -6,7 +6,7 @@
 
 **Built for simplicity.**
 
-A native Apple TV app for Plex, Jellyfin, and Live TV.
+A native Apple TV app for Plex, Jellyfin, Emby, and Live TV.
 
 <a href="https://apps.apple.com/us/app/rivulet-for-plex/id6756892857">
   <img src="https://img.shields.io/badge/Download_on_the-App_Store-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download on the App Store">
@@ -53,9 +53,10 @@ I began this project in Decemeber 2025. At the time there was quite a lack of Pl
 - **HomePod Integration**: the Plex app has never worked well when setting HomePod as the default audio output on my Apple TV. It hurts to have a HomePod sitting there collecting dust while my sub-par TV speakers play sound. This app helps the hurt.
 - **Apple-Esque**: I enjoy Apple’s designs and apps, and enjoy the challenge of creating an app that feels native to the Apple ecosystem.
 <br></br>
+
 ## Live TV
 
-Rivulet works with several kinds of Live TV source. You don't need a Plex or Jellyfin server. Add just a Live TV source and the app opens straight to Live TV.
+Rivulet works with several kinds of Live TV source. You don't need a Plex, Jellyfin, or Emby server. Add just a Live TV source and the app opens straight to Live TV.
 
 - **What's On**: what's airing now, what starts soon, and a For You row that learns what you watch.
 - **Guide**: standard guide layout if you want.
@@ -82,25 +83,35 @@ This is a fun one. Open insights from the bottom row buttons while playing media
 
 </div>
 <br></br>
+
 ## Video player
 
 Playback runs on [AetherEngine](https://github.com/superuser404notfound/AetherEngine).
 
 - **Containers**: MKV, MP4, WebM, MPEG-TS, AVI, WMV, OGG, FLV, and more.
 - **Video**: H.264 and HEVC (including 10-bit) decode in hardware. AV1, VP9, MPEG-2, VC-1, MPEG-4 Part 2, and almost anything else FFmpeg can decode play in software. Interlaced broadcasts are deinterlaced on the GPU.
-- **HDR**: HDR10, HDR10+, HLG, and Dolby Vision profiles 5, 8.1, and 8.4. Profile 7 FEL plays with both layers composed on a Dolby Vision TV. Profile 7 MEL, and FEL titles too heavy to compose in real time, play as 8.1. Without a Dolby Vision TV, Profile 7 plays its HDR10 base layer.
-- **Audio**: Apple TV can't bitstream audio, so everything goes through tvOS. AAC, AC3, E-AC3, FLAC, and ALAC are handed to tvOS as-is, and it outputs them the same way it does in Apple's own apps. Atmos in E-AC3 reaches an Atmos receiver as Dolby MAT, and everything else goes out as multichannel PCM or Dolby Digital, depending on your Apple TV audio settings. TrueHD, DTS, DTS-HD MA, Opus, Vorbis, and PCM are decoded by Rivulet first and reach tvOS as lossless multichannel audio. TrueHD and DTS-HD MA stay lossless, but your receiver will show PCM instead of the original format.
+- **HDR**: HDR10, HDR10+, HLG, and Dolby Vision profiles 5, 8.1, and 8.4. On a Dolby Vision TV, Profile 7 plays as 8.1. Without one, it plays its HDR10 base layer.
+- **Audio**: Apple TV can't bitstream audio, so everything goes through tvOS. AAC, AC3, E-AC3, FLAC, and ALAC are handed to tvOS as-is, and it outputs them the same way it does in Apple's own apps. Atmos in E-AC3 reaches an Atmos receiver as Dolby MAT, and everything else goes out as multichannel PCM or Dolby Digital, depending on your Apple TV audio settings. TrueHD, DTS, DTS-HD MA, Opus, Vorbis, and PCM are decoded by Rivulet first and reach tvOS as lossless multichannel audio. TrueHD and DTS-HD MA stay lossless at up to 7.1, but your receiver will show PCM instead of the original format.
 - **Subtitles**: SRT, ASS/SSA, and WebVTT, plus image subtitles (PGS, DVB, DVD/VobSub), CEA-608 closed captions, DVB teletext, and external subtitle files from your server. ASS/SSA renders through libass with its original styling and embedded fonts.
 - **Stream quality**: direct play by default, or pick a transcode quality when bandwidth is tight.
 - **Content filtering** (work in progress): mute language and skip scenes on your device, from the title's subtitles or an imported EDL list. The file is never touched.
 
 <br></br>
+
 ## Music
 
 - Album, artist, and playlist browsing, modeled on Apple's Music app for tvOS. I think its beautiful.
 - Lyrics, synced when the source provides timestamps.
 - System Now Playing controls. HomePod, AirPods, Siri Remote, and Control Center all work.
+
+<div align="center">
+
+<img src="Screenshots/tvOS/08-music-library.jpg" alt="Music library" width="49%">
+<img src="Screenshots/tvOS/09-now-playing.jpg" alt="Now Playing" width="49%">
+
+</div>
 <br></br>
+
 ## iPhone and iPad
 
 The iOS app follows the Apple TV app and should have all the features one needs. It shares the same Core code as the tvOS app.
@@ -125,6 +136,7 @@ The iOS app follows the Apple TV app and should have all the features one needs.
 
 ---
 <br></br>
+
 ## Building
 
 Requires Xcode 27. Copy the secrets template once (placeholder values are fine), then open the project:
@@ -136,6 +148,7 @@ open Rivulet.xcodeproj
 
 `Rivulet` is the tvOS scheme and `Rivulet iOS` is the iPhone and iPad scheme. `Rivulet/` holds the tvOS app, `RivuletiOS/` the iOS app, and `RivuletCore/` the code both share. See `CLAUDE.md` for the architecture.
 <br></br>
+
 ## Contributing
 
 Found a bug? [Open an issue](../../issues/new/choose) and pick the platform (tvOS or iOS). If the same bug shows up on both, open one issue per platform so each fix is tracked on its own.
@@ -146,6 +159,7 @@ I welcome all contributions from any level of developer. I welcome contributions
 
 By submitting a pull request, you agree to license your contribution under the same terms as Rivulet (PolyForm Noncommercial 1.0.0, see [LICENSE](LICENSE)).
 <br></br>
+
 ## License
 
 Rivulet is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
@@ -158,6 +172,7 @@ This restriction is not decorative. If you ship Rivulet's code (in whole or in p
 
 Third-party components retain their original licenses. FFmpeg is included under LGPL-2.1+; libdovi under MIT. See [LICENSE](LICENSE) for details.
 <br></br>
+
 ## Acknowledgments
 
 - [AetherEngine](https://github.com/superuser404notfound/AetherEngine): the playback engine
@@ -166,6 +181,7 @@ Third-party components retain their original licenses. FFmpeg is included under 
 - [libass](https://github.com/libass/libass): ASS/SSA subtitle rendering
 - [Plex](https://plex.tv/): media server platform
 - [Jellyfin](https://jellyfin.org/): open source media server
+- [Emby](https://emby.media/): media server platform
 - [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr): IPTV management
 - [TMDB](https://www.themoviedb.org/): artwork and metadata for Discover
 
@@ -173,6 +189,8 @@ Third-party components retain their original licenses. FFmpeg is included under 
 
 <div align="center">
 
-Rivulet is not affiliated with or endorsed by Plex, Inc. or the Jellyfin project.
+Rivulet is not affiliated with or endorsed by Plex, Inc., the Jellyfin project, or Emby LLC.
+
+Media used in the README is AI generated for copyright reasons.
 
 </div>

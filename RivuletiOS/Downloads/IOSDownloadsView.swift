@@ -19,24 +19,25 @@ struct IOSDownloadsView: View {
 
     private var groups: [Shelf] {
         let records = downloads.visibleRecords
-        let movies = records.filter { $0.metadata.type != "episode" }
-            .sorted { $0.metadata.displayTitle.localizedStandardCompare($1.metadata.displayTitle) == .orderedAscending }
-        let seasons = Dictionary(grouping: records.filter { $0.metadata.type == "episode" }) {
-            "\($0.metadata.grandparentRatingKey ?? $0.metadata.showTitle)|\($0.metadata.parentIndex ?? 0)"
+        let movies = records.filter { $0.item.kind != .episode }
+            .sorted { $0.item.displayTitle.localizedStandardCompare($1.item.displayTitle) == .orderedAscending }
+        let seasons = Dictionary(grouping: records.filter { $0.item.kind == .episode }) {
+            "\($0.providerID)|\($0.item.grandparentRef?.itemID ?? $0.item.seriesTitle ?? "")|\($0.item.seasonNumber ?? 0)"
         }
         let shows = seasons.map { key, records in
-            let episodes = records.sorted { ($0.metadata.index ?? 0) < ($1.metadata.index ?? 0) }
-            let first = episodes[0].metadata
-            let season = first.parentIndex.map { $0 == 0 ? "Specials" : "Season \($0)" }
-            return (show: first.showTitle, season: first.parentIndex ?? 0, group: Shelf(
-                id: key, title: [first.showTitle, season].compactMap { $0 }.joined(separator: " · "), records: episodes))
+            let episodes = records.sorted { ($0.item.episodeNumber ?? 0) < ($1.item.episodeNumber ?? 0) }
+            let first = episodes[0].item
+            let showTitle = first.seriesTitle ?? first.displayTitle
+            let season = first.seasonNumber.map { $0 == 0 ? String(localized: "Specials") : String(localized: "Season \($0)") }
+            return (show: showTitle, season: first.seasonNumber ?? 0, group: Shelf(
+                id: key, title: [showTitle, season].compactMap { $0 }.joined(separator: " · "), records: episodes))
         }
         .sorted { lhs, rhs in
             let order = lhs.show.localizedStandardCompare(rhs.show)
             return order == .orderedSame ? lhs.season < rhs.season : order == .orderedAscending
         }
         .map(\.group)
-        return (movies.isEmpty ? [] : [Shelf(id: "movies", title: "Movies", records: movies)]) + shows
+        return (movies.isEmpty ? [] : [Shelf(id: "movies", title: String(localized: "Movies"), records: movies)]) + shows
     }
 
     var body: some View {
@@ -72,17 +73,25 @@ struct IOSDownloadsView: View {
             switch record.state {
             // By record: its ratingKey may name another item on the current server.
             case .completed:
-                if let request = downloads.localPlayback(record: record) { playback.play(request) }
+                playback.play(download: record)
             case .failed: downloads.retry(recordID: record.id)
+            case .pausedByUser: downloads.resume(recordID: record.id)
             default: break
             }
         } label: {
-            IOSDownloadRow(record: record, isPreparing: actions.preparingID == record.metadata.id)
+            IOSDownloadRow(record: record, isPreparing: actions.preparingID == record.item.ref.actionKey)
         }
         .buttonStyle(.plain)
         .swipeActions {
             Button(record.state.isSettled ? "Delete" : "Cancel", systemImage: "trash", role: .destructive) {
                 downloads.delete(recordID: record.id)
+            }
+            if record.state == .pausedByUser {
+                Button("Resume", systemImage: "play.fill") { downloads.resume(recordID: record.id) }
+                    .tint(.blue)
+            } else if !record.state.isSettled {
+                Button("Pause", systemImage: "pause.fill") { downloads.pause(recordID: record.id) }
+                    .tint(.orange)
             }
         }
     }
@@ -91,18 +100,19 @@ struct IOSDownloadsView: View {
 private struct IOSDownloadRow: View {
     let record: DownloadRecord
     let isPreparing: Bool
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
 
-    private var item: PlexMetadata { record.metadata }
+    private var item: MediaItem { record.item }
 
+    /// The saved poster; failing that, a Plex server's art by path, or another server's own image URL.
     private var posterURL: URL? {
         record.posterFileName.map { IOSDownloadTransfer.directory.appending(path: $0) }
-            ?? plex.artworkURL(for: item, kind: .poster, width: 180, height: 270)
+            ?? (record.isPlex ? plex.artworkURL(for: record.metadata, kind: .poster, width: 180, height: 270) : item.artwork.poster)
     }
 
     private var title: String {
-        guard item.type == "episode" else { return item.displayTitle }
-        return [item.index.map { "E\($0)" }, item.displayTitle].compactMap { $0 }.joined(separator: " · ")
+        guard item.kind == .episode else { return item.displayTitle }
+        return [item.episodeNumber.map { String(localized: "E\($0)") }, item.displayTitle].compactMap { $0 }.joined(separator: " · ")
     }
 
     private var isFailed: Bool {
@@ -120,7 +130,7 @@ private struct IOSDownloadRow: View {
                     .font(.body.weight(.semibold))
                     .lineLimit(2)
                 Text(record.statusText)
-                    .font(.subheadline)
+                    .font(.subheadline.monospacedDigit())
                     .foregroundStyle(isFailed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
                     .lineLimit(3)
                 if let progress = record.progress {
@@ -137,12 +147,18 @@ private struct IOSDownloadRow: View {
             } else if isFailed {
                 Image(systemName: "arrow.clockwise")
                     .foregroundStyle(.tint)
+            } else if let percent = record.percentText {
+                // Sized to "100%" so the row doesn't reflow as the number grows.
+                Text("100%").hidden()
+                    .overlay(alignment: .trailing) { Text(percent) }
+                    .font(.title3.weight(.semibold).monospacedDigit())
             }
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityHint(record.state == .completed ? "Plays" : (isFailed ? "Retries the download" : ""))
+        .accessibilityHint(record.state == .completed ? "Plays"
+            : isFailed ? "Retries the download" : record.state == .pausedByUser ? "Resumes the download" : "")
     }
 }
 
@@ -150,13 +166,14 @@ private struct IOSDownloadRow: View {
 
 /// The detail page's download circle: Download, a progress ring, or a filled arrow with Play and Remove.
 struct IOSDownloadButton: View {
-    let item: PlexMetadata
+    let item: MediaItem
     @EnvironmentObject private var downloads: IOSDownloadCenter
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
+    @EnvironmentObject private var browse: BrowseStore
     @Environment(\.plexActions) private var actions
 
     var body: some View {
-        if let key = item.ratingKey, let record = downloads.record(for: key) {
+        if let record = downloads.record(for: item.ref) {
             Menu {
                 Section(record.statusText) {
                     switch record.state {
@@ -178,14 +195,14 @@ struct IOSDownloadButton: View {
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
             .accessibilityLabel("Download")
-            .accessibilityValue(record.statusText)
+            .accessibilityValue([record.statusText, record.percentText].compactMap { $0 }.joined(separator: ", "))
         } else {
             Button { actions.download(item) } label: {
                 Image(systemName: "arrow.down").frame(width: 22, height: 22)
             }
             .buttonStyle(.glass)
             .buttonBorderShape(.circle)
-            .disabled(!plex.isConfigured)
+            .disabled(!browse.canDownload(item))
             .accessibilityLabel("Download")
         }
     }
@@ -222,32 +239,41 @@ extension DownloadRecord {
         func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
         switch state {
         case .waitingForNetwork:
-            return "Waiting for Wi-Fi"
+            return String(localized: "Waiting for Wi-Fi")
         case .waitingForServer:
-            return "Waiting for Server"
+            return String(localized: "Waiting for Server")
         case .preparing(let progress):
-            return "Preparing on Server \(Int(progress))%"
+            return String(localized: "Preparing on Server")
         case .downloading:
             guard let expected = expectedBytes, expected > 0 else {
-                return receivedBytes > 0 ? "Downloading · \(size(receivedBytes))" : "Downloading"
+                return receivedBytes > 0 ? size(receivedBytes) : String(localized: "Downloading")
             }
-            let percent = Int(Double(receivedBytes) / Double(expected) * 100)
-            return "Downloading \(percent)% · \(size(receivedBytes)) of \(size(expected))"
-        case .paused:
-            return "Paused"
+            // Received in the total's unit, padded with digit-wide figure spaces to its width.
+            let formatter = ByteCountFormatter()
+            formatter.countStyle = .file
+            formatter.allowedUnits = expected >= 1_000_000_000 ? .useGB : .useMB
+            formatter.zeroPadsFractionDigits = true
+            let total = formatter.string(fromByteCount: expected)
+            let received = formatter.string(fromByteCount: min(receivedBytes, expected))
+            return String(repeating: "\u{2007}", count: max(0, total.count - received.count)) + "\(received) / \(total)"
+        case .paused, .pausedByUser:
+            return String(localized: "Paused")
         case .failed(let reason):
-            return "Failed: \(reason)"
+            return String(localized: "Failed: \(reason)")
         case .completed:
-            return ["Downloaded", outputLabel, expectedBytes.map(size)].compactMap { $0 }.joined(separator: " · ")
+            return [String(localized: "Downloaded"), outputLabel, expectedBytes.map(size)].compactMap { $0 }.joined(separator: " · ")
         }
     }
+
+    /// The row's trailing percent while there is progress to show.
+    var percentText: String? { progress.map { "\(Int($0 * 100))%" } }
 
     /// 0 to 1 while the server converts or the file transfers.
     var progress: Double? {
         switch state {
         case .preparing(let progress):
             return min(max(progress / 100, 0), 1)
-        case .downloading:
+        case .downloading, .pausedByUser:
             guard let expected = expectedBytes, expected > 0 else { return nil }
             return min(Double(receivedBytes) / Double(expected), 1)
         default:

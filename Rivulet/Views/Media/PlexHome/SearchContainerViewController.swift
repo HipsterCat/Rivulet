@@ -39,7 +39,7 @@ final class SearchContainerViewController: UIViewController {
 
         searchController.searchResultsUpdater = self
         searchController.searchBar.delegate = self
-        searchController.searchBar.placeholder = "Search your libraries"
+        searchController.searchBar.placeholder = String(localized: "Search your libraries")
         // Otherwise a dimming view covers the results, which are the whole page, until the
         // first query. `showsSearchResultsController` is unavailable on tvOS.
         searchController.obscuresBackgroundDuringPresentation = false
@@ -257,5 +257,11 @@ extension SearchContainerViewController: UISearchResultsUpdating {
 extension SearchContainerViewController: UISearchBarDelegate {
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         results.submitSearch()
+    }
+}
+
+extension SearchContainerViewController: SidebarTabReselecting {
+    func reselectSidebarTab() {
+        move(to: .keyboard)
     }
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//  The library grid's header: title and item count on the left, the Sort and View
-//  (Titles, Collections, Folders) menu buttons on the right. Only the buttons take focus,
+//  The library grid's header: title and item count on the left, Shuffle and the Sort
+//  and View (Titles, Collections, Folders) menu buttons on the right. Only the buttons take focus,
 //  and Up and Down reach them only from beneath.
 
 import UIKit
@@ -12,14 +12,14 @@ import UIKit
 extension SortOption {
     var displayName: String {
         switch self {
-        case .titleAsc:        "Title A-Z"
-        case .titleDesc:       "Title Z-A"
-        case .releaseDateDesc: "Release Date"
-        case .addedAtDesc:     "Date Added"
-        case .addedAtAsc:      "Date Added (Oldest)"
-        case .releaseDateAsc:  "Release Date (Oldest)"
-        case .lastContentAddedDesc: "Recently Updated"
-        case .ratingDesc:      "Rating"
+        case .titleAsc:        String(localized: "Title A-Z")
+        case .titleDesc:       String(localized: "Title Z-A")
+        case .releaseDateDesc: String(localized: "Release Date")
+        case .addedAtDesc:     String(localized: "Date Added")
+        case .addedAtAsc:      String(localized: "Date Added (Oldest)")
+        case .releaseDateAsc:  String(localized: "Release Date (Oldest)")
+        case .lastContentAddedDesc: String(localized: "Recently Updated")
+        case .ratingDesc:      String(localized: "Rating")
         }
     }
 }
@@ -30,7 +30,14 @@ extension SortOption {
 enum LibraryViewMode: String {
     case titles, collections, folders
 
-    var title: String { rawValue.capitalized }
+    // Display name; rawValue is persisted.
+    var title: String {
+        switch self {
+        case .titles: String(localized: "Titles")
+        case .collections: String(localized: "Collections")
+        case .folders: String(localized: "Folders")
+        }
+    }
 
     var symbol: String {
         switch self {
@@ -41,29 +48,78 @@ enum LibraryViewMode: String {
     }
 
     /// The View button's menu; nil when there is nothing to switch to.
-    static func menu(_ modes: [LibraryViewMode], current: LibraryViewMode,
+    /// `filters` (Titles of a video library) is a second group under a divider; with it the menu
+    /// exists even when there is only one mode.
+    static func menu(_ modes: [LibraryViewMode], current: LibraryViewMode, filters: UIMenu? = nil,
                      select: @escaping (LibraryViewMode) -> Void) -> UIMenu? {
-        guard modes.count > 1 else { return nil }
-        return UIMenu(children: modes.map { mode in
+        guard modes.count > 1 || filters != nil else { return nil }
+        let modeActions = modes.count > 1 ? modes.map { mode in
             UIAction(title: mode.title, image: UIImage(systemName: mode.symbol),
                      state: mode == current ? .on : .off) { _ in select(mode) }
+        } : []
+        guard let filters else { return UIMenu(children: modeActions) }
+        return UIMenu(children: modeActions.isEmpty ? [filters] : [UIMenu(options: .displayInline, children: modeActions), filters])
+    }
+}
+
+// MARK: - LibraryFilterMenu
+
+/// The View menu's filter group: Genre and Decade submenus (All first) and an Unwatched Only toggle.
+enum LibraryFilterMenu {
+    /// The View button's label while a filter is on, e.g. "Action · 1990s · Unwatched"; nil when none is.
+    static func summary(_ filter: LibraryFilter) -> String? {
+        var parts: [String] = []
+        if let genre = filter.genre { parts.append(genre.name) }
+        if let decade = filter.decade { parts.append(LibraryFilter.decadeTitle(decade)) }
+        if filter.unwatchedOnly { parts.append(String(localized: "Unwatched")) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    static func menu(_ filter: LibraryFilter, options: LibraryFilterOptions,
+                     change: @escaping (LibraryFilter) -> Void) -> UIMenu {
+        var children: [UIMenuElement] = []
+        if !options.genres.isEmpty {
+            let all = UIAction(title: String(localized: "All"), state: filter.genre == nil ? .on : .off) { _ in
+                var next = filter; next.genre = nil; change(next)
+            }
+            let genres = options.genres.map { genre in
+                UIAction(title: genre.name, state: filter.genre == genre ? .on : .off) { _ in
+                    var next = filter; next.genre = genre; change(next)
+                }
+            }
+            children.append(UIMenu(title: String(localized: "Genre"), children: [all] + genres))
+        }
+        if !options.decades.isEmpty {
+            let all = UIAction(title: String(localized: "All"), state: filter.decade == nil ? .on : .off) { _ in
+                var next = filter; next.decade = nil; change(next)
+            }
+            let decades = options.decades.map { decade in
+                UIAction(title: LibraryFilter.decadeTitle(decade), state: filter.decade == decade ? .on : .off) { _ in
+                    var next = filter; next.decade = decade; change(next)
+                }
+            }
+            children.append(UIMenu(title: String(localized: "Decade"), children: [all] + decades))
+        }
+        children.append(UIAction(title: String(localized: "Unwatched Only"), state: filter.unwatchedOnly ? .on : .off) { _ in
+            var next = filter; next.unwatchedOnly.toggle(); change(next)
         })
+        return UIMenu(options: .displayInline, children: children)
     }
 }
 
 // MARK: - SortButton
 
-/// A focusable rounded button that renders a sort label + SF Symbol icon.
-/// Manages its own glass/focus appearance via UIFocusAnimationCoordinator.
+/// A focusable glass pill with an SF Symbol and a label, on the hero's pill
+/// metrics (66 tall, 29 pt label) so it matches every other button.
 /// A UIButton so it can carry a `menu`, which Select then opens.
 final class SortButton: UIButton {
+
+    private static let iconConfig = UIImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
 
     // MARK: - Subviews
 
     private let iconView: UIImageView = {
-        let cfg = UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-        let img = UIImage(systemName: "arrow.up.arrow.down", withConfiguration: cfg)
-        let iv = UIImageView(image: img)
+        let iv = UIImageView()
         iv.tintColor = .white
         iv.contentMode = .scaleAspectFit
         iv.translatesAutoresizingMaskIntoConstraints = false
@@ -72,7 +128,7 @@ final class SortButton: UIButton {
 
     private let sortLabel: UILabel = {
         let lb = UILabel()
-        lb.font = .systemFont(ofSize: 17, weight: .semibold)
+        lb.font = HeroPillButton.titleFont
         lb.textColor = .white
         lb.translatesAutoresizingMaskIntoConstraints = false
         return lb
@@ -80,11 +136,19 @@ final class SortButton: UIButton {
 
     private let bgView: UIView = {
         let v = UIView()
-        v.backgroundColor = UIColor.white.withAlphaComponent(0.15)
-        v.layer.cornerRadius = 14
+        v.backgroundColor = UIColor.white.withAlphaComponent(0.2)
+        v.layer.cornerRadius = HeroPillButton.buttonHeight / 2
         v.layer.cornerCurve = .continuous
-        v.layer.borderWidth = 1
-        v.layer.borderColor = UIColor.white.withAlphaComponent(0.2).cgColor
+        v.isUserInteractionEnabled = false
+        v.translatesAutoresizingMaskIntoConstraints = false
+        return v
+    }()
+
+    private let glassView: UIVisualEffectView = {
+        let v = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+        v.layer.cornerRadius = HeroPillButton.buttonHeight / 2
+        v.layer.cornerCurve = .continuous
+        v.clipsToBounds = true
         v.isUserInteractionEnabled = false
         v.translatesAutoresizingMaskIntoConstraints = false
         return v
@@ -104,32 +168,38 @@ final class SortButton: UIButton {
     required init?(coder: NSCoder) { fatalError() }
 
     private func setup() {
-        addSubview(bgView)
-        bgView.addSubview(iconView)
-        bgView.addSubview(sortLabel)
+        for v in [bgView, glassView, iconView, sortLabel] as [UIView] { addSubview(v) }
+        let pad = HeroPillButton.sidePadding
 
         NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: HeroPillButton.buttonHeight),
             bgView.topAnchor.constraint(equalTo: topAnchor),
             bgView.bottomAnchor.constraint(equalTo: bottomAnchor),
             bgView.leadingAnchor.constraint(equalTo: leadingAnchor),
             bgView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            glassView.topAnchor.constraint(equalTo: topAnchor),
+            glassView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            glassView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            glassView.trailingAnchor.constraint(equalTo: trailingAnchor),
 
-            iconView.leadingAnchor.constraint(equalTo: bgView.leadingAnchor, constant: 16),
-            iconView.centerYAnchor.constraint(equalTo: bgView.centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 18),
-            iconView.heightAnchor.constraint(equalToConstant: 18),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
 
-            sortLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
-            sortLabel.trailingAnchor.constraint(equalTo: bgView.trailingAnchor, constant: -16),
-            sortLabel.centerYAnchor.constraint(equalTo: bgView.centerYAnchor),
+            sortLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: HeroPillButton.iconGap),
+            sortLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -pad),
+            sortLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     // MARK: - Configure
 
     /// The View button: shows `current` and opens `menu`; hidden without one.
-    func configure(view current: LibraryViewMode, menu: UIMenu?) {
-        configure(sortName: current.title, symbol: current.symbol)
+    /// `filterSummary` replaces the mode's name while a library filter is on.
+    func configure(view current: LibraryViewMode, menu: UIMenu?, filterSummary: String? = nil) {
+        configure(sortName: filterSummary ?? current.title,
+                  symbol: filterSummary == nil ? current.symbol : "line.3.horizontal.decrease")
         self.menu = menu
         showsMenuAsPrimaryAction = true
         isHidden = menu == nil
@@ -137,9 +207,7 @@ final class SortButton: UIButton {
 
     func configure(sortName: String, symbol: String = "arrow.up.arrow.down") {
         sortLabel.text = sortName
-        iconView.image = UIImage(
-            systemName: symbol,
-            withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .medium))
+        iconView.image = UIImage(systemName: symbol, withConfiguration: Self.iconConfig)
     }
 
     // MARK: - Focus
@@ -150,11 +218,10 @@ final class SortButton: UIButton {
         let focused = context.nextFocusedView === self
         coordinator.addCoordinatedAnimations { [weak self] in
             guard let self else { return }
-            self.transform = focused ? CGAffineTransform(scaleX: 1.06, y: 1.06) : .identity
-            self.bgView.backgroundColor = focused ? .white : UIColor.white.withAlphaComponent(0.15)
-            self.bgView.layer.borderColor = focused
-                ? UIColor.white.withAlphaComponent(0.0).cgColor
-                : UIColor.white.withAlphaComponent(0.2).cgColor
+            let scale = HeroPillButton.focusScale
+            self.transform = focused ? CGAffineTransform(scaleX: scale, y: scale) : .identity
+            self.bgView.backgroundColor = focused ? .white : UIColor.white.withAlphaComponent(0.2)
+            self.glassView.alpha = focused ? 0 : 1
             self.iconView.tintColor = focused ? .black : .white
             self.sortLabel.textColor = focused ? .black : .white
         }
@@ -174,7 +241,8 @@ final class MediaLibrarySortControl: UICollectionViewCell {
 
     private let titleLabel: UILabel = {
         let lb = UILabel()
-        lb.font = .systemFont(ofSize: 34, weight: .bold)
+        // The folder and photo library pages' title size.
+        lb.font = .systemFont(ofSize: 48, weight: .bold)
         lb.textColor = .white
         lb.translatesAutoresizingMaskIntoConstraints = false
         return lb
@@ -182,8 +250,8 @@ final class MediaLibrarySortControl: UICollectionViewCell {
 
     private let countLabel: UILabel = {
         let lb = UILabel()
-        lb.font = .systemFont(ofSize: 17)
-        lb.textColor = UIColor.white.withAlphaComponent(0.5)
+        lb.font = .systemFont(ofSize: 29)
+        lb.textColor = UIColor.white.withAlphaComponent(0.6)
         lb.translatesAutoresizingMaskIntoConstraints = false
         return lb
     }()
@@ -200,6 +268,18 @@ final class MediaLibrarySortControl: UICollectionViewCell {
         b.translatesAutoresizingMaskIntoConstraints = false
         return b
     }()
+
+    /// Plays the library shuffled; shows beside Sort when the page has a handler.
+    private let shuffleButton: SortButton = {
+        let b = SortButton()
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.configure(sortName: String(localized: "Shuffle"), symbol: "shuffle")
+        return b
+    }()
+    private var onShuffle: (() -> Void)?
+    /// Off while Shuffle is hidden, so a hidden button never squeezes the title.
+    private lazy var shuffleClearsTitle: NSLayoutConstraint = shuffleButton.leadingAnchor.constraint(
+        greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 16)
 
     /// The sort button's trailing edge: beside the View button while both
     /// show, otherwise at the cell edge. Not a UIStackView: its hiding
@@ -218,7 +298,10 @@ final class MediaLibrarySortControl: UICollectionViewCell {
     override init(frame: CGRect) {
         super.init(frame: frame)
         setup()
-        for button in [sortButton, viewButton] { button.isReachable = { [weak self] in self?.buttonsReachable() ?? true } }
+        for button in [shuffleButton, sortButton, viewButton] {
+            button.isReachable = { [weak self] in self?.buttonsReachable() ?? true }
+        }
+        shuffleButton.addAction(UIAction { [weak self] _ in self?.onShuffle?() }, for: .primaryActionTriggered)
     }
 
     @available(*, unavailable)
@@ -232,8 +315,14 @@ final class MediaLibrarySortControl: UICollectionViewCell {
         contentView.addSubview(countLabel)
         contentView.addSubview(sortButton)
         contentView.addSubview(viewButton)
+        contentView.addSubview(shuffleButton)
 
         NSLayoutConstraint.activate([
+            // Shuffle: left of Sort, and shown only with it.
+            shuffleButton.trailingAnchor.constraint(equalTo: sortButton.leadingAnchor, constant: -16),
+            shuffleButton.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+            shuffleButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+
             // Title: left-aligned, vertically centered on the top text cluster.
             titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
@@ -241,19 +330,18 @@ final class MediaLibrarySortControl: UICollectionViewCell {
             // Count: just below the title, same left edge.
             countLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             countLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+            countLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20),
 
             // View button: pinned to the right edge, so it never moves under
             // focus when the sort button hides.
             viewButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             viewButton.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-            viewButton.heightAnchor.constraint(equalToConstant: 44),
             viewButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
 
             // Sort button: left of the View button, or at the edge
             // (configure() swaps these two).
             sortAtEdge,
             sortButton.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
-            sortButton.heightAnchor.constraint(equalToConstant: 44),
             sortButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
 
             // Keep the buttons from overrunning the title. Both stay active: a
@@ -269,17 +357,21 @@ final class MediaLibrarySortControl: UICollectionViewCell {
 
     // MARK: - Configure
 
-    /// In Collections the count reads "N collections" and the sort button
-    /// hides, which also takes it out of the focus graph.
+    /// In Collections the count reads "N collections" and the sort and shuffle
+    /// buttons hide, which also takes them out of the focus graph.
     func configure(title: String, count: Int, sortName: String, sortMenu: UIMenu,
-                   view: LibraryViewMode, viewMenu: UIMenu?) {
+                   view: LibraryViewMode, viewMenu: UIMenu?, filterSummary: String? = nil,
+                   onShuffle: (() -> Void)? = nil) {
         titleLabel.text = title
-        countLabel.text = view == .collections ? "\(count) collections" : "\(count) items"
+        countLabel.text = view == .collections ? String(localized: "\(count) collections") : String(localized: "\(count) items")
         sortButton.configure(sortName: sortName)
         sortButton.menu = sortMenu
         sortButton.showsMenuAsPrimaryAction = true
         sortButton.isHidden = view == .collections
-        viewButton.configure(view: view, menu: viewMenu)
+        self.onShuffle = onShuffle
+        shuffleButton.isHidden = sortButton.isHidden || onShuffle == nil
+        shuffleClearsTitle.isActive = !shuffleButton.isHidden
+        viewButton.configure(view: view, menu: viewMenu, filterSummary: filterSummary)
         // Deactivate before activate, so the two are never active together.
         let beside = !viewButton.isHidden
         NSLayoutConstraint.deactivate([beside ? sortAtEdge : sortBesideView])
@@ -294,7 +386,7 @@ final class MediaLibrarySortControl: UICollectionViewCell {
     private func buttonsReachable() -> Bool {
         guard let window, let focused = UIFocusSystem.focusSystem(for: self)?.focusedItem as? UIView else { return true }
         if focused.isDescendant(of: self) { return true }
-        let left = [sortButton, viewButton].filter { !$0.isHidden }.map { $0.convert($0.bounds, to: window).minX }.min()
+        let left = [shuffleButton, sortButton, viewButton].filter { !$0.isHidden }.map { $0.convert($0.bounds, to: window).minX }.min()
         guard let left else { return false }
         return focused.convert(focused.bounds, to: window).maxX > left
     }
@@ -303,6 +395,6 @@ final class MediaLibrarySortControl: UICollectionViewCell {
     // this section rather than skipping past it entirely). A hidden sort button
     // is not focusable, so a programmatic request falls through to the View button.
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
-        [sortButton, viewButton]
+        [sortButton, viewButton, shuffleButton]
     }
 }

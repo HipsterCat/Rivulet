@@ -5,12 +5,15 @@ import SwiftUI
 
 /// The Account sheet behind every tab's avatar: profile, server, settings pages, About.
 struct IOSAccountView: View {
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
     @ObservedObject private var profiles = PlexUserProfileManager.shared
+    @ObservedObject private var sync = CloudSync.shared
     @Environment(\.dismiss) private var dismiss
     @State private var showingSignIn = false
     @State private var confirmingSignOut = false
     @State private var appIcon = AppIcon.current
+    /// Bumped when the sheet shows again, so the server rows re-read their stored accounts.
+    @State private var serverRevision = 0
 
     var body: some View {
         NavigationStack {
@@ -19,6 +22,11 @@ struct IOSAccountView: View {
                     accountSections
                 } else {
                     signedOutSection
+                }
+
+                // Server accounts are the owner's, not a restricted profile's.
+                if !profiles.isRestrictedProfile {
+                    serversSection
                 }
 
                 Section("Settings") {
@@ -58,6 +66,19 @@ struct IOSAccountView: View {
                     }
                 }
 
+                // Sources and server choice are the owner's, not a restricted profile's.
+                if !profiles.isRestrictedProfile {
+                    Section {
+                        Toggle("iCloud Sync", isOn: Binding(get: { sync.isEnabled }, set: { sync.setEnabled($0) }))
+                    } footer: {
+                        Text(sync.status == .noAccount
+                             ? "Sign in to iCloud in the Settings app to sync."
+                             : sync.status == .on && sync.blockedAccountIDs.contains(PlexAuthManager.syncID)
+                             ? "iCloud has a different Plex account."
+                             : "Keeps your settings, servers and Live TV sources the same on your Apple TV, iPhone and iPad. Sign-ins are stored encrypted in iCloud. Watch progress comes from your servers and is not part of this.")
+                    }
+                }
+
                 Section("About") {
                     LabeledContent("Version", value: IOSChangelog.currentVersion)
                     NavigationLink("Changelog") { IOSChangelogView() }
@@ -68,13 +89,21 @@ struct IOSAccountView: View {
                     Section {
                         Button("Sign Out", role: .destructive) { confirmingSignOut = true }
                             .confirmationDialog("Sign out of Plex?", isPresented: $confirmingSignOut, titleVisibility: .visible) {
-                                Button("Sign Out", role: .destructive) { plex.signOut() }
+                                if sync.isSynced(accountID: PlexAuthManager.syncID) {
+                                    Button("This Device Only") { plex.signOut(scope: .thisDevice) }
+                                    Button("All Devices", role: .destructive) { plex.signOut(scope: .everywhere) }
+                                } else {
+                                    Button("Sign Out", role: .destructive) { plex.signOut() }
+                                }
                             } message: {
-                                Text("You can sign back in at any time.")
+                                Text(sync.isSynced(accountID: PlexAuthManager.syncID)
+                                     ? "Your Plex sign-in is shared through iCloud. Sign out of this device only, or of every device?"
+                                     : "You can sign back in at any time.")
                             }
                     }
                 }
             }
+            .onAppear { serverRevision += 1 }
             .navigationTitle("Account")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -83,7 +112,7 @@ struct IOSAccountView: View {
                 }
             }
         }
-        .sheet(isPresented: $showingSignIn) { IOSPlexConnectionSheet() }
+        .sheet(isPresented: $showingSignIn) { IOSPlexConnectionSheet().iosSessionObjects(plex) }
     }
 
     @ViewBuilder
@@ -116,9 +145,26 @@ struct IOSAccountView: View {
                     IOSServerPicker()
                 } label: {
                     LabeledContent {
-                        Text(plex.selectedServerName ?? "")
+                        Text(plex.serversSummary ?? "")
                     } label: {
-                        Label("Server", systemImage: "server.rack")
+                        Label("Servers", systemImage: "server.rack")
+                    }
+                }
+            }
+        }
+    }
+
+    private var serversSection: some View {
+        Section("Servers") {
+            let _ = serverRevision
+            ForEach(OtherServerKind.all, id: \.kind) { server in
+                NavigationLink {
+                    IOSServerSignInView(server: server)
+                } label: {
+                    LabeledContent {
+                        Text(server.account()?.name ?? "")
+                    } label: {
+                        Label("\(server.kind.displayName) Server", systemImage: "server.rack")
                     }
                 }
             }
@@ -143,20 +189,23 @@ struct IOSAccountView: View {
     }
 }
 
-/// Every server on the account, current one checked. Picking another connects to it.
+/// Every server on the account; the ones checked show their content. A click turns one on or off.
 private struct IOSServerPicker: View {
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
     @State private var servers: [PlexDevice]?
     @State private var loadError: String?
     @State private var connectingID: String?
-    @State private var failedServer: String?
+    @State private var notice: ServerNotice?
+    /// Bumped after a toggle so the checkmarks re-read.
+    @State private var revision = 0
 
     var body: some View {
         List(servers ?? []) { server in
-            Button { connect(to: server) } label: {
+            Button { toggle(server) } label: {
+                let _ = revision
                 IOSServerRow(
                     server: server,
-                    isCurrent: connectingID == nil && plex.isCurrentServer(server),
+                    isCurrent: connectingID == nil && plex.isServerEnabled(server),
                     isConnecting: connectingID == server.id
                 )
             }
@@ -169,13 +218,13 @@ private struct IOSServerPicker: View {
                 ProgressView()
             }
         }
-        .navigationTitle("Server")
+        .navigationTitle("Servers")
         .task { await load() }
         .refreshable { await load() }
-        .alert("Couldn’t Connect", isPresented: Binding(get: { failedServer != nil }, set: { if !$0 { failedServer = nil } })) {
+        .alert(notice?.title ?? "", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("\(failedServer ?? "The server") isn’t reachable right now.")
+            Text(notice?.message ?? "")
         }
     }
 
@@ -189,12 +238,16 @@ private struct IOSServerPicker: View {
         }
     }
 
-    private func connect(to server: PlexDevice) {
-        guard !plex.isCurrentServer(server) else { return }
+    private func toggle(_ server: PlexDevice) {
         connectingID = server.id
         Task {
-            if !(await plex.switchServer(to: server)) { failedServer = server.name }
+            switch await plex.toggleServer(server, among: servers ?? []) {
+            case .changed: break
+            case .onlyServer: notice = .onlyServer
+            case .unreachable: notice = .unreachable(server.name)
+            }
             connectingID = nil
+            revision += 1
         }
     }
 }

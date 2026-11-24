@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-//  First-run landing: one card each for Plex, Jellyfin and Live TV, each opening
+//  First-run landing: one card each for Plex, Jellyfin, Emby and Live TV, each opening
 //  its own setup flow. A finished card shows a check, and Start Watching appears
 //  once any source is connected.
 
@@ -10,9 +10,10 @@ import UIKit
 
 final class SetupLandingViewController: UIViewController {
 
-    /// Plex, Jellyfin, or a Live TV source the user added (not one that follows a server).
+    /// Plex, Jellyfin, Emby, or a Live TV source the user added (not one that follows a server).
     static var hasAnySource: Bool {
-        PlexAuthManager.shared.hasCredentials || JellyfinSession.account != nil || !addedLiveTVSources.isEmpty
+        PlexAuthManager.shared.hasCredentials || JellyfinSession.account != nil
+            || EmbySession.account != nil || !addedLiveTVSources.isEmpty
     }
 
     private static var addedLiveTVSources: [LiveTVDataStore.LiveTVSourceInfo] {
@@ -23,11 +24,16 @@ final class SetupLandingViewController: UIViewController {
 
     private let plexCard = SetupLandingViewController.makeCard(title: "Plex", symbol: "play.rectangle.fill")
     private let jellyfinCard = SetupLandingViewController.makeCard(title: "Jellyfin", symbol: "server.rack")
-    private let liveTVCard = SetupLandingViewController.makeCard(title: "Live TV",
+    private let embyCard = SetupLandingViewController.makeCard(title: "Emby", symbol: "play.square.stack.fill")
+    private let liveTVCard = SetupLandingViewController.makeCard(title: String(localized: "Live TV"),
                                                                  symbol: "antenna.radiowaves.left.and.right")
     private let doneButton = UIButton(configuration: .glass())
     private var sourcesObserver: AnyCancellable?
+    private var cloudObserver: AnyCancellable?
     private let doneGuide = UIFocusGuide()
+    private let cardRow = UIStackView()
+    private let checkingLabel = UILabel()
+    private var cardsRevealed = true
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -36,21 +42,23 @@ final class SetupLandingViewController: UIViewController {
         view.addSubview(glow)
 
         let title = UILabel()
-        title.text = "Welcome to Rivulet"
+        title.text = String(localized: "Welcome to Rivulet")
         title.font = .systemFont(ofSize: 57, weight: .bold)
         title.textColor = .white
         let subtitle = UILabel()
-        subtitle.text = "Connect your media and Live TV to get started."
+        subtitle.text = String(localized: "Connect your media and Live TV to get started.")
         subtitle.font = .systemFont(ofSize: 29)
         subtitle.textColor = UIColor.white.withAlphaComponent(0.7)
 
         plexCard.addAction(UIAction { [weak self] _ in self?.connectPlex() }, for: .primaryActionTriggered)
         jellyfinCard.addAction(UIAction { [weak self] _ in self?.connectJellyfin() }, for: .primaryActionTriggered)
+        embyCard.addAction(UIAction { [weak self] _ in self?.connectEmby() }, for: .primaryActionTriggered)
         liveTVCard.addAction(UIAction { [weak self] _ in self?.addLiveTV() }, for: .primaryActionTriggered)
-        let cards = UIStackView(arrangedSubviews: [plexCard, jellyfinCard, liveTVCard])
-        cards.spacing = 48
+        let cards = cardRow
+        [plexCard, jellyfinCard, embyCard, liveTVCard].forEach(cards.addArrangedSubview)
+        cards.spacing = Self.cardSpacing
 
-        doneButton.configuration?.title = "Start Watching"
+        doneButton.configuration?.title = String(localized: "Start Watching")
         doneButton.configuration?.attributedTitle?.font = .systemFont(ofSize: 29, weight: .semibold)
         doneButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 18, leading: 56, bottom: 18, trailing: 56)
         doneButton.addAction(UIAction { [weak self] _ in self?.onDone?() }, for: .primaryActionTriggered)
@@ -83,6 +91,42 @@ final class SetupLandingViewController: UIViewController {
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.refresh() }
         refresh()
+        awaitICloud()
+    }
+
+    /// A new Apple TV may be about to get its sign-ins from iCloud: show "Checking iCloud" for a few
+    /// seconds before the cards, so nobody types a password the phone already entered.
+    private func awaitICloud() {
+        guard !CloudSync.shared.accountsReady, !Self.hasAnySource else { return }
+        cardsRevealed = false
+        cardRow.alpha = 0
+        doneButton.alpha = 0
+        checkingLabel.text = String(localized: "Checking iCloud…")
+        checkingLabel.font = .systemFont(ofSize: 29)
+        checkingLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+        checkingLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(checkingLabel)
+        NSLayoutConstraint.activate([
+            checkingLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            checkingLabel.topAnchor.constraint(equalTo: cardRow.bottomAnchor, constant: 40)
+        ])
+        cloudObserver = CloudSync.shared.$accountsReady
+            .receive(on: RunLoop.main)
+            .sink { [weak self] ready in if ready { self?.revealCards() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in self?.revealCards() }
+    }
+
+    private func revealCards() {
+        guard !cardsRevealed else { return }
+        cardsRevealed = true
+        cloudObserver = nil
+        checkingLabel.removeFromSuperview()
+        UIView.animate(withDuration: 0.3) {
+            self.cardRow.alpha = 1
+            self.doneButton.alpha = 1
+        }
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
     }
 
     /// Arriving, focus starts on the first card; Start Watching takes it only after a flow just connected something.
@@ -115,6 +159,11 @@ final class SetupLandingViewController: UIViewController {
     private func connectJellyfin() {
         SettingsContent.addSourceDraft = AddSourceDraft()
         presentSettingsFlow(.jellyfin)
+    }
+
+    private func connectEmby() {
+        SettingsContent.addSourceDraft = AddSourceDraft()
+        presentSettingsFlow(.emby)
     }
 
     /// Selectable again once checked: Live TV takes more than one source.
@@ -154,12 +203,15 @@ final class SetupLandingViewController: UIViewController {
     private func refresh() {
         let auth = PlexAuthManager.shared
         let plexServers = auth.isAuthenticated ? 1 + PlexExtraServers.shared.current.count : 0
-        Self.setDone(plexCard, prompt: "Sign In", detail: plexServers > 1 ? "\(plexServers) Servers"
-                     : plexServers == 1 ? auth.savedServerName ?? "Connected" : nil)
-        Self.setDone(jellyfinCard, prompt: "Sign In", detail: JellyfinSession.account?.serverName)
+        let plexDetail: String? = plexServers > 1 ? String(localized: "\(plexServers) Servers")
+            : plexServers == 1 ? auth.savedServerName ?? String(localized: "Connected") : nil
+        Self.setDone(plexCard, prompt: String(localized: "Sign In"), detail: plexDetail)
+        Self.setDone(jellyfinCard, prompt: String(localized: "Sign In"), detail: JellyfinSession.account?.serverName)
         let added = Self.addedLiveTVSources
-        Self.setDone(liveTVCard, prompt: "Add a Source", detail: added.isEmpty ? nil
-                     : added.count == 1 ? added[0].displayName : "\(added.count) Sources")
+        let liveTVDetail: String? = added.isEmpty ? nil
+            : added.count == 1 ? added[0].displayName : String(localized: "\(added.count) Sources")
+        Self.setDone(embyCard, prompt: String(localized: "Sign In"), detail: EmbySession.account?.serverName)
+        Self.setDone(liveTVCard, prompt: String(localized: "Add a Source"), detail: liveTVDetail)
         // Held in place while hidden, so nothing moves when it appears.
         doneButton.isEnabled = Self.hasAnySource
         doneButton.alpha = doneButton.isEnabled ? 1 : 0
@@ -180,11 +232,11 @@ final class SetupLandingViewController: UIViewController {
         let card = UIButton(configuration: config)
         card.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            card.widthAnchor.constraint(equalToConstant: 400),
+            card.widthAnchor.constraint(equalToConstant: cardWidth),
             card.heightAnchor.constraint(equalToConstant: 300)
         ])
         let gradient = SetupCardGradientView()
-        gradient.frame = CGRect(x: 0, y: 0, width: 400, height: 300)
+        gradient.frame = CGRect(x: 0, y: 0, width: cardWidth, height: 300)
         gradient.layer.cornerRadius = cardRadius
         gradient.alpha = 0
         // Under the glass, which takes its colour.
@@ -193,6 +245,9 @@ final class SetupLandingViewController: UIViewController {
     }
 
     private static let cardRadius: CGFloat = 32
+    // Four cards span 1656 pt, inside the 1760 pt between the 80 pt margins.
+    private static let cardWidth: CGFloat = 384
+    private static let cardSpacing: CGFloat = 40
 
     /// A connected card shows its gradient and names what it connected to.
     private static func setDone(_ card: UIButton, prompt: String, detail: String?) {

@@ -19,10 +19,16 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
     case genericM3U = "m3u"
     case xtream = "xtream"
     case jellyfin = "jellyfin"
+    case emby = "emby"
     case tvheadend = "tvheadend"
 
     /// Follows a signed-in media server: added and removed with it, never saved.
-    var followsServer: Bool { self == .plex || self == .jellyfin }
+    var followsServer: Bool {
+        switch self {
+        case .plex, .jellyfin, .emby: true
+        case .dispatcharr, .genericM3U, .xtream, .tvheadend: false
+        }
+    }
 
     var displayName: String {
         switch self {
@@ -31,6 +37,7 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
         case .genericM3U: return "M3U Playlist"
         case .xtream: return "Xtream Codes"
         case .jellyfin: return "Jellyfin Live TV"
+        case .emby: return "Emby Live TV"
         case .tvheadend: return "Tvheadend"
         }
     }
@@ -42,6 +49,7 @@ enum LiveTVSourceType: String, Codable, CaseIterable, Sendable {
         case .genericM3U: return "list.bullet"
         case .xtream: return "person.badge.key"
         case .jellyfin: return "server.rack"
+        case .emby: return "server.rack"
         case .tvheadend: return "tv"
         }
     }
@@ -376,25 +384,28 @@ enum LiveTVProviderError: LocalizedError {
     case noChannelsFound
     case channelNotFound(String)
     case epgNotAvailable
+    case tunersBusy
 
     var errorDescription: String? {
         switch self {
         case .notConnected:
-            return "Source is not connected"
+            return String(localized: "Source is not connected")
         case .authenticationRequired:
-            return "Authentication required"
+            return String(localized: "Authentication required")
         case .sourceNotConfigured:
-            return "Source is not configured"
+            return String(localized: "Source is not configured")
         case .networkError(let error):
-            return "Network error: \(error.localizedDescription)"
+            return String(localized: "Network error: \(error.localizedDescription)")
         case .parseError(let message):
-            return "Parse error: \(message)"
+            return String(localized: "Parse error: \(message)")
         case .noChannelsFound:
-            return "No channels found"
+            return String(localized: "No channels found")
         case .channelNotFound(let id):
-            return "Channel not found: \(id)"
+            return String(localized: "Channel not found: \(id)")
         case .epgNotAvailable:
-            return "EPG data is not available"
+            return String(localized: "EPG data is not available")
+        case .tunersBusy:
+            return String(localized: "Couldn't tune this channel. All tuners may be busy.")
         }
     }
 }
@@ -453,7 +464,8 @@ extension XMLTVParser.ParsedProgram {
             posterURL: posterIcon.flatMap { URL(string: $0) },
             landscapeURL: landscapeIcon.flatMap { URL(string: $0) },
             episodeNumber: episodeNum,
-            isNew: isNew
+            isNew: isNew,
+            year: year
         )
     }
 }

@@ -37,7 +37,7 @@ struct GuideLayoutView: View {
     /// own (Plex account favourites). Not a `groupTitle`: a favourite keeps
     /// its tuner group too, and this tab sorts by the order the user arranged
     /// rather than by channel number.
-    static let favouritesTab = "Favorites"
+    static let favouritesTab = String(localized: "Favorites")
 
     /// Tabs that lead the bar regardless of the alphabet, in this order. A list
     /// the user curated outranks a source's own grouping — burying "Favourites"
@@ -126,7 +126,7 @@ struct GuideLayoutView: View {
             programs.append(UnifiedProgram(
                 id: "\(channelId):placeholder:\(Int(blockStart.timeIntervalSince1970))",
                 channelId: channelId,
-                title: "No guide data available.",
+                title: String(localized: "No guide data available."),
                 startTime: blockStart,
                 endTime: blockEnd
             ))
@@ -282,7 +282,7 @@ struct GuideLayoutView: View {
                     presentProgramMenu(channel: channel, program: program, frame: frame)
                 },
                 recordingProgramIds: dataStore.recordingProgramIds(in: dataStore.epg),
-                categoryActionTitle: dataStore.hasRecordingSources ? "Recordings" : nil,
+                categoryActionTitle: dataStore.hasRecordingSources ? String(localized: "Recordings") : nil,
                 onCategoryAction: { presentRecordings() },
                 miniSession: miniSession,
                 onMiniPlayerSelect: { miniSession.map { selectChannel($0.channel) } }
@@ -557,7 +557,7 @@ struct GuideLayoutView: View {
         if focusedChannel == nil {
             focusedChannel = first
             focusedProgram = dataStore.getCurrentProgram(for: first)
-                ?? dataStore.epg[first.id]?.first
+                ?? dataStore.epg[first.id]?.first { $0.endTime > timelineStart }
         }
     }
 }

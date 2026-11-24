@@ -7,7 +7,7 @@ import UIKit
 /// Call to action shown in place of content: sign in, or, when signed in with
 /// content waiting on a Home profile, choose who is watching.
 struct IOSPlexConnectView: View {
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
     @ObservedObject private var profiles = PlexUserProfileManager.shared
     @State private var showingSignIn = false
     @State private var choosingProfile = false
@@ -35,7 +35,7 @@ struct IOSPlexConnectView: View {
                 Button("Sign In") { showingSignIn = true }
                     .buttonStyle(.borderedProminent)
             }
-            .sheet(isPresented: $showingSignIn) { IOSPlexConnectionSheet() }
+            .sheet(isPresented: $showingSignIn) { IOSPlexConnectionSheet().iosSessionObjects(plex) }
         }
     }
 }
@@ -101,7 +101,7 @@ extension PlexHomeUser {
 
 /// PIN sign-in, then server choice, then the profile picker when the Plex Home has several users.
 struct IOSPlexConnectionSheet: View {
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var plex: PlexSession
     @ObservedObject private var profiles = PlexUserProfileManager.shared
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -143,8 +143,8 @@ struct IOSPlexConnectionSheet: View {
     }
 
     private var title: String {
-        if choosingProfile { return "Who’s Watching?" }
-        return plex.state == .selectingServer ? "Choose a Server" : "Sign In"
+        if choosingProfile { return String(localized: "Who’s Watching?") }
+        return plex.state == .selectingServer ? String(localized: "Choose a Server") : String(localized: "Sign In")
     }
 
     @ViewBuilder
@@ -335,12 +335,14 @@ struct IOSProfilePicker: View {
                         badge("lock.circle.fill", color: .gray)
                     }
                 }
+                .contentShape(.hoverEffect, .circle)
+                .hoverEffect(.lift)
             Text(user.displayName)
                 .font(.subheadline)
                 .lineLimit(1)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(user.requiresPin ? "\(user.displayName), requires PIN" : user.displayName)
+        .accessibilityLabel(user.requiresPin ? String(localized: "\(user.displayName), requires PIN") : user.displayName)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 
@@ -378,7 +380,7 @@ struct IOSProfilePicker: View {
             if result.success {
                 dismiss()
             } else {
-                pinError = result.pinWasInvalid ? "Your saved PIN no longer works. Enter it again." : nil
+                pinError = result.pinWasInvalid ? String(localized: "Your saved PIN no longer works. Enter it again.") : nil
                 pinUser = user
             }
         }
@@ -445,6 +447,8 @@ private struct IOSProfilePINEntry: View {
             }
         }
         .presentationDetents([.medium])
+        // On iPad a sheet is a page otherwise: too tall for one field and a toggle.
+        .presentationSizing(.form)
         .onAppear {
             error = initialError
             focused = true
@@ -460,7 +464,7 @@ private struct IOSProfilePINEntry: View {
             if ok {
                 dismiss()
             } else {
-                error = "Incorrect PIN. Try again."
+                error = String(localized: "Incorrect PIN. Try again.")
                 pin = ""
                 focused = true
             }

@@ -17,6 +17,7 @@ nonisolated enum DiagLog {
         case topShelf = "top_shelf"
         case deepLink = "deep_link"
         case liveTV = "live_tv"
+        case sync
     }
 
     private static let loggers: [Category: Logger] = Dictionary(
@@ -42,7 +43,8 @@ nonisolated enum DiagLog {
     /// Our own services by name; a media server only by the kind of address.
     private static func hostKind(_ host: String) -> String {
         if host.hasSuffix(".plex.direct") { return "plex.direct" }
-        if host.hasSuffix("plex.tv") || host.hasSuffix("workers.dev") || host.hasSuffix("sentry.io")
+        if host.hasSuffix("plex.tv") || host.hasSuffix("workers.dev") || host.hasSuffix("gurleystudios.com")
+            || host.hasSuffix("sentry.io")
             || host.hasSuffix("themoviedb.org") { return host }
         if host == "localhost" || host == "127.0.0.1" { return "loopback" }
         if host.allSatisfy({ $0.isNumber || $0 == "." }) { return isPrivateIPv4(host) ? "lan ipv4" : "ipv4" }

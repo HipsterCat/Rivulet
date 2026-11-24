@@ -6,7 +6,7 @@ import SwiftUI
 /// Account > Live TV: sources, favorites, suggestions and the default layout.
 struct IOSLiveTVSettingsView: View {
     @ObservedObject private var store = LiveTVDataStore.shared
-    @AppStorage(IOSLiveLayout.storageKey) private var layoutRaw = IOSLiveLayout.browse.rawValue
+    @AppStorage(LiveLayout.storageKey) private var layoutRaw = LiveLayout.browse.rawValue
     @AppStorage(LiveTVDataStore.suggestionsKey) private var suggestions = true
     @State private var showingAddSource = false
     @State private var askingToErase = false
@@ -37,7 +37,7 @@ struct IOSLiveTVSettingsView: View {
                     LabeledContent("Favorites", value: store.favoriteIds.isEmpty ? "" : "\(store.favoriteIds.count)")
                 }
                 Picker("Default Layout", selection: $layoutRaw) {
-                    ForEach(IOSLiveLayout.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
+                    ForEach(LiveLayout.allCases, id: \.self) { Text($0.title).tag($0.rawValue) }
                 }
             }
 
@@ -68,12 +68,20 @@ private struct IOSLiveSourceDetailView: View {
     @State private var isRefreshing = false
 
     private var source: LiveTVDataStore.LiveTVSourceInfo? { store.sources.first { $0.id == sourceId } }
+    private var synced: Bool { CloudSync.shared.isSynced(accountID: LiveTVDataStore.syncID(forSource: sourceId)) }
+
+    private func remove(_ scope: SignOutScope?) {
+        Task {
+            await store.removeSource(id: sourceId, scope: scope)
+            dismiss()
+        }
+    }
 
     var body: some View {
         Form {
             if let source {
                 Section {
-                    LabeledContent("Status", value: source.isConnected ? "Connected" : "Offline")
+                    LabeledContent("Status", value: source.isConnected ? String(localized: "Connected") : String(localized: "Offline"))
                     LabeledContent("Channels", value: "\(source.channelCount)")
                     if let profile = source.channelProfile, !profile.isEmpty {
                         LabeledContent("Channel Profile", value: profile)
@@ -103,20 +111,22 @@ private struct IOSLiveSourceDetailView: View {
                     Section {
                         Button("Remove Source", role: .destructive) { confirmingRemove = true }
                             .confirmationDialog("Remove Source?", isPresented: $confirmingRemove, titleVisibility: .visible) {
-                                Button("Remove", role: .destructive) {
-                                    Task {
-                                        await store.removeSource(id: sourceId)
-                                        dismiss()
-                                    }
+                                if synced {
+                                    Button("This Device Only") { remove(.thisDevice) }
+                                    Button("All Devices", role: .destructive) { remove(.everywhere) }
+                                } else {
+                                    Button("Remove", role: .destructive) { remove(nil) }
                                 }
                             } message: {
-                                Text("This will remove \"\(source.displayName)\" and all its channels from Live TV.")
+                                Text(synced
+                                     ? "\"\(source.displayName)\" is shared through iCloud. Remove it from this device only, or from every device?"
+                                     : "This will remove \"\(source.displayName)\" and all its channels from Live TV.")
                             }
                     }
                 }
             }
         }
-        .navigationTitle(source?.displayName ?? "Source")
+        .navigationTitle(source?.displayName ?? String(localized: "Source"))
     }
 }
 
@@ -207,7 +217,7 @@ struct IOSLiveAddSourceSheet: View {
         .presentationSizing(.form)
     }
 
-    private func row(_ title: String, detail: String, systemImage: String) -> some View {
+    private func row(_ title: LocalizedStringKey, detail: LocalizedStringKey, systemImage: String) -> some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -250,7 +260,7 @@ private struct IOSLiveDispatcharrForm: View {
 
             Section {
                 IOSFormField("Channel Profile", text: $profile, prompt: "All Channels", kind: .username)
-                IOSFormField("Name", text: $name, prompt: LiveTVSourceConnector.defaultServerName)
+                IOSFormField("Name", text: $name, prompt: LocalizedStringKey(LiveTVSourceConnector.defaultServerName))
             } header: {
                 Text("Options")
             } footer: {
@@ -308,7 +318,7 @@ private struct IOSLiveXtreamForm: View {
                 Text("Account")
             }
             Section {
-                IOSFormField("Name", text: $name, prompt: LiveTVSourceConnector.defaultPlaylistName)
+                IOSFormField("Name", text: $name, prompt: LocalizedStringKey(LiveTVSourceConnector.defaultPlaylistName))
             } footer: {
                 Text("How this source appears in Live TV.")
             }
@@ -376,7 +386,7 @@ private struct IOSLiveTvheadendForm: View {
                 Text("Only needed if your server asks for a login, and to record. Leave both empty to just watch.")
             }
             Section {
-                IOSFormField("Name", text: $name, prompt: LiveTVSourceConnector.defaultTvheadendName)
+                IOSFormField("Name", text: $name, prompt: LocalizedStringKey(LiveTVSourceConnector.defaultTvheadendName))
             } footer: {
                 Text("How this source appears in Live TV.")
             }
@@ -424,7 +434,7 @@ private struct IOSLiveThreadfinForm: View {
                 Text("Your Threadfin server's address on your network, with its port.")
             }
             Section {
-                IOSFormField("Name", text: $name, prompt: LiveTVSourceConnector.defaultThreadfinName)
+                IOSFormField("Name", text: $name, prompt: LocalizedStringKey(LiveTVSourceConnector.defaultThreadfinName))
             } footer: {
                 Text("How this source appears in Live TV.")
             }
@@ -477,7 +487,7 @@ private struct IOSLivePlaylistForm: View {
                 Text("An XMLTV link for what's on. Leave it empty if the playlist names its own guide.")
             }
             Section {
-                IOSFormField("Name", text: $name, prompt: LiveTVSourceConnector.defaultPlaylistName)
+                IOSFormField("Name", text: $name, prompt: LocalizedStringKey(LiveTVSourceConnector.defaultPlaylistName))
             } footer: {
                 Text("How this source appears in Live TV.")
             }
@@ -509,15 +519,15 @@ private struct IOSLivePlaylistForm: View {
 
 /// A labelled form row, the way Settings and Mail lay out an account: the label
 /// stays put once the field has text, so what was typed is never ambiguous.
-private struct IOSFormField: View {
+struct IOSFormField: View {
     enum Kind { case text, url, username, password }
 
-    let label: String
+    let label: LocalizedStringKey
     @Binding var text: String
-    let prompt: String
+    let prompt: LocalizedStringKey
     let kind: Kind
 
-    init(_ label: String, text: Binding<String>, prompt: String, kind: Kind = .text) {
+    init(_ label: LocalizedStringKey, text: Binding<String>, prompt: LocalizedStringKey, kind: Kind = .text) {
         self.label = label
         self._text = text
         self.prompt = prompt
@@ -536,17 +546,17 @@ private struct IOSFormField: View {
     @ViewBuilder private var field: some View {
         switch kind {
         case .password:
-            SecureField(label, text: $text, prompt: Text(verbatim: prompt))
+            SecureField(label, text: $text, prompt: Text(prompt))
                 .textContentType(.password)
         case .url:
-            TextField(label, text: $text, prompt: Text(verbatim: prompt))
+            TextField(label, text: $text, prompt: Text(prompt))
                 .keyboardType(.URL)
                 .textContentType(.URL)
         case .username:
-            TextField(label, text: $text, prompt: Text(verbatim: prompt))
+            TextField(label, text: $text, prompt: Text(prompt))
                 .textContentType(.username)
         case .text:
-            TextField(label, text: $text, prompt: Text(verbatim: prompt))
+            TextField(label, text: $text, prompt: Text(prompt))
         }
     }
 }

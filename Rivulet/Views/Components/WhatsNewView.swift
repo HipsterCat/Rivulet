@@ -119,6 +119,12 @@ struct WhatsNewView: View {
         line.hasPrefix("## ") ? String(line.dropFirst(3)) : nil
     }
 
+    /// A changelog line starting with `> ` is a personal note: plain text with
+    /// no dot. Returns its text, or nil otherwise.
+    static func note(_ line: String) -> String? {
+        line.hasPrefix("> ") ? String(line.dropFirst(2)) : nil
+    }
+
     private func featureRow(text: String, isFocused: Bool) -> some View {
         let heading = Self.heading(text)
         return HStack(alignment: .top, spacing: 14) {
@@ -149,6 +155,48 @@ struct WhatsNewView: View {
     // MARK: - Changelog Data
 
     static let changelogs: [(version: String, features: [String])] = [
+        ("1.2.0 (123)", [
+            "> Thank you to everyone who sent a PR!",
+            "Emby support, next to Plex and Jellyfin",
+            "Arrange Home: reorder and hide rows, add favorites and playlists. @DIYtechie",
+            "The hero can mix several sources, and Left goes back a title. @danieldjupvik",
+            "Mark favorites on any server, with an optional Favorites page. @DennisR-git",
+            "Jellyfin and Emby theme videos play behind the hero and details. @smidley",
+            "Sidebar: Now Playing next to your profile, and Up opens it. @DIYtechie",
+            "Live TV can rewind through a channel's window, with past shows. @tresby",
+            "Shuffle libraries and shows, and delete episodes from long-press menus",
+            "Specials now come after the last season. @priyanshuppal",
+            "Greek is available. @Camthalion77",
+            "Updated AetherEngine to 7.57.0",
+            "Other small changes and fixes",
+        ]),
+        ("1.2.0 (122)", [
+            "> I removed Dolby Vision FEL and Height Speakers because of licensing uncertainty. Profile 7 now plays as 8.1 on a Dolby Vision TV, and TrueHD and DTS-HD play as lossless 7.1. Sorry if this is what brought you to Rivulet.",
+        ]),
+        ("1.2.0 (121)", [
+            "> Thanks for the bugs, support, and PRs! I'm on vacation this week, so these are tested on a simulator but not a real Apple TV.",
+            "Trailers options in Playback",
+            "Added Localization. German is available! Welcome PRs for other languages. @JoschaP",
+            "Jellyfin Quick Connect, Music Videos, and Recently Added music row. @DIYtechie",
+            "SVG logos in Live TV",
+            "A title in 2 libraries on one server is now one card in CW",
+            "Plex QR sign in. @priyanshuppal",
+            "Profile Picker shows on return after backgrounding for 30 seconds. @twinkie0101",
+            "Updated AetherEngine to 7.56.0",
+            "Other small changes and fixes",
+        ]),
+        ("1.1.1 (120)", [
+            "Episode and season pages now show their extras.",
+            "The player's info panels stay open while you're reading them.",
+            "Continue Watching no longer adds a title to artwork that already shows one.",
+            "Live TV shows film release years and marks new airings from Plex guides.",
+            "Music's Now Playing remembers lyrics and opens when you return mid-song.",
+            "Subtitle tracks list language first and stay set on autoplayed episodes.",
+            "Your Watchlist now finds titles on your account's other Plex servers.",
+            "At home, Rivulet now prefers your Plex server's local connection.",
+            "Change audio and subtitle tracks from Control Center on iPhone and iPad.",
+            "Rivulet now follows the Apple TV's caption and Audio Description settings.",
+        ]),
         ("1.1.1 (119)", [
             "Subtitle and audio language settings are now saved for each Plex profile.",
             "New Seasons page lists the episodes beside the season poster.",

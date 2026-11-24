@@ -49,12 +49,14 @@ final class AetherPlayer: ObservableObject {
             if let menuDetail { return menuDetail }
             var parts: [String] = []
             if let language, !language.isEmpty {
-                parts.append(Locale.current.localizedString(forLanguageCode: language) ?? language)
+                let languageName = Locale.current.localizedString(forLanguageCode: language) ?? language
+                // A name that already says the language ("English (SDH)") does not repeat it.
+                if !name.localizedCaseInsensitiveContains(languageName) { parts.append(languageName) }
             }
             if !codec.isEmpty { parts.append(codec.uppercased()) }
-            if channels > 0 { parts.append(channels == 2 ? "Stereo" : "\(channels) ch") }
+            if channels > 0 { parts.append(channels == 2 ? String(localized: "Stereo") : String(localized: "\(channels) ch")) }
             if isHearingImpaired { parts.append("SDH") }
-            if isForced { parts.append("Forced") }
+            if isForced { parts.append(String(localized: "Forced")) }
             return parts.joined(separator: " · ")
         }
     }
@@ -69,6 +71,7 @@ final class AetherPlayer: ObservableObject {
             let isStruckThrough: Bool
             let fontName: String?
             let fontSize: Int?
+            var backgroundColor: UIColor?
         }
 
         struct TextPlacement: Hashable {
@@ -89,17 +92,7 @@ final class AetherPlayer: ObservableObject {
         let placement: TextPlacement?
     }
 
-    /// A sidecar subtitle file registered at load (Plex external streams).
-    struct SidecarSubtitle {
-        let url: URL
-        let name: String?
-        let language: String?
-        let isForced: Bool
-        let isHearingImpaired: Bool
-        let isDefault: Bool
-        /// "srt", "ass", "vtt": Plex stream keys carry no extension.
-        let formatHint: String?
-    }
+    typealias SidecarSubtitle = SubtitleSidecar
 
     /// The live rewind window on the session axis, the one `seekLive` takes.
     /// Never `sourceTime`: on the software live path that axis is offset.
@@ -361,6 +354,7 @@ final class AetherPlayer: ObservableObject {
                 self.refreshPictureInPictureSource()
                 guard let avPlayer else {
                     self.observeVideoSize(of: nil)
+                    self.observeSeekableWindow(of: nil)
                     self.clearNativeMediaSelection()
                     return
                 }
@@ -368,6 +362,7 @@ final class AetherPlayer: ObservableObject {
                     .receive(on: DispatchQueue.main)
                     .sink { [weak self] item in
                         self?.observeVideoSize(of: item)
+                        self?.observeSeekableWindow(of: item)
                         self?.prepareNativeMediaSelection(for: item)
                     }
             }
@@ -406,12 +401,25 @@ final class AetherPlayer: ObservableObject {
         }
         if isLive {
             let clock = engine.clock
-            let window = LiveWindow(
+            var window = LiveWindow(
                 seekableRange: clock.seekableLiveRange,
                 edgeTime: clock.liveEdgeTime,
                 playhead: time,
                 isAtLiveEdge: clock.isAtLiveEdge
             )
+            // Direct HLS: the engine publishes an unbounded `0...edge` (AVPlayer
+            // clamps seeks itself), which would offer media the origin evicted
+            // long ago. The window is the AVPlayer item's own, on the same axis,
+            // and one no deeper than the live holdback is no window at all.
+            if engine.videoRoute == .remoteBypass {
+                if let remote = remoteLiveWindow, remote.isSeekable {
+                    window = LiveWindow(seekableRange: remote.lowerBound...remote.upperBound,
+                                        edgeTime: remote.upperBound, playhead: time,
+                                        isAtLiveEdge: remote.isAtLiveEdge(time))
+                } else {
+                    window = LiveWindow(seekableRange: nil, edgeTime: clock.liveEdgeTime, playhead: time, isAtLiveEdge: true)
+                }
+            }
             if window != liveWindow { liveWindow = window }
         }
         if let source = engine.softwarePiPSource {
@@ -656,11 +664,12 @@ final class AetherPlayer: ObservableObject {
         engine.volume = muted ? 0 : 1
     }
 
-    /// VOD seek on the media timeline.
-    func seek(to time: TimeInterval) async {
+    /// VOD seek on the media timeline. `exact` lands on the time itself; without it the engine may
+    /// snap AV1 on its software host to a keyframe, which is wrong for the end of an intro.
+    func seek(to time: TimeInterval, exact: Bool = false) async {
         let upper = duration > 0 ? duration : .greatestFiniteMagnitude
         let target = min(max(0, time), upper)
-        await performSeek(to: target)
+        await performSeek(to: target, exact: exact)
     }
 
     /// Skip relative to where the last skip was headed, so rapid taps stack.
@@ -677,7 +686,10 @@ final class AetherPlayer: ObservableObject {
     func seekLive(to sessionSeconds: Double) async {
         let window = liveWindow
         guard let range = window.seekableRange else { return }
-        let target = min(max(sessionSeconds, range.lowerBound), window.edgeTime)
+        // On direct HLS, clear of the oldest segment: the next playlist refresh
+        // may evict it before the seek lands.
+        let floor = remoteLiveWindow.map { $0.seekTarget($0.lowerBound) } ?? range.lowerBound
+        let target = min(max(sessionSeconds, floor), window.edgeTime)
         if window.edgeTime - target < 1 {
             await seekToLiveEdge()
         } else {
@@ -687,7 +699,7 @@ final class AetherPlayer: ObservableObject {
 
     /// Seek events clear the pending target; the timeout covers a seek the
     /// engine drops without one (no session yet).
-    private func performSeek(to target: Double) async {
+    private func performSeek(to target: Double, exact: Bool = false) async {
         // A user seek owns the pending target from here; its seek event clears it.
         isStarting = false
         pendingSeekTarget = target
@@ -695,12 +707,40 @@ final class AetherPlayer: ObservableObject {
             try? await Task.sleep(for: .seconds(10))
             if self?.pendingSeekTarget == target { self?.pendingSeekTarget = nil }
         }
-        await engine.seek(to: target)
+        await engine.seek(to: target, exact: exact)
     }
 
     func seekToLiveEdge() async {
         pendingSeekTarget = nil
         await engine.seekToLiveEdge()
+    }
+
+    // MARK: - Direct HLS rewind window
+
+    /// The AVPlayer item's seekable window, mirrored by KVO: the getter is a
+    /// sync XPC round trip to mediaserverd and this is read on every clock tick.
+    private var itemSeekableWindow: LiveSeekableWindow?
+    private var seekableObservation: AnyCancellable?
+
+    private var remoteLiveWindow: LiveSeekableWindow? {
+        engine.videoRoute == .remoteBypass ? itemSeekableWindow : nil
+    }
+
+    private func observeSeekableWindow(of item: AVPlayerItem?) {
+        guard let item else {
+            seekableObservation = nil
+            itemSeekableWindow = nil
+            return
+        }
+        seekableObservation = item.publisher(for: \.seekableTimeRanges)
+            .map { ranges in
+                LiveSeekableWindow(ranges: ranges.map {
+                    let range = $0.timeRangeValue
+                    return (start: range.start.seconds, duration: range.duration.seconds)
+                })
+            }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] window in self?.itemSeekableWindow = window }
     }
 
     func selectAudioTrack(id: Int) {
@@ -741,12 +781,16 @@ final class AetherPlayer: ObservableObject {
         pendingSeekTarget = nil
         isStarting = false
         liveWindow = .idle
+        observeSeekableWindow(of: nil)
         rate = 1
         engine.pictureInPictureActive = false
         dropFrameExtractor()
         engine.stop()
         state = .idle
     }
+
+    /// The source has audio and the engine could not build a way to play it.
+    var audioIsDropped: Bool { engine.audioDelivery == .droppedNoPipeline }
 
     /// A still of the loaded file at `seconds`, keyframe-snapped and cached by the engine.
     /// nil when the source cannot open a second reader.
@@ -895,19 +939,19 @@ final class AetherPlayer: ObservableObject {
 
     /// Only kinds that change what the viewer should do get their own sentence.
     private static func userFacingFailure(_ info: PlaybackErrorInfo?) -> String {
-        let generic = "This video couldn't be played. Check your connection and try again."
+        let generic = String(localized: "This video couldn't be played. Check your connection and try again.")
         guard let kind = info?.kind else { return generic }
         switch kind {
         case .sourceRateLimited:
-            return "The server is refusing new streams right now. Wait a moment and try again."
+            return String(localized: "The server is refusing new streams right now. Wait a moment and try again.")
         case .sourceRefused:
-            return "The server refused this stream. It may have moved, or your access to it may have changed."
+            return String(localized: "The server refused this stream. It may have moved, or your access to it may have changed.")
         case .sourceCertificateRejected:
-            return "The server's security certificate was not accepted."
+            return String(localized: "The server's security certificate was not accepted.")
         case .liveSourceUnavailable:
-            return "This channel is not responding right now."
+            return String(localized: "This channel is not responding right now.")
         case .dolbyVisionRequiresHardware:
-            return "This Dolby Vision file has no fallback layer this device can decode."
+            return String(localized: "This Dolby Vision file has no fallback layer this device can decode.")
         default:
             return generic
         }
@@ -933,7 +977,7 @@ final class AetherPlayer: ObservableObject {
         if let language = track.language, !language.isEmpty {
             return Locale.current.localizedString(forLanguageCode: language) ?? language
         }
-        return track.codec.isEmpty ? "Track \(track.id)" : track.codec.uppercased()
+        return track.codec.isEmpty ? String(localized: "Track \(track.id)") : track.codec.uppercased()
     }
 
     // MARK: - Source predicates (shared with tvOS AetherPlayer)
@@ -989,14 +1033,8 @@ final class AetherPlayer: ObservableObject {
         ensureNativeLegibleOutput(on: item)
 
         Task { @MainActor [weak self, weak item] in
-            guard let item else { return }
-            if item.status == .unknown {
-                for await status in item.publisher(for: \.status).values where status != .unknown {
-                    guard status == .readyToPlay else { return }
-                    break
-                }
-            }
-            guard let self, self.nativeMediaItem === item else { return }
+            // No wait for item.status: it can stay .unknown while the origin plays, and the asset loads its groups on its own.
+            guard let self, let item, self.nativeMediaItem === item else { return }
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .audible),
                   !group.options.isEmpty,
                   self.engine.audioTracks.isEmpty || !self.engineAudioTracksAreSelectable else { return }
@@ -1006,7 +1044,7 @@ final class AetherPlayer: ObservableObject {
             self.audioTracks = group.options.enumerated().map { index, option in
                 Track(
                     id: Self.nativeAudioTrackIDBase + index,
-                    name: option.displayName.isEmpty ? "Audio \(index + 1)" : option.displayName,
+                    name: option.displayName.isEmpty ? String(localized: "Audio \(index + 1)") : option.displayName,
                     codec: "",
                     language: option.extendedLanguageTag,
                     channels: 0,
@@ -1102,6 +1140,7 @@ final class AetherPlayer: ObservableObject {
         }
 
         let colorKey = NSAttributedString.Key(kCMTextMarkupAttribute_ForegroundColorARGB as String)
+        let backgroundKey = NSAttributedString.Key(kCMTextMarkupAttribute_CharacterBackgroundColorARGB as String)
         let boldKey = NSAttributedString.Key(kCMTextMarkupAttribute_BoldStyle as String)
         let italicKey = NSAttributedString.Key(kCMTextMarkupAttribute_ItalicStyle as String)
         let underlineKey = NSAttributedString.Key(kCMTextMarkupAttribute_UnderlineStyle as String)
@@ -1116,6 +1155,16 @@ final class AetherPlayer: ObservableObject {
             var color: UIColor?
             if let argb = attributes[colorKey] as? [NSNumber], argb.count == 4 {
                 color = UIColor(
+                    red: CGFloat(argb[1].doubleValue),
+                    green: CGFloat(argb[2].doubleValue),
+                    blue: CGFloat(argb[3].doubleValue),
+                    alpha: CGFloat(argb[0].doubleValue)
+                )
+            }
+
+            var backgroundColor: UIColor?
+            if let argb = attributes[backgroundKey] as? [NSNumber], argb.count == 4 {
+                backgroundColor = UIColor(
                     red: CGFloat(argb[1].doubleValue),
                     green: CGFloat(argb[2].doubleValue),
                     blue: CGFloat(argb[3].doubleValue),
@@ -1139,7 +1188,8 @@ final class AetherPlayer: ObservableObject {
                     isUnderlined: (attributes[underlineKey] as? NSNumber)?.boolValue ?? false,
                     isStruckThrough: false,
                     fontName: attributes[faceKey] as? String,
-                    fontSize: fontSize
+                    fontSize: fontSize,
+                    backgroundColor: backgroundColor
                 )
             )
         }
@@ -1224,7 +1274,8 @@ final class AetherPlayer: ObservableObject {
 private extension AetherPlayer.SubtitleCue.StyledRun {
     func replacingText(_ text: String) -> Self {
         Self(text: text, color: color, isBold: isBold, isItalic: isItalic, isUnderlined: isUnderlined,
-             isStruckThrough: isStruckThrough, fontName: fontName, fontSize: fontSize)
+             isStruckThrough: isStruckThrough, fontName: fontName, fontSize: fontSize,
+             backgroundColor: backgroundColor)
     }
 }
 

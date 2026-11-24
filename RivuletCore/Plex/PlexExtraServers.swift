@@ -6,7 +6,7 @@
 //  Rivulet
 //
 //  The account's Plex servers other than the selected one (#87), for both apps:
-//  tvOS makes each a PlexProvider, iOS a server in IOSPlexSession. The list
+//  tvOS makes each a PlexProvider, iOS a server in PlexSession. The list
 //  belongs to the profile whose plex.tv token fetched it, because a Home
 //  profile sees its own servers with its own tokens.
 //
@@ -58,6 +58,15 @@ final class PlexExtraServers {
 
     func isEnabled(machineID: String) -> Bool {
         !(UserDefaults.standard.stringArray(forKey: disabledKey) ?? []).contains(machineID)
+    }
+
+    /// iCloud changed the list of servers turned off: apply it as a tap in Settings would.
+    func syncedPreferencesChanged(_ keys: Set<String>) {
+        guard keys.contains(disabledKey) else { return }
+        Self.onChanged?()
+        LiveTVDataStore.shared.plexContentTokenChanged()
+        lastRefresh = nil
+        refreshForAccount()
     }
 
     func setEnabled(_ enabled: Bool, machineID: String) {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright (C) 2025-2026 Bain Gurley
 
-import UIKit
+import CoreGraphics
 import CoreText
 import MediaAccessibility
 
@@ -13,7 +13,7 @@ import MediaAccessibility
 struct CaptionStyle: Equatable, @unchecked Sendable {
 
     /// Text/foreground color.
-    var foreground: UIColor
+    var foreground: CGColor
 
     /// True when the system lets the CONTENT's own colour win — the "Video
     /// Override" state in tvOS caption settings, reported as
@@ -27,11 +27,40 @@ struct CaptionStyle: Equatable, @unchecked Sendable {
     /// more opaque than the user asked for.
     var foregroundOpacity: Double
 
-    /// Character-cell background color.
-    var backgroundColor: UIColor
+    /// The background drawn behind each line of text.
+    var backgroundColor: CGColor
 
-    /// Opacity of the character-cell background (0...1).
+    /// True when the content's own per-run background may win (Video Override).
+    var allowsContentBackground: Bool
+
     var backgroundOpacity: Double
+
+    /// The window drawn behind the whole cue.
+    var windowColor: CGColor
+    var windowOpacity: Double
+
+    /// The cue box's insets and corner, by caption style.
+    var box: Box
+
+    /// Multiples of the point size. Apple's caption renderer keys these on the
+    /// built-in style's name and ignores the Rounded Corners setting.
+    struct Box: Equatable {
+        var horizontal: CGFloat
+        var vertical: CGFloat
+        var cornerRadius: CGFloat
+
+        static let edited = Box(horizontal: 0.77, vertical: 0.1, cornerRadius: 0.23)
+        static let builtIn = [
+            "MACaptionProfile-Default": Box(horizontal: 0.78, vertical: 0.26, cornerRadius: 0.26),
+            "MACaptionProfile-LargeText": Box(horizontal: 0.55, vertical: 0.09, cornerRadius: 0.15),
+            "MACaptionProfile-Classic": Box(horizontal: 0.32, vertical: 0.04, cornerRadius: 0.16),
+            "MACaptionProfile-OutlineText": Box(horizontal: 0, vertical: 0, cornerRadius: 0)
+        ]
+    }
+
+    /// One box per cue: the window, or the line background where there is no window.
+    var boxColor: CGColor { backgroundOpacity <= 0.01 && windowOpacity > 0.01 ? windowColor : backgroundColor }
+    var boxOpacity: Double { backgroundOpacity <= 0.01 && windowOpacity > 0.01 ? windowOpacity : backgroundOpacity }
 
     /// Font size multiplier derived from the system relative-character-size preference.
     /// Applied on top of the size Apple bases on the presentation (view) height.
@@ -64,27 +93,38 @@ struct CaptionStyle: Equatable, @unchecked Sendable {
     }
 
     /// Builds the caption font for the system settings at a concrete point size.
-    /// Uses the configured caption font descriptor when available. `CTFont` and
-    /// `UIFont` are toll-free bridged, so the descriptor path costs no copy.
-    func font(ofSize size: CGFloat) -> UIFont {
+    /// Uses the configured caption font descriptor when available, else the medium
+    /// system font. `CTFont` is toll-free bridged to `UIFont` and `NSFont`.
+    func font(ofSize size: CGFloat) -> CTFont {
         if let fontDescriptor {
-            return CTFontCreateWithFontDescriptor(fontDescriptor, size, nil) as UIFont
+            return CTFontCreateWithFontDescriptor(fontDescriptor, size, nil)
         }
-        return .systemFont(ofSize: size, weight: .medium)
+        let system = CTFontCreateUIFontForLanguage(.system, size, nil) ?? CTFontCreateWithName("Helvetica" as CFString, size, nil)
+        // 0.23 is UIFont.Weight.medium / NSFont.Weight.medium.
+        let attributes = [
+            kCTFontFamilyNameAttribute: CTFontCopyFamilyName(system),
+            kCTFontTraitsAttribute: [kCTFontWeightTrait: 0.23]
+        ] as CFDictionary
+        let medium = CTFontDescriptorCreateWithAttributes(attributes)
+        return CTFontCreateWithFontDescriptor(medium, size, nil)
     }
 
     static let `default` = CaptionStyle(
-        foreground: .white,
+        foreground: CGColor(gray: 1, alpha: 1),
         allowsContentColor: true,
         foregroundOpacity: 1.0,
-        backgroundColor: .black,
-        backgroundOpacity: 0.75,
+        backgroundColor: CGColor(gray: 0, alpha: 1),
+        allowsContentBackground: true,
+        backgroundOpacity: 0,
+        windowColor: CGColor(gray: 0, alpha: 1),
+        windowOpacity: 0.5,
+        box: Box.builtIn[CaptionAppearance.systemDefaultProfileID] ?? .edited,
         fontScale: 1.0,
         isSystemDefault: true,
         allowsContentFontSize: true,
         fontDescriptor: nil,
         allowsContentFont: true,
-        edge: .dropShadow
+        edge: .none
     )
 
     static func == (lhs: CaptionStyle, rhs: CaptionStyle) -> Bool {
@@ -92,7 +132,11 @@ struct CaptionStyle: Equatable, @unchecked Sendable {
             && lhs.allowsContentColor == rhs.allowsContentColor
             && lhs.foregroundOpacity == rhs.foregroundOpacity
             && lhs.backgroundColor == rhs.backgroundColor
+            && lhs.allowsContentBackground == rhs.allowsContentBackground
             && lhs.backgroundOpacity == rhs.backgroundOpacity
+            && lhs.windowColor == rhs.windowColor
+            && lhs.windowOpacity == rhs.windowOpacity
+            && lhs.box == rhs.box
             && lhs.fontScale == rhs.fontScale
             && lhs.isSystemDefault == rhs.isSystemDefault
             && lhs.allowsContentFontSize == rhs.allowsContentFontSize
@@ -156,24 +200,17 @@ enum CaptionAppearance {
         func contentMayOverride() -> Bool { behavior == .useContentIfAvailable }
 
         let fgUnmanaged = MACaptionAppearanceCopyForegroundColor(.user, &behavior)
-        let foreground = UIColor(cgColor: fgUnmanaged.takeRetainedValue())
+        let foreground = fgUnmanaged.takeRetainedValue()
         let allowsContentColor = contentMayOverride()
         let rawFgOpacity = Double(MACaptionAppearanceGetForegroundOpacity(.user, &behavior))
         let foregroundOpacity = rawFgOpacity > 0 ? min(rawFgOpacity, 1.0) : 1.0
 
-        // Background color + opacity — the box drawn directly behind the glyphs.
         let bgCG = MACaptionAppearanceCopyBackgroundColor(.user, &behavior).takeRetainedValue()
+        let allowsContentBackground = contentMayOverride()
         let bgOpacity = Double(MACaptionAppearanceGetBackgroundOpacity(.user, &behavior))
-
-        // Window color + opacity — the larger region box. Several built-in styles
-        // express their "background" via the window rather than the character
-        // background, so fall back to it when the character background is clear.
         let windowCG = MACaptionAppearanceCopyWindowColor(.user, &behavior).takeRetainedValue()
         let windowOpacity = Double(MACaptionAppearanceGetWindowOpacity(.user, &behavior))
-
-        let useWindow = bgOpacity <= 0.01 && windowOpacity > 0.01
-        let backgroundColor = UIColor(cgColor: useWindow ? windowCG : bgCG)
-        let backgroundOpacity = useWindow ? windowOpacity : bgOpacity
+        let profileID = MACaptionAppearanceCopyActiveProfileID() as String
 
         // Font scale
         let relative = MACaptionAppearanceGetRelativeCharacterSize(.user, &behavior)
@@ -200,10 +237,14 @@ enum CaptionAppearance {
             foreground: foreground,
             allowsContentColor: allowsContentColor,
             foregroundOpacity: foregroundOpacity,
-            backgroundColor: backgroundColor,
-            backgroundOpacity: backgroundOpacity,
+            backgroundColor: bgCG,
+            allowsContentBackground: allowsContentBackground,
+            backgroundOpacity: bgOpacity,
+            windowColor: windowCG,
+            windowOpacity: windowOpacity,
+            box: CaptionStyle.Box.builtIn[profileID] ?? .edited,
             fontScale: scale,
-            isSystemDefault: MACaptionAppearanceCopyActiveProfileID() as String == systemDefaultProfileID,
+            isSystemDefault: profileID == systemDefaultProfileID,
             allowsContentFontSize: allowsContentFontSize,
             fontDescriptor: fontDescriptor,
             allowsContentFont: allowsContentFont,

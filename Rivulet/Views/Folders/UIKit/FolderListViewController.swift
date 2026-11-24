@@ -13,7 +13,7 @@ import UIKit
 import Combine
 
 @MainActor
-final class FolderListViewController: UIViewController, UICollectionViewDelegate {
+final class FolderListViewController: UIViewController, UICollectionViewDelegate, SidebarTabReselecting {
     private nonisolated enum Item: Hashable, Sendable {
         case entry(MediaItemRef)
         case failure
@@ -29,6 +29,8 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
     private let folderTitle: String?
     private let listing: FolderListing
     private let viewMenu: (() -> UIMenu?)?
+    /// The library the header's Shuffle plays; nil shows no Shuffle.
+    private let shuffleLibrary: (() -> MediaLibrary?)?
     private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: makeLayout())
     private var dataSource: UICollectionViewDiffableDataSource<Int, Item>!
     private let preview = FolderPreviewView()
@@ -43,11 +45,13 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
     private var sources: [MediaItemRef: MediaSource] = [:]
     private var observers = Set<AnyCancellable>()
 
-    init(libraryTitle: String, folderTitle: String?, listing: FolderListing, viewMenu: (() -> UIMenu?)? = nil) {
+    init(libraryTitle: String, folderTitle: String?, listing: FolderListing, viewMenu: (() -> UIMenu?)? = nil,
+         shuffleLibrary: (() -> MediaLibrary?)? = nil) {
         self.libraryTitle = libraryTitle
         self.folderTitle = folderTitle
         self.listing = listing
         self.viewMenu = viewMenu
+        self.shuffleLibrary = shuffleLibrary
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -80,7 +84,7 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
         configureDataSource()
 
         let stateFrame = CGRect(x: Self.columnX, y: headerHeight, width: columnWidth, height: 90)
-        emptyLabel.text = "This folder is empty"
+        emptyLabel.text = String(localized: "This folder is empty")
         emptyLabel.frame = stateFrame
         spinner.center = CGPoint(x: stateFrame.midX, y: stateFrame.midY)
         anchor.frame = stateFrame
@@ -131,7 +135,7 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
             guard let entry = entry(ref) else { return }
             cell.configure(title: entry.title, detail: FolderRowDetail.text(for: entry))
         case .failure:
-            cell.configure(title: "Couldn't load this folder", detail: "")
+            cell.configure(title: String(localized: "Couldn't load this folder"), detail: "")
         }
     }
 
@@ -139,7 +143,11 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
         elementKind: UICollectionView.elementKindSectionHeader) { [unowned self] header, _, _ in
         // At the library root the library's own title is the heading, with nothing above it.
         header.configure(breadcrumb: folderTitle == nil ? nil : libraryTitle, title: folderTitle ?? libraryTitle,
-                         viewMenu: viewMenu)
+                         viewMenu: viewMenu,
+                         onShuffle: shuffleLibrary?().map { library in { [weak self] in
+                             guard let self else { return }
+                             ShufflePlayback.shuffle(library, from: self)
+                         } })
     }
 
     private func configureDataSource() {
@@ -195,7 +203,7 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
     }
 
     // Back from a deeper level, focus goes to the row that opened it; otherwise the
-    // first row, never the header's View button. Only if the cell exists now.
+    // first row, never the header's buttons. Only if the cell exists now.
     func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {
         let path = focusedRef.flatMap { dataSource.indexPath(for: .entry($0)) } ?? IndexPath(item: 0, section: 0)
         return collectionView.cellForItem(at: path) != nil ? path : nil
@@ -206,6 +214,11 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
         guard let path = context.nextFocusedIndexPath, let entry = entry(at: path) else { return }
         focusedRef = entry.id
         showPreview(entry)
+    }
+
+    func reselectSidebarTab() {
+        focusedRef = listing.entries.first?.id
+        SidebarReselection.returnToTop(in: collectionView, focusing: IndexPath(item: 0, section: 0))
     }
 
     /// Scrolls back to the first row and focuses it. False when it already holds focus.
@@ -290,8 +303,8 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
             content.lines = [
                 [item.runtime.map { FolderRowDetail.length($0) }, format].compactMap { $0 }.filter { !$0.isEmpty }
                     .joined(separator: " · "),
-                item.isInProgress ? item.runtime.map { FolderRowDetail.length($0 - item.userState.viewOffset) + " left" }
-                    : (item.isWatched ? "Watched" : nil)
+                item.isInProgress ? item.runtime.map { String(localized: "\(FolderRowDetail.length($0 - item.userState.viewOffset)) left") }
+                    : (item.isWatched ? String(localized: "Watched") : nil)
             ].compactMap { $0 }.filter { !$0.isEmpty }
             content.progress = item.watchProgress.flatMap { $0 > 0 && $0 < 1 ? $0 : nil }
             content.path = source?.fileName
@@ -307,7 +320,7 @@ final class FolderListViewController: UIViewController, UICollectionViewDelegate
         return await ImageCacheManager.shared.image(for: url, quality: .thumb)
     }
 
-    private static func itemCount(_ count: Int) -> String { "\(count.formatted()) \(count == 1 ? "item" : "items")" }
+    private static func itemCount(_ count: Int) -> String { String(localized: "\(count) items") }
 
     // MARK: - Actions
 
@@ -402,8 +415,8 @@ private struct SinglePhotoProvider: PhotoProvider {
 
 // MARK: - Header
 
-/// The library name over the folder name, clear of the shell's pill, with an
-/// optional View button on the trailing edge.
+/// The library name over the folder name, clear of the shell's pill, with
+/// optional Shuffle and View buttons on the trailing edge.
 private final class FolderHeaderView: UICollectionReusableView {
     private static let breadcrumbFont = UIFont.systemFont(ofSize: 29, weight: .regular)
     private static let titleFont = UIFont.systemFont(ofSize: 48, weight: .bold)
@@ -417,8 +430,14 @@ private final class FolderHeaderView: UICollectionReusableView {
     private let breadcrumb = UILabel()
     private let title = UILabel()
     private let viewButton = SortButton()
+    private let shuffleButton = SortButton()
     private var viewMenu: (() -> UIMenu?)?
+    private var onShuffle: (() -> Void)?
     private lazy var viewCenterY = viewButton.centerYAnchor.constraint(equalTo: topAnchor)
+    /// Shuffle's trailing edge: beside View while it shows, else the header's edge. Swapped in configure.
+    private lazy var shuffleBesideView = shuffleButton.trailingAnchor.constraint(equalTo: viewButton.leadingAnchor,
+                                                                                 constant: -16)
+    private lazy var shuffleAtEdge = shuffleButton.trailingAnchor.constraint(equalTo: trailingAnchor)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -427,25 +446,38 @@ private final class FolderHeaderView: UICollectionReusableView {
         title.font = Self.titleFont
         title.textColor = .white
         [breadcrumb, title].forEach(addSubview)
-        viewButton.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(viewButton)
+        shuffleButton.configure(sortName: String(localized: "Shuffle"), symbol: "shuffle")
+        shuffleButton.addAction(UIAction { [weak self] _ in self?.onShuffle?() }, for: .primaryActionTriggered)
+        for button in [viewButton, shuffleButton] {
+            button.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(button)
+        }
         NSLayoutConstraint.activate([
             viewButton.trailingAnchor.constraint(equalTo: trailingAnchor),
-            viewButton.heightAnchor.constraint(equalToConstant: 44),
             viewButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
             viewCenterY,
+            shuffleButton.centerYAnchor.constraint(equalTo: viewButton.centerYAnchor),
+            shuffleButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+            shuffleAtEdge,
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    func configure(breadcrumb text: String?, title titleText: String, viewMenu: (() -> UIMenu?)?) {
+    func configure(breadcrumb text: String?, title titleText: String, viewMenu: (() -> UIMenu?)?,
+                   onShuffle: (() -> Void)? = nil) {
         breadcrumb.text = text
         breadcrumb.isHidden = text == nil
         title.text = titleText
         self.viewMenu = viewMenu
         viewButton.configure(view: .folders, menu: viewMenu?())
+        self.onShuffle = onShuffle
+        shuffleButton.isHidden = onShuffle == nil
+        // Deactivate before activate, so the two are never active together.
+        let beside = !viewButton.isHidden
+        NSLayoutConstraint.deactivate([beside ? shuffleAtEdge : shuffleBesideView])
+        NSLayoutConstraint.activate([beside ? shuffleBesideView : shuffleAtEdge])
         setNeedsLayout()
     }
 
@@ -463,8 +495,10 @@ private final class FolderHeaderView: UICollectionReusableView {
             breadcrumb.frame = CGRect(x: 0, y: y, width: bounds.width, height: ceil(Self.breadcrumbFont.lineHeight))
             y = breadcrumb.frame.maxY
         }
-        let viewWidth = viewButton.isHidden ? 0 : viewButton.frame.width + 24
-        title.frame = CGRect(x: 0, y: y, width: bounds.width - viewWidth, height: ceil(Self.titleFont.lineHeight))
+        // The title stops short of the leftmost visible button.
+        let buttonsLeft = [shuffleButton, viewButton].filter { !$0.isHidden }.map(\.frame.minX).min()
+        let titleWidth = buttonsLeft.map { $0 - 24 } ?? bounds.width
+        title.frame = CGRect(x: 0, y: y, width: titleWidth, height: ceil(Self.titleFont.lineHeight))
         viewCenterY.constant = title.frame.midY
     }
 }

@@ -91,6 +91,9 @@ final class MediaDetailChromeView: UIView {
     /// repopulate genre + quality rows + cast label with richer fields.
     private var detail: MediaItemDetail?
 
+    /// The episode the Play pill names, shown in place of a show's synopsis.
+    private var episodeDescription: (prefix: String, body: String)?
+
     /// Sizes the logo view to the image's aspect, since `.scaleAspectFit` centres the glyphs
     /// and would push them right of the metadata's leading edge.
     private var logoAspectConstraint: NSLayoutConstraint?
@@ -352,6 +355,7 @@ final class MediaDetailChromeView: UIView {
         loadToken &+= 1
         item = nil
         detail = nil
+        episodeDescription = nil
         if let prev = logoAspectConstraint {
             prev.isActive = false
             logoAspectConstraint = nil
@@ -430,6 +434,7 @@ final class MediaDetailChromeView: UIView {
         let token = loadToken
         pendingLoads = 0
         readyWaiters = []
+        episodeDescription = nil
 
         titleLogoImageView.image = nil
         titleFallbackLabel.text = nil
@@ -555,7 +560,20 @@ final class MediaDetailChromeView: UIView {
                   self.loadToken == token
             else { return }
             self.setPlayTarget(episode)
+            await self.showEpisodeDescription(for: episode, page: item.kind, token: token)
         }
+    }
+
+    /// Swaps the synopsis for the named episode's (one fetch when the episode lacks an overview).
+    private func showEpisodeDescription(for episode: MediaItem, page: MediaKind, token: UInt64) async {
+        var overview = episode.overview
+        if overview?.isEmpty != false,
+           EpisodePicker.episodeDescription(for: episode, overview: "x", on: page) != nil {
+            overview = await Self.fetchDetail(episode.ref)?.item.overview
+        }
+        guard loadToken == token else { return }
+        episodeDescription = EpisodePicker.episodeDescription(for: episode, overview: overview, on: page)
+        if let item, let detail { renderDescription(item: item, detail: detail) }
     }
 
     private static func fetchDetail(_ ref: MediaItemRef) async -> MediaItemDetail? {
@@ -578,22 +596,10 @@ final class MediaDetailChromeView: UIView {
     private func applyDetail(item: MediaItem, detail: MediaItemDetail) {
         rebuildGenreRow(item: item, detail: detail)
         rebuildQualityRow(item: item, detail: detail)
-        if let s = item.seasonNumber, let e = item.episodeNumber,
-           let overview = detail.item.overview, !overview.isEmpty {
-            // Episode: bold "S1, E1:" prefix before the synopsis.
-            let color = UIColor.white.withAlphaComponent(0.85)
-            let attr = NSMutableAttributedString(string: "S\(s), E\(e): ", attributes: [
-                .font: UIFont.systemFont(ofSize: 23, weight: .bold), .foregroundColor: color])
-            attr.append(NSAttributedString(string: overview, attributes: [
-                .font: Self.descriptionFont, .foregroundColor: color]))
-            descriptionLabel.attributedText = attr
-        } else if let overview = detail.item.overview, !overview.isEmpty {
-            descriptionLabel.text = overview
-            descriptionLabel.font = Self.descriptionFont
-        }
+        renderDescription(item: item, detail: detail)
         let topCast = detail.cast.prefix(3).map { $0.name }
         if !topCast.isEmpty {
-            let attr = NSMutableAttributedString(string: "Starring ", attributes: [
+            let attr = NSMutableAttributedString(string: String(localized: "Starring "), attributes: [
                 .foregroundColor: UIColor.white.withAlphaComponent(Self.rolesLabelAlpha)])
             attr.append(NSAttributedString(string: topCast.joined(separator: ", ")))
             castLabel.attributedText = attr
@@ -601,6 +607,27 @@ final class MediaDetailChromeView: UIView {
             castLabel.attributedText = nil
         }
         addVersionsButton(detail)
+    }
+
+    private func renderDescription(item: MediaItem, detail: MediaItemDetail) {
+        let color = UIColor.white.withAlphaComponent(0.85)
+        func prefixed(_ prefix: String, _ body: String) {
+            let attr = NSMutableAttributedString(string: prefix, attributes: [
+                .font: UIFont.systemFont(ofSize: 23, weight: .bold), .foregroundColor: color])
+            attr.append(NSAttributedString(string: body, attributes: [
+                .font: Self.descriptionFont, .foregroundColor: color]))
+            descriptionLabel.attributedText = attr
+        }
+        if let episode = episodeDescription {
+            prefixed(episode.prefix + " ", episode.body)
+        } else if let s = item.seasonNumber, let e = item.episodeNumber,
+                  let overview = detail.item.overview, !overview.isEmpty {
+            prefixed(String(localized: "S\(s), E\(e): "), overview)   // episode page
+        } else if let overview = detail.item.overview, !overview.isEmpty {
+            descriptionLabel.attributedText = nil
+            descriptionLabel.text = overview
+            descriptionLabel.font = Self.descriptionFont
+        }
     }
 
     /// Versions button after Info, once the detail shows two or more files.
@@ -654,6 +681,13 @@ final class MediaDetailChromeView: UIView {
         }
         watchlist.onPrimaryAction = { [weak self] in self?.toggleWatchlist(item) }
 
+        // Movies and shows on a server that keeps favorites.
+        let favorite: FocusableActionButton? = FavoritesFeed.canFavorite(item) ? makeCircleButton(systemImage: "heart") : nil
+        favoriteButton = favorite
+        heroFavorite = item.userState.isFavorite
+        updateFavoriteIcon()
+        favorite?.onPrimaryAction = { [weak self] in self?.toggleFavorite(item) }
+
         let info = makeCircleButton(systemImage: "text.page")     // open details popup
         infoButton = info
         info.onPrimaryAction = { [weak self] in
@@ -662,12 +696,23 @@ final class MediaDetailChromeView: UIView {
         }
 
         actionButtonsStack.addArrangedSubview(play)
+        // A show shuffles every episode.
+        if item.kind == .show {
+            let shuffle = makeCircleButton(systemImage: "shuffle")
+            shuffle.accessibilityLabel = String(localized: "Shuffle")
+            shuffle.onPrimaryAction = { [weak self] in
+                guard let self, let host = self.hostViewController else { return }
+                ShufflePlayback.shuffle(show: item, from: host)
+            }
+            actionButtonsStack.addArrangedSubview(shuffle)
+        }
         actionButtonsStack.addArrangedSubview(watched)
         // Jellyfin has no watchlist: its add throws, so the button would flip
         // and snap back. Nil provider keeps today's behaviour.
         if MediaProviderRegistry.shared.provider(for: item.ref.providerID)?.supportsWatchlist ?? true {
             actionButtonsStack.addArrangedSubview(watchlist)
         }
+        if let favorite { actionButtonsStack.addArrangedSubview(favorite) }
         actionButtonsStack.addArrangedSubview(info)
         // An episode's Watched acts on the episode alone; the whole show is
         // marked from the show's own page, which this opens.
@@ -737,7 +782,7 @@ final class MediaDetailChromeView: UIView {
 
         guard let tmdbID = item.tmdbID else {
             icon.image = UIImage(systemName: "bookmark")
-            label.text = "Watchlist"
+            label.text = String(localized: "Watchlist")
             return pill
         }
         let guid = "tmdb://\(tmdbID)"
@@ -746,7 +791,7 @@ final class MediaDetailChromeView: UIView {
             let isOn = PlexWatchlistService.shared.contains(guid: guid)
                 || PlexWatchlistService.shared.contains(tmdbId: tmdbID)
             icon.image = UIImage(systemName: isOn ? "bookmark.fill" : "bookmark")
-            label.text = "Watchlist"
+            label.text = String(localized: "Watchlist")
         }
         render()
 
@@ -779,6 +824,8 @@ final class MediaDetailChromeView: UIView {
     private weak var versionsButton: FocusableActionButton?
     private var heroWatched = false
     private var heroOnWatchlist = false
+    private weak var favoriteButton: FocusableActionButton?
+    private var heroFavorite = false
 
     private func toggleWatched(_ item: MediaItem) {
         // The stored item, not the one captured at build: a refresh since then
@@ -799,7 +846,7 @@ final class MediaDetailChromeView: UIView {
                 self?.setWatched(choice.markWatched, show)
             })
         }
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel))
         host.present(alert, animated: true)
     }
 
@@ -833,6 +880,31 @@ final class MediaDetailChromeView: UIView {
                 }
             }
         }
+    }
+
+    private func toggleFavorite(_ item: MediaItem) {
+        heroFavorite.toggle()
+        updateFavoriteIcon()
+        let target = heroFavorite
+        Task { [weak self] in
+            do {
+                try await FavoritesFeed.set(target, for: item)
+                NotificationCenter.default.post(name: .plexDataNeedsRefresh, object: nil)
+            } catch {
+                // The server refused: put the heart back, as the watchlist does.
+                await MainActor.run {
+                    guard let self else { return }
+                    self.heroFavorite = !target
+                    self.updateFavoriteIcon()
+                }
+            }
+        }
+    }
+
+    private func updateFavoriteIcon() {
+        Self.setCircleIcon(favoriteButton, heroFavorite ? "heart.fill" : "heart")
+        favoriteButton?.accessibilityLabel = heroFavorite
+            ? String(localized: "Remove from Favorites") : String(localized: "Add to Favorites")
     }
 
     // Distinct active glyphs so watched ≠ watchlist when both are on.
@@ -1102,18 +1174,18 @@ final class MediaDetailChromeView: UIView {
         let hours = minutes / 60
         let remaining = minutes % 60
         if hours > 0 {
-            return remaining > 0 ? "\(hours)h \(remaining)m" : "\(hours)h"
+            return remaining > 0 ? String(localized: "\(hours)h \(remaining)m") : String(localized: "\(hours)h")
         }
-        return "\(minutes)m"
+        return String(localized: "\(minutes)m")
     }
 
     private static func kindLabel(_ kind: MediaKind) -> String {
         switch kind {
-        case .movie: return "Movie"
-        case .show, .season, .episode: return "TV Show"
-        case .collection: return "Collection"
-        case .playlist: return "Playlist"
-        case .person: return "Person"
+        case .movie: return String(localized: "Movie")
+        case .show, .season, .episode: return String(localized: "TV Show")
+        case .collection: return String(localized: "Collection")
+        case .playlist: return String(localized: "Playlist")
+        case .person: return String(localized: "Person")
         case .unknown: return ""
         }
     }
@@ -1159,21 +1231,21 @@ struct ShowWatchPrompt: Equatable {
         let markWatched: Bool
     }
 
-    static let markWatched = Choice(title: "Mark All Watched", markWatched: true)
-    static let markUnwatched = Choice(title: "Mark All Unwatched", markWatched: false)
+    static let markWatched = Choice(title: String(localized: "Mark All Watched"), markWatched: true)
+    static let markUnwatched = Choice(title: String(localized: "Mark All Unwatched"), markWatched: false)
 
     let message: String?
     let choices: [Choice]
 
     init(progress: ChildProgress?) {
-        guard let progress, progress.total > 0 else {
+        guard let progress, progress.total > 0, progress.unplayedOnly != true else {
             message = nil
             choices = [Self.markWatched, Self.markUnwatched]
             return
         }
         let total = progress.total
         let played = min(max(progress.played, 0), total)
-        message = "\(played) of \(total) episodes watched."
+        message = String(localized: "\(played) of \(total) episodes watched.")
         choices = (played < total ? [Self.markWatched] : []) + (played > 0 ? [Self.markUnwatched] : [])
     }
 }

@@ -590,7 +590,7 @@ private final class UniversalPlaybackInputTarget: PlaybackInputTarget {
                 // Matches Apple TV convention and the overlays' own
                 // .onExitCommand intent (which the UIKit press interception
                 // pre-empts, so it has to be honored here too).
-                vm.dismissPostVideo()
+                vm.closePostVideo()
             } else if vm.isScrubbing {
                 let speedBefore = vm.scrubSpeed
                 PlaybackInputTelemetry.shared.recordScrubTransition(
@@ -602,11 +602,11 @@ private final class UniversalPlaybackInputTarget: PlaybackInputTarget {
                 )
                 vm.cancelScrub()
                 onResetRemoteInput?()
-            } else if vm.showPausedPoster {
+            } else if vm.backReturnsToPausedFrame {
                 // Back with the ambient pause backdrop up returns to the
                 // paused frame — it does not exit the player.
                 vm.hidePausedPoster()
-            } else if vm.controlsFocusActive || vm.showControls {
+            } else if (vm.controlsFocusActive || vm.showControls) && !vm.showPausedPoster {
                 // Back from the transport buttons (or from any visible chrome)
                 // closes the whole chrome in one press, rather than first
                 // de-focusing the buttons onto the scrubber and leaving the rail
@@ -1034,22 +1034,22 @@ struct UniversalPlayerView: View {
     private func errorTitle(for error: PlayerError) -> String {
         switch error {
         case .networkError:
-            return "Connection Problem"
+            return String(localized: "Connection Problem")
         case .loadFailed:
-            return "Couldn't Load Video"
+            return String(localized: "Couldn't Load Video")
         case .codecUnsupported:
-            return "Format Not Supported"
+            return String(localized: "Format Not Supported")
         case .invalidURL:
-            return "Invalid Stream"
+            return String(localized: "Invalid Stream")
         case .unknown:
-            return "Playback Error"
+            return String(localized: "Playback Error")
         case .serverTerminated:
-            return "Playback Stopped"
+            return String(localized: "Playback Stopped")
         case .engineFailure(let kind, _):
             switch DirectPlayFailureKind(engineKind: kind) {
-            case .network: return "Connection Problem"
-            case .unsupportedCodec: return "Format Not Supported"
-            default: return "Playback Error"
+            case .network: return String(localized: "Connection Problem")
+            case .unsupportedCodec: return String(localized: "Format Not Supported")
+            default: return String(localized: "Playback Error")
             }
         }
     }
@@ -1088,10 +1088,10 @@ private struct PlayerErrorOverlay: View {
 
             HStack(spacing: 32) {
                 if error.isRetryable {
-                    actionButton(label: "Try Again", field: .retry, action: onRetry)
+                    actionButton(label: String(localized: "Try Again"), field: .retry, action: onRetry)
                 }
 
-                actionButton(label: "Dismiss", field: .dismiss, action: onDismiss)
+                actionButton(label: String(localized: "Dismiss"), field: .dismiss, action: onDismiss)
             }
             .padding(.top, 20)
         }

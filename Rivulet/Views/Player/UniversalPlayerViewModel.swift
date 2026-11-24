@@ -111,6 +111,12 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Kept for existing call sites; true in either ambient tier.
     var showPausedPoster: Bool { pausePresentation != .frame }
 
+    /// Back from the poster returns to the paused frame, which does not exist
+    /// while the engine is torn down after a sleep: Back must leave instead (#523).
+    var backReturnsToPausedFrame: Bool {
+        showPausedPoster && !(aetherPlayer?.isParkedForReload ?? false)
+    }
+
     /// Full-resolution backdrop for the ambient pause state: raw Plex art
     /// path with token, NOT the `/photo/:/transcode` downscale that
     /// `PlexNetworkManager.buildThumbnailURL` applies (the TV renders it at
@@ -194,13 +200,21 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var pendingEngineThumbnailTime: TimeInterval?
 
     // MARK: - Skip Marker State
-    @Published private(set) var activeMarker: PlexMarker?
+    @Published private(set) var activeMarker: PlexMarker? {
+        didSet { if (activeMarker == nil) != (oldValue == nil) { skipPillDismissed = false } }
+    }
     @Published private(set) var showSkipButton = false
+    /// Menu hid the pill for this marker or this Up Next fold; it still shows in the controls (#556).
+    @Published private(set) var skipPillDismissed = false
     private var hasSkippedIntro = false
     private var skippedCreditsIds: Set<Int> = []  // Track skipped credits by ID (can have multiple)
     private var skippedCommercialIds: Set<Int> = []  // Track skipped commercials by ID
     private var skippedRecapIds: Set<Int> = []  // Track skipped recaps by ID (IntroDB backup)
     private var hasTriggeredPostVideo = false
+    /// Up Next was closed with a next episode waiting: the skip pill stands in for it, labelled "Up Next".
+    @Published private(set) var upNextCollapsed = false {
+        didSet { if upNextCollapsed != oldValue { skipPillDismissed = false } }
+    }
 
     // MARK: - Auto-Skip Countdown State
     /// Current countdown value (5...4...3...2...1), 0 means no countdown active.
@@ -357,10 +371,10 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// The generated row's second line: the model's download until it is on disk.
     static var generatedSubtitleStatus: String {
         switch SpeechModelStore.shared.state {
-        case .ready: return "Generated"
-        case .absent: return "Generated, downloads 230 MB"
-        case .downloading(let fraction): return "Downloading \(Int(fraction * 100))%"
-        case .failed: return "Download failed, select to retry"
+        case .ready: return String(localized: "Generated")
+        case .absent: return String(localized: "Generated, downloads 230 MB")
+        case .downloading(let fraction): return String(localized: "Downloading \(Int(fraction * 100))%")
+        case .failed: return String(localized: "Download failed, select to retry")
         }
     }
     /// Why the filter can't mute language on this title right now; nil when it can.
@@ -378,17 +392,14 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// height). Shared by both, so a title carries one identity.
     var subtitleMediaKey: String { "plex:\(metadata.ratingKey ?? "unknown")" }
 
-    /// This item's height adjustment in stepper units. Published so both
-    /// overlays re-render on a step, and reloaded per item like the delay.
+    /// The global subtitle height in stepper units. Published so the overlay
+    /// re-renders on a step.
     @Published private(set) var subtitleHeightUnits: Int = 0
 
-    /// Steps the height and persists it for this ratingKey. Applied to BOTH
-    /// routes, same as the delay stepper, so it survives a mid-playback route
-    /// change.
+    /// Steps the global height and persists it.
     func adjustSubtitleHeight(bySteps steps: Int) {
-        SubtitleAdjustments.setHeightUnits(subtitleHeightUnits + steps,
-                                           forMediaKey: subtitleMediaKey)
-        subtitleHeightUnits = SubtitleAdjustments.heightUnits(forMediaKey: subtitleMediaKey)
+        SubtitleAdjustments.heightUnits = subtitleHeightUnits + steps
+        subtitleHeightUnits = SubtitleAdjustments.heightUnits
     }
 
     /// Current subtitle delay in seconds; positive = subtitles appear later.
@@ -411,7 +422,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     private func loadStoredSubtitleDelay() {
         let value = SubtitleAdjustments.delay(forKey: subtitleMediaKey)
         aetherSubtitleModel.delaySeconds = value
-        subtitleHeightUnits = SubtitleAdjustments.heightUnits(forMediaKey: subtitleMediaKey)
+        subtitleHeightUnits = SubtitleAdjustments.heightUnits
     }
 
     // MARK: - Metadata
@@ -430,12 +441,12 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Bumped when `metadata` swaps to a different item (not on in-place field
     /// fills). UI caching per-item state observes this, since `metadata` is not published.
     @Published private(set) var itemGeneration = 0
-    var title: String { metadata.title ?? "Unknown" }
+    var title: String { metadata.title ?? String(localized: "Unknown") }
     var subtitle: String? {
         if metadata.type == "episode" {
             let show = metadata.grandparentTitle ?? ""
-            let season = metadata.parentIndex.map { "S\($0)" } ?? ""
-            let episode = metadata.index.map { "E\($0)" } ?? ""
+            let season = metadata.parentIndex.map { String(localized: "S\($0)") } ?? ""
+            let episode = metadata.index.map { String(localized: "E\($0)") } ?? ""
             return "\(show) \(season)\(episode)"
         }
         return metadata.year.map { String($0) }
@@ -586,7 +597,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var isReloadingStream = false
     private var trackReloadQueued = false
     /// The picks a Plex transcode was started with, when Rivulet PUT them; seeds the HLS track ids.
-    private var transcodeTrackIDs: PlexTrackIDs?
+    private var transcodeTrackIDs: TrackPicks?
     /// `.provider`: the version the next quality reload plays, when the cap moved off the playing one.
     private var providerTargetSourceID: String?
 
@@ -602,6 +613,64 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Full Plex metadata for the next item, by ratingKey. Tests stub the server here.
     var plexMetadataFetch: (_ serverURL: String, _ authToken: String, _ ratingKey: String) async throws -> PlexMetadata = {
         try await PlexNetworkManager.shared.getFullMetadata(serverURL: $0, authToken: $1, ratingKey: $2)
+    }
+
+    // MARK: - Cinema extras (#491)
+
+    /// The movie waiting behind the trailer or pre-roll playing now; nil otherwise.
+    private var cinemaFeature: PlexMetadata?
+    /// The clips still to play ahead of `cinemaFeature`.
+    private var cinemaQueue: [PlexMetadata] = []
+    private var cinemaFeatureVersion: VersionChoice?
+    /// The pre-play picks, held for the movie: a clip's first track pass would consume them.
+    private var cinemaFeaturePicks: (audio: Int?, subtitle: InitialSubtitleSelection)?
+    private var cinemaStopped = false
+    private var hasCheckedCinemaExtras = false
+    /// The item that already moved on, so a skip racing the clip's end advances once.
+    private var cinemaAdvancedGeneration: Int?
+    /// The clips the server plays before a movie. Tests stub the server here.
+    var plexCinemaExtras: (_ serverURL: String, _ authToken: String, _ ratingKey: String, _ count: Int) async throws -> [PlexMetadata] = {
+        try await PlexNetworkManager.shared.cinemaExtras(serverURL: $0, authToken: $1, ratingKey: $2, count: $3)
+    }
+
+    var isPlayingCinemaExtra: Bool { cinemaFeature != nil }
+
+    /// Runs once, before a movie's first load: puts the first clip in the movie's place.
+    private func beginCinemaExtrasIfNeeded() async {
+        guard !hasCheckedCinemaExtras else { return }
+        hasCheckedCinemaExtras = true
+        let count = CinemaExtras.count
+        guard case .plex = source, let ratingKey = metadata.ratingKey,
+              CinemaExtras.applies(type: metadata.type, startOffset: startOffset,
+                                   inPlaylist: playQueue != nil, count: count) else { return }
+        let stops = stopCount
+        // Any failure here plays the movie: extras are never worth blocking it.
+        guard let clips = try? await plexCinemaExtras(serverURL, authToken, ratingKey, count),
+              stops == stopCount, let first = clips.first else { return }
+        cinemaFeature = metadata
+        // Server order, or the version's index into the file list is lost on the way back.
+        cinemaFeature?.Media = serverOrderedMedia
+        cinemaFeatureVersion = baseVersionChoice
+        cinemaFeaturePicks = (initialAudioTrackId, initialSubtitleSelection)
+        initialAudioTrackId = nil
+        initialSubtitleSelection = .auto
+        cinemaQueue = Array(clips.dropFirst())
+        metadata = first
+        playingMediaID = nil
+        playingMediaServerIndex = 0
+        duration = Self.metadataDuration(first)
+        resetPreparedStreamContext()
+        itemGeneration += 1
+    }
+
+    /// The next clip, or the movie after the last one.
+    private func advanceCinemaExtras() async {
+        guard let cinemaFeature, !cinemaStopped, cinemaAdvancedGeneration != itemGeneration else { return }
+        cinemaAdvancedGeneration = itemGeneration
+        activeMarker = nil
+        showSkipButton = false
+        nextEpisode = cinemaQueue.isEmpty ? cinemaFeature : cinemaQueue.removeFirst()
+        await playNextEpisode()
     }
 
     // MARK: - Preloaded Next Episode Data
@@ -728,6 +797,23 @@ final class UniversalPlayerViewModel: ObservableObject {
             playSessionID: playback.stream.playSessionID
         )
         providerReporterStarted = false
+        if playback.extrasPending { loadProviderMarkers(playback) }
+    }
+
+    /// Skip markers for a provider item that `prepare` left for later: fetched alongside the start
+    /// and applied when they arrive, as the selected server's markers are.
+    private func loadProviderMarkers(_ playback: ProviderPlayback) {
+        let ref = playback.item.ref
+        Task { [weak self] in
+            let extras = await playback.provider.playbackExtras(for: ref, sourceID: playback.stream.source.id)
+            // The source still being this item is the staleness check: an autoplay swap moves it.
+            guard let self, case .provider(var current) = self.source, current.item.ref == ref else { return }
+            current.extras = extras
+            current.extrasPending = false
+            self.source = .provider(current)
+            let markers = ProviderPlaybackMetadata.markers(from: extras)
+            if !markers.isEmpty { self.metadata.Marker = markers }
+        }
     }
 
     /// The provider stream's first route. A direct-play stream goes to Aether
@@ -735,11 +821,13 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// with nothing behind it. nil when the provider gave no URL.
     static func initialRoutes(for stream: StreamInfo) -> (primary: PlaybackRoute, hasTranscodeFallback: Bool)? {
         guard let url = stream.source.streamURL else { return nil }
+        // Plex carries its token and client profile in headers; Jellyfin and Emby carry auth in the URL.
+        let headers = stream.headers.isEmpty ? nil : stream.headers
         switch stream.source.streamKind {
         case .hlsTranscode:
-            return (.hls(url: url, headers: nil), false)
+            return (.hls(url: url, headers: headers), false)
         case .directPlay, .progressiveTranscode:
-            return (.aether(url: url, headers: nil), true)
+            return (.aether(url: url, headers: headers), true)
         }
     }
 
@@ -847,7 +935,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         // seek beyond EOF; land just short so playback ends normally instead.
         let target = duration > 0 ? min(skipTarget, max(0, duration - 0.25)) : skipTarget
         Task { [weak self] in
-            await self?.seek(to: target, revealsControls: false)
+            // Exact: a keyframe landing would replay the scene being skipped.
+            await self?.seek(to: target, revealsControls: false, exact: true)
         }
     }
 
@@ -912,10 +1001,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         let url: URL?
         switch source {
         case .plex:
-            guard var components = URLComponents(string: "\(serverURL)\(key)") else { return nil }
-            components.queryItems = (components.queryItems ?? [])
-                + [URLQueryItem(name: "X-Plex-Token", value: authToken)]
-            url = components.url
+            url = PlexSidecarURL.url(serverURL: serverURL, key: key, token: authToken, codec: stream.codec)
         case .provider:
             url = URL(string: key)
         }
@@ -1287,7 +1373,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             // source itself and serves HLS-fMP4 to AVPlayer over loopback.
             streamURL = url
             streamHeaders = headers ?? rivuletDirectPlayHeaders()
-            if let ratingKey = metadata.ratingKey {
+            if let ratingKey = metadata.ratingKey, !isPlayingCinemaExtra {
                 let mediaIndex = playingMediaServerIndex, server = plexServer
                 Task { await PlexProgressReporter.shared.beginDirectPlaySession(
                     ratingKey: ratingKey, mediaIndex: mediaIndex, server: server) }
@@ -1326,7 +1412,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         playbackPlan = plan
         activeRoute = plan.primary
         streamURL = url
-        streamHeaders = [:]
+        streamHeaders = playback.stream.headers
         AppHangContext.setPlaybackRoute(plan.primary.description)
         diagnostics.setMedia(metadata, route: plan.primary.description, startOffset: startOffset, isRelay: false,
                              quality: quality.choice.rawValue, location: quality.isHome ? "home" : "away")
@@ -1625,6 +1711,11 @@ final class UniversalPlayerViewModel: ObservableObject {
     private var bufferingStartedAt: Date?
 
     private func updatePlaybackState(_ state: UniversalPlaybackState) {
+        // A trailer that fails must not stop the movie behind it.
+        if case .failed = state, isPlayingCinemaExtra {
+            Task { await advanceCinemaExtras() }
+            return
+        }
         recordStallTransition(from: playbackState, to: state)
         trackQualityStall(from: playbackState, to: state)
         playbackState = state
@@ -1738,7 +1829,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     func startPlayback() async {
-        Task { await resolveSubtitleSearchAccess() }
+        await beginCinemaExtrasIfNeeded()
         // Fetch detailed metadata if markers or chapters are missing
         let hasMarkers = !(metadata.Marker ?? []).isEmpty
         let hasChapters = !(metadata.Chapter ?? []).isEmpty
@@ -1782,6 +1873,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         // .aether route (or an AVPlayer fallback route) and
         // startAVPlayerPlayback() drives both.
         await startAVPlayerPlayback()
+        // A clip that can't start never reaches the state funnel's error path.
+        if case .failed = playbackState { await advanceCinemaExtras() }
     }
 
     // MARK: - AVPlayer Startup
@@ -1790,7 +1883,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         await ensureStreamURLPrepared()
 
         guard let url = streamURL else {
-            errorMessage = "No stream URL available"
+            errorMessage = String(localized: "No stream URL available")
             playbackState = .failed(.invalidURL)
             return
         }
@@ -1852,7 +1945,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             if let playerError = error as? PlayerError {
                 errorMessage = playerError.userFacingDescription
             } else {
-                errorMessage = "Something went wrong during playback. Please try again."
+                errorMessage = String(localized: "Something went wrong during playback. Please try again.")
             }
             playbackState = .failed(.loadFailed(technicalError))
 
@@ -2157,6 +2250,14 @@ final class UniversalPlayerViewModel: ObservableObject {
                 )
                 return
             }
+            // Video-only: the engine has no way to carry this audio, and the server does (#464).
+            if aetherPlayer?.audioIsDropped == true, planHasHLSFallback(plan), !isStacked {
+                try await attemptRivuletHLSFallback(
+                    resumeTime: startTime ?? 0,
+                    reason: "aether_audio_dropped",
+                    failureKind: .unsupportedCodec
+                )
+            }
         }
     }
 
@@ -2252,10 +2353,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard let streams = (part ?? metadata.Media?.first?.Part?.first)?.Stream else { return [] }
         return streams.filter { $0.isSubtitle && $0.key != nil }.compactMap { stream in
             guard let key = stream.key,
-                  var components = URLComponents(string: "\(serverURL)\(key)") else { return nil }
-            components.queryItems = (components.queryItems ?? [])
-                + [URLQueryItem(name: "X-Plex-Token", value: authToken)]
-            guard let url = components.url else { return nil }
+                  let url = PlexSidecarURL.url(serverURL: serverURL, key: key, token: authToken, codec: stream.codec)
+            else { return nil }
             return AetherPlayer.SidecarSubtitle(
                 url: url,
                 name: stream.displayTitle ?? stream.extendedDisplayTitle,
@@ -2688,7 +2787,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             let seasonNum = metadata.parentIndex ?? 0
             let episodeNum = metadata.index ?? 0
             let epTitle = metadata.title ?? ""
-            displayTitle = "S\(seasonNum) E\(episodeNum) · \(epTitle)"
+            displayTitle = String(localized: "S\(seasonNum) E\(episodeNum) · \(epTitle)")
         } else {
             displayTitle = metadata.title ?? ""
         }
@@ -2864,8 +2963,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         switch channels {
         case 8: channelDesc = "7.1"
         case 6: channelDesc = "5.1"
-        case 2: channelDesc = "Stereo"
-        case 1: channelDesc = "Mono"
+        case 2: channelDesc = String(localized: "Stereo")
+        case 1: channelDesc = String(localized: "Mono")
         default: channelDesc = channels > 0 ? "\(channels)ch" : ""
         }
 
@@ -2948,7 +3047,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         if currentScrubThumbnailSource == .server, let partId = metadata.Media?.first?.Part?.first?.id,
            let image = await PlexThumbnailService.shared.getThumbnail(
                partId: partId, time: time, serverURL: serverURL, authToken: authToken) {
-            return image
+            return UIImage(cgImage: image)
         }
         guard let frame = await aetherPlayer?.scrubFrame(atSeconds: time, maxWidth: 640) else { return nil }
         return UIImage(cgImage: frame)
@@ -2967,7 +3066,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 let end = CMTime(value: CMTimeValue(endMs), timescale: 1000)
                 let range = CMTimeRange(start: start, end: end)
 
-                let title = chapter.tag ?? "Chapter \(chapter.index ?? 0)"
+                let title = chapter.tag ?? String(localized: "Chapter \(chapter.index ?? 0)")
                 var items = [makeMetadataItem(.commonIdentifierTitle, value: title)]
 
                 if let index = chapter.index, let imageData = chapterThumbnails[index] {
@@ -2992,7 +3091,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             let end = CMTime(value: CMTimeValue(endMs), timescale: 1000)
             let range = CMTimeRange(start: start, end: end)
 
-            let titleItem = makeMetadataItem(.commonIdentifierTitle, value: marker.type?.capitalized ?? "Marker")
+            let titleItem = makeMetadataItem(.commonIdentifierTitle, value: marker.type?.capitalized ?? String(localized: "Marker"))
             return AVTimedMetadataGroup(items: [titleItem], timeRange: range)
         }
 
@@ -3030,7 +3129,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
         let fallback: (url: URL, headers: [String: String], sessionId: String?)?
         if case .provider = source {
-            fallback = try await switchToProviderTranscode(resumeTime: resumeTime).map { ($0, [:], nil) }
+            fallback = try await switchToProviderTranscode(resumeTime: resumeTime).map { ($0.url, $0.headers, nil) }
         } else if resumeTime <= 0.5, let prebuiltURL = rivuletFallbackURL, !rivuletFallbackHeaders.isEmpty {
             let sessionId = URLComponents(url: prebuiltURL, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "session" })?.value
@@ -3145,19 +3244,20 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// The provider's server transcode, from where playback stopped. A new
     /// play session: the old one is stopped, and the stored stream and its
-    /// reporter follow the new one. Returns the URL to play, with no headers.
+    /// reporter follow the new one. Returns the URL to play with the headers its
+    /// server wants (Plex's token and client profile).
     /// `maxBitrate` (bps) caps it; nil leaves the bitrate to the server.
     func switchToProviderTranscode(resumeTime: TimeInterval, maxBitrate: Int? = nil,
-                                   tracks: PlexTrackIDs = PlexTrackIDs()) async throws -> URL? {
+                                   tracks: TrackPicks = TrackPicks()) async throws -> (url: URL, headers: [String: String])? {
         guard case .provider(var playback) = source else { return nil }
         playback.stream = try await playback.provider.transcodeStream(
             for: playback.item.ref,
             sourceID: providerTargetSourceID ?? playback.stream.source.id,
             startTime: resumeTime,
             maxBitrate: maxBitrate,
-            // A shim stream id is the provider's index; Plex's 0 (off) is -1 there.
+            // A shim stream id is the provider's index.
             audioStreamIndex: tracks.audio,
-            subtitleStreamIndex: tracks.subtitle.map { $0 == 0 ? -1 : $0 }
+            subtitleStreamIndex: tracks.subtitle?.providerStreamIndex
         )
         try Task.checkCancellation()
         providerTargetSourceID = nil
@@ -3165,7 +3265,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         playback.quality.plan = activeStreamPlan
         await stopProviderReporter(at: resumeTime)
         setProviderStream(playback)
-        return playback.stream.source.streamURL
+        return playback.stream.source.streamURL.map { ($0, playback.stream.headers) }
     }
 
     /// The playing version's uncapped stream as a new play session, or nil when the
@@ -3363,7 +3463,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Reloads at the playhead on the file or on a transcode at `activeStreamPlan`'s step,
     /// keeping the paused state and the audio and subtitle picks.
     /// A provider that will not transcode leaves the old stream playing and the plan as `snapshot` had it.
-    private func reloadStream(toOriginal: Bool, reason: String, tracks: PlexTrackIDs,
+    private func reloadStream(toOriginal: Bool, reason: String, tracks: TrackPicks,
                               restoring snapshot: PlanSnapshot) async {
         let resumeTime = playheadForReload
         let resume = playbackState != .paused
@@ -3406,15 +3506,15 @@ final class UniversalPlayerViewModel: ObservableObject {
         return currentTime
     }
 
-    private func reloadTranscode(at time: TimeInterval, tracks: PlexTrackIDs) async throws {
+    private func reloadTranscode(at time: TimeInterval, tracks: TrackPicks) async throws {
         let hls: (url: URL, headers: [String: String], sessionId: String?)
         if case .provider = source {
-            guard let url = try await switchToProviderTranscode(
+            guard let switched = try await switchToProviderTranscode(
                 resumeTime: time, maxBitrate: activeStreamPlan.step.map { $0.kbps * 1000 }, tracks: tracks) else {
                 throw PlayerError.loadFailed("Unable to start the provider transcode")
             }
             transcodeTrackIDs = tracks
-            hls = (url, [:], nil)
+            hls = (switched.url, switched.headers, nil)
         } else {
             transcodeTrackIDs = tracks
             await putTrackSelection(tracks)
@@ -3439,7 +3539,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     /// Back to the untouched file at `time`, through the same start a fresh play uses.
-    private func reloadOriginal(at time: TimeInterval, tracks: PlexTrackIDs) async throws {
+    private func reloadOriginal(at time: TimeInterval, tracks: TrackPicks) async throws {
         let plan: PlaybackPlan?
         if case .provider = source {
             plan = try await resolveProviderOriginal(at: time)
@@ -3466,7 +3566,11 @@ final class UniversalPlayerViewModel: ObservableObject {
         hasAttemptedRivuletHLSFallback = false
         // Engine ids differ from Plex ids, so the picks re-apply once the engine lists its tracks.
         initialAudioTrackId = tracks.audio
-        initialSubtitleSelection = tracks.subtitle.map { $0 == 0 ? .off : .track(id: $0) } ?? .auto
+        switch tracks.subtitle {
+        case .off: initialSubtitleSelection = .off
+        case .track(let id): initialSubtitleSelection = .track(id: id)
+        case nil: initialSubtitleSelection = .auto
+        }
         hasAppliedAudioPreference = false
         hasAppliedSubtitlePreference = false
         subtitlesPickedOff = false
@@ -3476,51 +3580,36 @@ final class UniversalPlayerViewModel: ObservableObject {
         try await startWithFallback(plan: plan, startTime: time)
     }
 
-    /// Audio and subtitle picks as Plex stream ids, which survive a route change.
-    /// `subtitle` 0 is off; nil leaves the server's choice alone.
-    struct PlexTrackIDs {
-        var audio: Int?
-        var subtitle: Int?
-    }
-
-    private func currentPlexTrackIDs() -> PlexTrackIDs {
+    /// The playing picks as server stream ids, which survive a route change.
+    private func currentPlexTrackIDs() -> TrackPicks {
         guard aetherPlayer != nil else {
-            return PlexTrackIDs(audio: currentAudioTrackId, subtitle: currentSubtitleTrackId ?? 0)
+            return TrackPicks(audio: currentAudioTrackId, subtitle: SubtitlePick(currentSubtitleTrackId))
         }
-        let audio = currentAudioTrackId
-            .flatMap { id in audioTracks.first { $0.id == id }?.streamIndex }
-            .flatMap { index in plexAudioTracksFromMetadata().first { $0.streamIndex == index }?.id }
+        let audio = currentAudioTrackId.flatMap {
+            TrackMerge.serverID(forEngine: $0, engine: audioTracks, server: plexAudioTracksFromMetadata())
+        }
         guard let subtitleId = currentSubtitleTrackId, subtitleId != Self.generatedSubtitleId else {
-            return PlexTrackIDs(audio: audio, subtitle: 0)
+            return TrackPicks(audio: audio, subtitle: .off)
         }
-        guard let track = subtitleTracks.first(where: { $0.id == subtitleId }) else {
-            return PlexTrackIDs(audio: audio, subtitle: nil)
-        }
-        let plexSubs = plexSubtitleTracksFromMetadata()
-        let subtitle: Int?
-        if track.isExternal {
-            // Sidecars pair by registration order, as in `subtitleTrackMatchingPlexStreamId`.
-            let ordinal = subtitleTracks.filter(\.isExternal).firstIndex { $0.id == subtitleId } ?? -1
-            subtitle = plexSubs.filter { $0.subtitleKey != nil }[safe: ordinal]?.id
-        } else {
-            subtitle = track.streamIndex.flatMap { index in plexSubs.first { $0.streamIndex == index }?.id }
-        }
-        return PlexTrackIDs(audio: audio, subtitle: subtitle)
+        // A track the server can't name leaves its choice alone.
+        let subtitle = TrackMerge.serverID(forEngine: subtitleId, engine: subtitleTracks,
+                                           server: plexSubtitleTracksFromMetadata())
+        return TrackPicks(audio: audio, subtitle: subtitle.map(SubtitlePick.track))
     }
 
     /// What `applyAudioPreference` and `applySubtitlePreference` will pick on the Plex list, so a
     /// transcode starts on those tracks instead of restarting once they load. nil leaves the server's choice.
-    private var startingTrackSelection: PlexTrackIDs {
+    private var startingTrackSelection: TrackPicks {
         let override = initialAudioTrackId.flatMap { id in plexAudioTracksFromMetadata().contains { $0.id == id } ? id : nil }
         let start = TrackIntentResolver.startingPlexSelection(streams: metadata.Media?.first?.Part?.first?.Stream ?? [],
                                                               audioOverride: override)
         switch initialSubtitleSelection {
         case .off:
-            return PlexTrackIDs(audio: start.audio, subtitle: 0)
+            return TrackPicks(audio: start.audio, subtitle: .off)
         case .track(let id) where plexSubtitleTracksFromMetadata().contains(where: { $0.id == id }):
-            return PlexTrackIDs(audio: start.audio, subtitle: id)
+            return TrackPicks(audio: start.audio, subtitle: .track(id))
         default:
-            return PlexTrackIDs(audio: start.audio, subtitle: start.subtitle)
+            return start
         }
     }
 
@@ -3531,14 +3620,14 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     /// `picks` matched by language and kind onto the version `metadata` now carries.
-    private func plexTrackIDs(carrying picks: (audio: MediaTrack?, subtitle: MediaTrack?)) -> PlexTrackIDs {
+    private func plexTrackIDs(carrying picks: (audio: MediaTrack?, subtitle: MediaTrack?)) -> TrackPicks {
         let audio = picks.audio.flatMap {
             TrackIntentResolver.resolveAudio(intent: AudioIntent(from: $0), in: plexAudioTracksFromMetadata())?.id
         }
-        let subtitle = picks.subtitle.map {
-            TrackIntentResolver.resolveSubtitle(intent: SubtitleIntent(from: $0), in: plexSubtitleTracksFromMetadata())?.id ?? 0
-        } ?? 0
-        return PlexTrackIDs(audio: audio, subtitle: subtitle)
+        let subtitle = picks.subtitle.flatMap {
+            TrackIntentResolver.resolveSubtitle(intent: SubtitleIntent(from: $0), in: plexSubtitleTracksFromMetadata())?.id
+        }
+        return TrackPicks(audio: audio, subtitle: SubtitlePick(subtitle))
     }
 
     /// What a quality reload restores when a provider will not serve the new plan.
@@ -3561,7 +3650,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     /// Plex reads the part's selected streams when a transcode session starts.
-    private func putTrackSelection(_ tracks: PlexTrackIDs) async {
+    private func putTrackSelection(_ tracks: TrackPicks) async {
         guard case .plex = source, let partId = metadata.Media?.first?.Part?.first?.id else { return }
         let network = PlexNetworkManager.shared
         if let audio = tracks.audio {
@@ -3570,7 +3659,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
         if let subtitle = tracks.subtitle {
             await network.setSelectedSubtitleStream(serverURL: serverURL, authToken: authToken,
-                                                    partId: partId, subtitleStreamID: subtitle)
+                                                    partId: partId, subtitleStreamID: subtitle.plexStreamID)
         }
     }
 
@@ -3786,6 +3875,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     func stopPlayback() {
         stopCount += 1
+        cinemaStopped = true
         pausedTimelineTask?.cancel()
         pausedTimelineTask = nil
         streamPreparationTask?.cancel()
@@ -3959,14 +4049,14 @@ final class UniversalPlayerViewModel: ObservableObject {
     ///   transport chrome (the normal reveal-the-scrubber affordance). A marker
     ///   skip taken while the chrome is hidden passes `false` so the jump
     ///   doesn't pop the rail open.
-    func seek(to time: TimeInterval, revealsControls: Bool = true) async {
+    func seek(to time: TimeInterval, revealsControls: Bool = true, exact: Bool = false) async {
         // An absolute seek (scrub commit, marker skip) supersedes any relative
         // one still in flight; the next skip starts from where this lands.
         seekGeneration += 1
         inFlightRelativeSeekTarget = nil
         stallTracker.noteSeekOrLoad(at: Date())
         if let ap = aetherPlayer {
-            await ap.seek(to: time)
+            await ap.seek(to: time, exact: exact)
         } else {
             await player?.seek(to: CMTime(seconds: time, preferredTimescale: 600))
         }
@@ -4323,7 +4413,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 self.loadEngineThumbnail(for: time)
                 return
             }
-            self.scrubThumbnail = thumbnail
+            self.scrubThumbnail = thumbnail.map(UIImage.init(cgImage:))
         }
     }
 
@@ -4471,28 +4561,15 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     // MARK: - Subtitle Search
 
-    /// Plex writes the file next to the media, which only the server's admin may
-    /// do. `selectedServer` (and its `owned`) is nil after a warm launch, so ask the server.
-    private(set) var canSearchSubtitles = false
-    /// Admin answers per server URL + token, for the session.
-    private static var serverAdminAnswers: [String: Bool] = [:]
-
-    private func resolveSubtitleSearchAccess() async {
-        guard case .plex = source, metadata.ratingKey != nil,
-              PlexUserProfileManager.shared.selectedUser?.restricted != true else { return }
-        let key = serverURL + authToken
-        if let known = Self.serverAdminAnswers[key] {
-            canSearchSubtitles = known
-            return
-        }
-        let isAdmin = await PlexNetworkManager.shared.canAdministerServer(serverURL: serverURL, authToken: authToken)
-        Self.serverAdminAnswers[key] = isAdmin
-        canSearchSubtitles = isAdmin
+    /// PMS lets any non-restricted user search and download, not just the admin (measured).
+    var canSearchSubtitles: Bool {
+        guard case .plex = source else { return false }
+        return metadata.ratingKey != nil && PlexUserProfileManager.shared.selectedUser?.restricted != true
     }
 
     /// The subtitle preference's language, else the device's, as ISO 639-1.
     private var subtitleSearchLanguage: String {
-        let device = Locale.current.language.languageCode?.identifier(.alpha2) ?? "en"
+        let device = Locale.LanguageCode(TrackLanguage.device).identifier(.alpha2) ?? "en"
         guard let preferred = TrackIntentStore.effectiveSubtitleIntent.language else { return device }
         let code = TrackLanguage.normalize(preferred)
         return code.isEmpty ? device : Locale.LanguageCode(code).identifier(.alpha2) ?? device
@@ -4513,7 +4590,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         let generation = itemGeneration
         let known = Set(plexSubtitleTracksFromMetadata().map(\.id))
         var tracks = currentPlexTrackIDs()
-        showCompatibilityNotice("Downloading Subtitles…")
+        showCompatibilityNotice(String(localized: "Downloading Subtitles…"))
         do {
             try await network.downloadSubtitle(
                 serverURL: serverURL, authToken: authToken, ratingKey: ratingKey, resultKey: resultKey)
@@ -4530,7 +4607,7 @@ final class UniversalPlayerViewModel: ObservableObject {
                 TrackIntentStore.subtitleIntent = .afterPick(
                     MediaTrack(from: added), replacing: TrackIntentStore.effectiveSubtitleIntent,
                     audioLanguage: playingAudioLanguage)
-                tracks.subtitle = added.id
+                tracks.subtitle = .track(added.id)
                 hideCompatibilityNotice()
                 enqueueStreamWork { vm in
                     await vm.reloadStream(toOriginal: vm.aetherPlayer != nil, reason: "subtitle_download",
@@ -4538,10 +4615,10 @@ final class UniversalPlayerViewModel: ObservableObject {
                 }
                 return
             }
-            showCompatibilityNotice("Subtitles Didn't Arrive")
+            showCompatibilityNotice(String(localized: "Subtitles Didn't Arrive"))
         } catch {
             if isCancellationError(error) || generation != itemGeneration { return }
-            showCompatibilityNotice("Couldn't Download Subtitles")
+            showCompatibilityNotice(String(localized: "Couldn't Download Subtitles"))
         }
     }
 
@@ -4615,7 +4692,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             }
             if previousSubtitleCount == 0 {
                 if let subtitle = transcodeTrackIDs?.subtitle {
-                    currentSubtitleTrackId = subtitle == 0 ? nil : subtitle
+                    currentSubtitleTrackId = subtitle.trackID
                 } else {
                     currentSubtitleTrackId = plexStreams.first(where: { $0.isSubtitle && $0.selected == true })?.id
                         ?? plexSubs.first(where: { $0.isForced })?.id
@@ -4806,17 +4883,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         guard aetherPlayer != nil else {
             return subtitleTracks.first { $0.id == id }
         }
-        let plex = plexSubtitleTracksFromMetadata()
-        guard let plexIndex = plex.firstIndex(where: { $0.id == id }) else { return nil }
-        let plexTrack = plex[plexIndex]
-
-        // Sidecars have no stream index — they pair by registration order.
-        if plexTrack.subtitleKey != nil {
-            let ordinal = plex[..<plexIndex].count(where: { $0.subtitleKey != nil })
-            return subtitleTracks.filter(\.isExternal)[safe: ordinal]
-        }
-        guard let streamIndex = plexTrack.streamIndex else { return nil }
-        return subtitleTracks.first { $0.streamIndex == streamIndex }
+        return TrackMerge.engineTrack(forServer: id, engine: subtitleTracks, server: plexSubtitleTracksFromMetadata())
     }
 
     // MARK: - Controls Visibility
@@ -4942,6 +5009,15 @@ final class UniversalPlayerViewModel: ObservableObject {
         // Don't check while scrubbing or if post-video already showing
         guard !isScrubbing, postVideoState == .hidden else { return }
 
+        // A clip has no markers or Up Next, only its Skip.
+        if isPlayingCinemaExtra {
+            if activeMarker == nil {
+                activeMarker = PlexMarker(type: "cinemaExtra")
+                showSkipButton = true
+            }
+            return
+        }
+
         // Check recap markers first — a recap precedes the intro in an
         // episode. These exist only via the IntroDB backup (Plex never emits
         // recap), so this loop is a no-op unless the backfill added one.
@@ -5003,7 +5079,8 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
 
         // Check credits markers - can have multiple (e.g., mid-credits and post-credits)
-        // Trigger post-video when FIRST credits marker starts
+        // Trigger post-video when the Up Next credits marker starts
+        let upNextCredits = PlexPlaybackMarkers.upNextCredits(metadata.creditsMarkers, duration: duration)
         for credits in metadata.creditsMarkers {
             guard let creditsId = credits.id else { continue }
 
@@ -5011,11 +5088,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             guard credits.endTimeSeconds > credits.startTimeSeconds else { continue }
 
             let previewStart = max(0, credits.startTimeSeconds - markerPreviewTime)
-            let creditsStartPercent = duration > 0 ? credits.startTimeSeconds / duration : 1.0
-            let remainingAfterCredits = duration - credits.startTimeSeconds
-
-            // Sanity check: credits should be in the last half of the video OR < 5 min of content remains
-            let creditsAreValid = creditsStartPercent >= 0.5 || remainingAfterCredits < 300
+            let creditsAreValid = PlexPlaybackMarkers.readsAsEndCredits(credits, duration: duration)
 
             // Reset skip flag if user rewound before the marker
             if skippedCreditsIds.contains(creditsId) {
@@ -5026,10 +5099,11 @@ final class UniversalPlayerViewModel: ObservableObject {
                 }
             }
 
-            // Reset post-video trigger if rewound before first credits marker
-            if let firstCredits = metadata.firstCreditsMarker,
-               time < max(0, firstCredits.startTimeSeconds - markerPreviewTime) {
+            // Reset post-video trigger if rewound before the Up Next credits
+            if let upNextCredits,
+               time < max(0, upNextCredits.startTimeSeconds - markerPreviewTime) {
                 if hasTriggeredPostVideo { hasTriggeredPostVideo = false }
+                if upNextCollapsed { upNextCollapsed = false }
             }
 
             // Show skip button from the exact credits marker start (no 5s
@@ -5041,8 +5115,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
                 // Trigger post-video summary when FIRST credits marker actually starts
                 // (skip button will be hidden by UI when postVideoState != .hidden)
-                if let firstCredits = metadata.firstCreditsMarker,
-                   credits.id == firstCredits.id,
+                if credits.id == upNextCredits?.id,
                    time >= credits.startTimeSeconds && !hasTriggeredPostVideo {
                     hasTriggeredPostVideo = true
                     triggerPostVideoTransition()
@@ -5076,15 +5149,16 @@ final class UniversalPlayerViewModel: ObservableObject {
             }
         }
 
-        // No credits markers - trigger post-video 45 seconds before end
-        // BUT require at least 85% completion to avoid triggering too early on short videos
+        // No credits markers: Up Next opens one countdown before the end, so autoplay lands at the
+        // end. Countdown off opens it at the end. At least 85% watched, for short videos.
         if metadata.creditsMarkers.isEmpty && duration > 60 {
-            let triggerTime = duration - 45
+            let triggerTime = duration - TimeInterval(autoplayCountdownSetting)
             let minCompletionTime = duration * 0.85  // At least 85% watched
 
             // Reset flag if user rewound before trigger point
             if time < triggerTime - 10 && hasTriggeredPostVideo {
                 hasTriggeredPostVideo = false
+                upNextCollapsed = false
             }
 
             // Only trigger if we're both near the end AND have watched most of the content
@@ -5174,6 +5248,11 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Cancel the auto-skip countdown (user pressed Menu during the countdown).
     /// Leaves the manual pill up but declines auto-skip for the current marker.
+    /// Menu on the floating pill: hide it until the next marker; the controls still offer it.
+    func dismissSkipPill() {
+        skipPillDismissed = true
+    }
+
     func cancelSkipCountdown() {
         guard skipCountdownTimer != nil || skipCountdownSeconds > 0 else { return }
 
@@ -5184,7 +5263,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Handle when playback enters a credits marker range (or preview window)
     /// Auto-skip only triggers when actually inside the marker (at or past startTimeSeconds).
     private func handleCreditsMarkerActive(_ marker: PlexMarker, currentTime: TimeInterval) {
-        guard let creditsId = marker.id else { return }
+        // The pill is Up Next's while it's folded there; no credits skip or auto-skip.
+        guard let creditsId = marker.id, !upNextCollapsed else { return }
 
         let mode = MarkerSkipMode.current(for: "credits")
         guard mode != .off else { return }
@@ -5275,6 +5355,9 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
+    /// The pill is up: a marker is active, or Up Next is folded into it.
+    var showsSkipPill: Bool { showSkipButton || upNextCollapsed }
+
     /// Skip to end of current marker (called from UI skip button)
     func skipActiveMarker() async {
         guard let marker = activeMarker else { return }
@@ -5283,6 +5366,10 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Skip to end of a specific marker
     private func skipMarker(_ marker: PlexMarker) async {
+        if isPlayingCinemaExtra {
+            await advanceCinemaExtras()
+            return
+        }
         // Stop any running auto-skip countdown — this funnels both the manual
         // skip (user clicked the pill) and the countdown reaching 0.
         cancelSkipCountdownTimer()
@@ -5322,7 +5409,7 @@ final class UniversalPlayerViewModel: ObservableObject {
             // Preserve the chrome state across the skip: if the controls were
             // hidden (the pill owned focus), the jump must NOT pop the rail open;
             // if they were already up, keep them up.
-            await seek(to: target, revealsControls: showControls)
+            await seek(to: target, revealsControls: showControls, exact: true)
 
             // Hide button
             activeMarker = nil
@@ -5332,17 +5419,20 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Label for current skip button
     var skipButtonLabel: String {
-        guard let marker = activeMarker else { return "Skip" }
-        if marker.isIntro {
-            return "Skip Intro"
+        if upNextCollapsed { return String(localized: "Up Next") }
+        guard let marker = activeMarker else { return String(localized: "Skip") }
+        if isPlayingCinemaExtra {
+            return String(localized: "Skip Trailer")
+        } else if marker.isIntro {
+            return String(localized: "Skip Intro")
         } else if marker.isCredits {
-            return "Skip Credits"
+            return String(localized: "Skip Credits")
         } else if marker.isCommercial {
-            return "Skip Ad"
+            return String(localized: "Skip Ad")
         } else if marker.isRecap {
-            return "Skip Recap"
+            return String(localized: "Skip Recap")
         }
-        return "Skip"
+        return String(localized: "Skip")
     }
 
     /// Pill title. The auto-skip countdown is shown as a left-to-right fill
@@ -5359,7 +5449,8 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// `controlsFocusActive`: while true the SwiftUI content layer releases
     /// focus and `PlayerContainerViewController` routes it to the pill.
     var skipPillOwnsFocus: Bool {
-        showSkipButton
+        showsSkipPill
+            && !skipPillDismissed
             && !showControls
             && !isScrubbing
             && postVideoState == .hidden
@@ -5524,6 +5615,10 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// player when nothing followed it (#264). Do not fold this into
     /// `handlePlaybackEnded()`: its other caller runs mid-credits and must not exit.
     func finishPlayback() async {
+        if isPlayingCinemaExtra {
+            await advanceCinemaExtras()
+            return
+        }
         await handlePlaybackEnded()
         if postVideoState == .hidden {
             shouldDismiss = true
@@ -5541,23 +5636,26 @@ final class UniversalPlayerViewModel: ObservableObject {
         // Don't re-enter if already showing post-video
         guard postVideoState == .hidden else { return }
 
-        // Mark as watched immediately when playback ends/reaches credits.
-        // This runs exactly once whether the custom overlay or the native
-        // card drives Up Next.
-        await markCurrentAsWatched()
-        guard generation == itemGeneration else { return }
-
-        postVideoState = .loading
-
         // Per-user opt-out of the post-video "Up Next" chooser for TV
         // episodes. When disabled, episodes follow the same path movies
         // already take: credits play uninterrupted at full size.
         // Movies: No PostVideo - just let the video play through to the end.
         // A playlist's next entry follows any type, ahead of both gates.
         guard playQueue != nil || (isEpisode && showPostVideoUpNext) else {
-            postVideoState = .hidden
+            await markCurrentAsWatched()
             return
         }
+
+        // Marked beside the page, so Up Next opens at the credits rather than after
+        // the server's replies. A folded Up Next was marked when it first opened.
+        if !upNextCollapsed {
+            Task {
+                guard generation == self.itemGeneration else { return }
+                await self.markCurrentAsWatched()
+            }
+        }
+        upNextCollapsed = false
+        postVideoState = .loading
 
         // TV Show: Only show PostVideo if there's a next episode
 
@@ -5947,20 +6045,6 @@ final class UniversalPlayerViewModel: ObservableObject {
         }
     }
 
-    /// The episode after `current`: the next by number in its season, else
-    /// the first of the next season. Episodes without a number are skipped.
-    static func nextEpisode(after current: MediaItem, in seasonEpisodes: [MediaItem],
-                            nextSeasonEpisodes: [MediaItem]?) -> MediaItem? {
-        guard let number = current.episodeNumber else { return nil }
-        return byEpisodeNumber(seasonEpisodes).first { ($0.episodeNumber ?? 0) > number }
-            ?? byEpisodeNumber(nextSeasonEpisodes ?? []).first
-    }
-
-    private static func byEpisodeNumber(_ episodes: [MediaItem]) -> [MediaItem] {
-        episodes.filter { $0.episodeNumber != nil }
-            .sorted { ($0.episodeNumber ?? 0) < ($1.episodeNumber ?? 0) }
-    }
-
     /// `.provider` half of the next-episode lookup: the current season's
     /// episodes in order, and the episode after the current one. Every item
     /// returned is registered so its shim maps back to it.
@@ -5970,7 +6054,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         if let fetch = providerUpNextFetch, fetch.generation == generation {
             task = fetch.task
         } else {
-            task = Task { await Self.fetchProviderUpNext(playback) }
+            task = Task { await EpisodePicker.upNext(after: playback.detail.item, provider: playback.provider) }
             providerUpNextFetch = (generation, task)
         }
         let result = await task.value
@@ -5981,28 +6065,6 @@ final class UniversalPlayerViewModel: ObservableObject {
             providerEpisodeItems[item.ref.itemID] = item
         }
         return result
-    }
-
-    /// Specials a server lists inside a season carry their own season number
-    /// and are left out, so they never become the next episode.
-    private static func fetchProviderUpNext(_ playback: ProviderPlayback) async -> (season: [MediaItem], next: MediaItem?) {
-        let current = playback.detail.item
-        let provider = playback.provider
-        guard current.kind == .episode, let seasonRef = current.parentRef,
-              let children = try? await provider.children(of: seasonRef) else { return ([], nil) }
-        let season = byEpisodeNumber(children.filter { $0.seasonNumber == current.seasonNumber })
-        var nextSeasonEpisodes: [MediaItem]?
-        if let number = current.episodeNumber, let seasonNumber = current.seasonNumber,
-           !season.contains(where: { ($0.episodeNumber ?? 0) > number }),
-           let showRef = current.grandparentRef,
-           let seasons = try? await provider.children(of: showRef),
-           let nextSeason = seasons
-               .filter({ ($0.seasonNumber ?? Int.min) > seasonNumber })
-               .min(by: { ($0.seasonNumber ?? 0) < ($1.seasonNumber ?? 0) }) {
-            nextSeasonEpisodes = try? await provider.children(of: nextSeason.ref)
-                .filter { $0.seasonNumber == nextSeason.seasonNumber }
-        }
-        return (season, nextEpisode(after: current, in: season, nextSeasonEpisodes: nextSeasonEpisodes))
     }
 
     /// A playlist row's still: an episode's frame, otherwise the backdrop.
@@ -6116,15 +6178,15 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     /// Start autoplay countdown timer
+    /// The Countdown setting in seconds: 5 when unset, 0 when off.
+    private var autoplayCountdownSetting: Int {
+        UserDefaults.standard.object(forKey: "autoplayCountdown") == nil
+            ? AutoplayCountdown.fiveSeconds.rawValue
+            : UserDefaults.standard.integer(forKey: "autoplayCountdown")
+    }
+
     func startAutoplayCountdown() {
-        // Default to 5 seconds if not set (key doesn't exist)
-        // 0 explicitly means disabled
-        let countdownSetting: Int
-        if UserDefaults.standard.object(forKey: "autoplayCountdown") == nil {
-            countdownSetting = 5  // Default: 5 seconds
-        } else {
-            countdownSetting = UserDefaults.standard.integer(forKey: "autoplayCountdown")
-        }
+        let countdownSetting = autoplayCountdownSetting
 
         // 0 means disabled
         guard countdownSetting > 0 else {
@@ -6235,7 +6297,8 @@ final class UniversalPlayerViewModel: ObservableObject {
             task = Task {
                 do {
                     return try await ProviderPlayback.prepare(item: item, provider: provider, version: version,
-                                                              quality: quality, throughput: throughput)
+                                                              quality: quality, throughput: throughput,
+                                                              awaitingExtras: false)
                 } catch {
                     print("🎬 [PostVideo] Next provider episode failed to prepare: \(error)")
                     return nil
@@ -6258,7 +6321,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     /// Stops the countdown and says why. The post-video page shows it; with
     /// no page up (a pick from the Up Next panel) it shows as a notice.
     private func showNextEpisodeError() {
-        let message = playQueue == nil ? "Couldn't load the next episode." : "Couldn't load the next item."
+        let message = playQueue == nil ? String(localized: "Couldn't load the next episode.") : String(localized: "Couldn't load the next item.")
         nextEpisodeError = message
         cancelCountdown()
         if postVideoState == .hidden { showCompatibilityNotice(message) }
@@ -6364,6 +6427,7 @@ final class UniversalPlayerViewModel: ObservableObject {
         isCountdownPaused = false
         episodesInARow = autoplayed ? episodesInARow + 1 : 1
 
+        upNextCollapsed = false
         postVideoState = .hidden
 
         if let nextProviderPlayback {
@@ -6377,8 +6441,18 @@ final class UniversalPlayerViewModel: ObservableObject {
             setProviderStream(nextProviderPlayback)
         } else {
             // Preloaded metadata has markers. Choose before the swap: the choice may read the outgoing file.
-            let version = upNextVersionChoice()
+            let version = cinemaFeatureVersion ?? upNextVersionChoice()
             metadata = queuePlexMetadata ?? preloadedNextMetadata ?? next
+            // The movie's turn: from here timeline, watched state and Up Next apply again.
+            if metadata.ratingKey == cinemaFeature?.ratingKey {
+                cinemaFeature = nil
+                cinemaFeatureVersion = nil
+                if let picks = cinemaFeaturePicks {
+                    initialAudioTrackId = picks.audio
+                    initialSubtitleSelection = picks.subtitle
+                    cinemaFeaturePicks = nil
+                }
+            }
             playingMediaID = nil
             playingMediaServerIndex = 0
             baseVersionChoice = version
@@ -6430,6 +6504,10 @@ final class UniversalPlayerViewModel: ObservableObject {
         skippedCreditsIds.removeAll()
         skippedCommercialIds.removeAll()
         skippedRecapIds.removeAll()
+        // checkMarkers pauses under the Up Next card, so the outgoing credits marker
+        // would keep the pill on the new episode and skip its credits on a press.
+        activeMarker = nil
+        showSkipButton = false
 
         // Clear any replay window left open from the previous episode — its
         // invokedAt is a timestamp on episode N's timeline, meaningless (and
@@ -6505,12 +6583,37 @@ final class UniversalPlayerViewModel: ObservableObject {
     func dismissPostVideo() {
         countdownTimer?.invalidate()
         countdownTimer = nil
+        upNextCollapsed = false
         postVideoState = .hidden
         nextEpisode = nil
         countdownSeconds = 0
         isCountdownPaused = false
         // Don't reset hasTriggeredPostVideo here - prevents immediate re-trigger
         clearPreloadedData()
+    }
+
+    /// Back or Dismiss on Up Next. With a next episode the page folds into the pill and the
+    /// credits play on; the next episode and its preload stay. Otherwise it closes.
+    func closePostVideo() {
+        guard postVideoState == .showingEpisodeSummary, nextEpisode != nil else {
+            dismissPostVideo()
+            return
+        }
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+        countdownSeconds = 0
+        isCountdownPaused = false
+        cancelSkipCountdownTimer()
+        // Before the state: the container reads it when the page leaves.
+        upNextCollapsed = true
+        postVideoState = .hidden
+    }
+
+    /// The Up Next pill: the page comes back, with no countdown (the viewer asked for it).
+    func reopenUpNext() {
+        guard upNextCollapsed, nextEpisode != nil else { return }
+        upNextCollapsed = false
+        postVideoState = .showingEpisodeSummary
     }
 
     // MARK: - Navigation
@@ -6543,6 +6646,8 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Periodic progress, throttled to `reportingInterval` unless `force`.
     func reportPlaybackProgress(time: TimeInterval, force: Bool) {
+        // Plex hears nothing about a clip: a webhook for it would read as the movie starting.
+        guard !isPlayingCinemaExtra else { return }
         // Report every 10 seconds
         guard force || abs(time - lastReportedTime) >= reportingInterval else { return }
         lastReportedTime = time
@@ -6584,6 +6689,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Report a playback state change immediately.
     func reportPlaybackState(_ newState: UniversalPlaybackState) {
+        guard !isPlayingCinemaExtra else { return }
         if case .provider = source {
             reportProviderState(newState)
             return
@@ -6626,6 +6732,7 @@ final class UniversalPlayerViewModel: ObservableObject {
     }
 
     func reportFinalProgress(time: TimeInterval, duration: TimeInterval) async {
+        guard !isPlayingCinemaExtra else { return }
         if case .provider(let playback) = source {
             await stopProviderReporter(at: time)
             if duration > 0 && time / duration > 0.9 {
@@ -6706,6 +6813,7 @@ final class UniversalPlayerViewModel: ObservableObject {
 
     /// Mark current content as watched (for use before transitioning to next episode)
     func markCurrentAsWatched() async {
+        guard !isPlayingCinemaExtra else { return }
         // A provider session stays open: this runs at the credits while the
         // video keeps playing, and `stopped` would end the server session
         // (and a transcode) under it. `.ended`, exit and the swap stop it.

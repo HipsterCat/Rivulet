@@ -442,11 +442,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         return (container.MediaContainer.Metadata ?? [], container.MediaContainer.totalSize)
     }
 
-    /// Library items with the section's total, for pagination.
-    /// `sort` is a Plex sort key such as "-addedAt" or "titleSort".
-    func getLibraryItemsWithTotal(
+    /// URL for one page of a section's items. Start and Size go together: Plex ignores Size without Start.
+    nonisolated static func libraryItemsURL(
         serverURL: String,
-        authToken: String,
         sectionId: String,
         start: Int = 0,
         size: Int = 100,
@@ -455,14 +453,9 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         includeGuids: Bool = false,
         followCollectionMode: Bool = false,
         filters: [URLQueryItem] = []
-    ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
-        #if DEBUG
-        if KinoPubDemo.isActive {
-            return KinoPubDemoPlexFixtures.sectionItems(sectionId: sectionId, start: start, size: size)
-        }
-        #endif
+    ) -> URL? {
         guard var components = URLComponents(string: "\(serverURL)/library/sections/\(sectionId)/all") else {
-            throw PlexAPIError.invalidURL
+            return nil
         }
 
         var queryItems = [
@@ -495,8 +488,32 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         }
 
         components.queryItems = queryItems + filters
+        return components.url
+    }
 
-        guard let url = components.url else {
+    /// Library items with the section's total, for pagination.
+    /// `sort` is a Plex sort key such as "-addedAt" or "titleSort".
+    func getLibraryItemsWithTotal(
+        serverURL: String,
+        authToken: String,
+        sectionId: String,
+        start: Int = 0,
+        size: Int = 100,
+        sort: String? = nil,
+        type: Int? = nil,
+        includeGuids: Bool = false,
+        followCollectionMode: Bool = false,
+        filters: [URLQueryItem] = []
+    ) async throws -> (items: [PlexMetadata], totalSize: Int?) {
+        #if DEBUG
+        if KinoPubDemo.isActive {
+            return KinoPubDemoPlexFixtures.sectionItems(sectionId: sectionId, start: start, size: size)
+        }
+        #endif
+        guard let url = Self.libraryItemsURL(
+            serverURL: serverURL, sectionId: sectionId, start: start, size: size, sort: sort, type: type,
+            includeGuids: includeGuids, followCollectionMode: followCollectionMode, filters: filters
+        ) else {
             throw PlexAPIError.invalidURL
         }
 
@@ -530,6 +547,20 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             headers: plexHeaders(authToken: authToken)
         )
         return container.MediaContainer.Directory ?? []
+    }
+
+    /// The genres and decades a section's `/all` can be filtered by (`genre=`, `decade=`).
+    func getLibraryFilterOptions(serverURL: String, authToken: String, sectionId: String) async throws -> LibraryFilterOptions {
+        func values(_ field: String) async throws -> [PlexFilterValue] {
+            guard let url = URL(string: "\(serverURL)/library/sections/\(sectionId)/\(field)") else {
+                throw PlexAPIError.invalidURL
+            }
+            let container: PlexFilterValueContainer = try await request(url, headers: plexHeaders(authToken: authToken))
+            return container.MediaContainer.Directory ?? []
+        }
+        async let genres = values("genre")
+        async let decades = values("decade")
+        return try await LibraryFilterOptions(plexGenres: genres, decades: decades)
     }
 
     /// Get item metadata by rating key
@@ -1166,7 +1197,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         guard let container = try? JSONDecoder().decode(TimelineReply.self, from: data).MediaContainer,
               container.terminationCode != nil || container.terminationText != nil else { return nil }
         let text = container.terminationText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return text.isEmpty ? "Your Plex server stopped this stream." : text
+        return text.isEmpty ? String(localized: "Your Plex server stopped this stream.") : text
     }
 
     nonisolated private struct TimelineReply: Decodable {
@@ -1364,6 +1395,14 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
         guard let url = URL(string: serverURL) else { return false }
         let root: PlexServerRootWrapper? = try? await request(url, headers: plexHeaders(authToken: authToken))
         return root?.MediaContainer.allowMediaDeletion == true
+    }
+
+    /// Whether `authToken` may delete media: the owner, with "Allow media deletion" on.
+    func canDeleteMedia(serverURL: String, authToken: String) async -> Bool {
+        async let admin = canAdministerServer(serverURL: serverURL, authToken: authToken)
+        async let allowed = allowsMediaDeletion(serverURL: serverURL, authToken: authToken)
+        let (isAdmin, isAllowed) = await (admin, allowed)
+        return isAdmin && isAllowed
     }
 
     /// Deletes an item and its files from the server.
@@ -2394,7 +2433,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
                 seenChannels.insert(channelId)
 
-                let channelTitle = media.channelTitle ?? "Channel \(channelId)"
+                let channelTitle = media.channelTitle ?? String(localized: "Channel \(channelId)")
                 let channelNumber = media.channelVcn ?? channelId
 
                 let channel = PlexLiveTVChannel(
@@ -2823,14 +2862,14 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
 
         // The grid returns flat programs with channel info in each program's Media array
         // We need to parse this and group by channel
-        nonisolated struct GridEPGContainer: Codable {
+        nonisolated struct GridEPGContainer: Decodable {
             let MediaContainer: GridEPGMediaContainer
         }
-        nonisolated struct GridEPGMediaContainer: Codable {
+        nonisolated struct GridEPGMediaContainer: Decodable {
             let size: Int?
             let Metadata: [GridEPGProgram]?
         }
-        nonisolated struct GridEPGProgram: Codable {
+        nonisolated struct GridEPGProgram: Decodable {
             let ratingKey: String?
             let key: String?
             let guid: String?
@@ -2853,7 +2892,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             let Genre: [PlexGenreTag]?
             let Media: [GridEPGMedia]?
         }
-        nonisolated struct GridEPGMedia: Codable {
+        nonisolated struct GridEPGMedia: Decodable {
             let channelCallSign: String?
             let channelIdentifier: String?
             let channelThumb: String?
@@ -2861,6 +2900,8 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
             let channelVcn: String?
             let beginsAt: Int?
             let endsAt: Int?
+            /// Per airing, as "1" (PMS 1.43.4); the program itself never carries it (#429).
+            let premiere: LenientInt?
         }
 
         let results: [Result<GridEPGContainer, Error>] = await fetchConcurrently(
@@ -2897,7 +2938,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
                     key: program.key,
                     guid: program.guid,
                     type: program.type,
-                    title: program.title ?? "Unknown",
+                    title: program.title ?? String(localized: "Unknown"),
                     grandparentTitle: program.grandparentTitle,
                     parentTitle: program.parentTitle,
                     summary: program.summary,
@@ -2913,7 +2954,7 @@ class PlexNetworkManager: NSObject, @unchecked Sendable {
                     endsAt: media.endsAt,
                     onAir: nil,
                     live: nil,
-                    premiere: nil,
+                    premiere: media.premiere?.value == 1,
                     Genre: program.Genre,
                     Media: nil,
                     index: program.index,
@@ -3318,19 +3359,19 @@ enum PlexAPIError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "Invalid URL"
+            return String(localized: "Invalid URL")
         case .invalidResponse:
-            return "Invalid server response"
+            return String(localized: "Invalid server response")
         case .httpError(let statusCode, _):
-            return "HTTP error: \(statusCode)"
+            return String(localized: "HTTP error: \(statusCode)")
         case .parsingError:
-            return "Failed to parse response"
+            return String(localized: "Failed to parse response")
         case .authenticationFailed:
-            return "Authentication failed"
+            return String(localized: "Authentication failed")
         case .notFound:
-            return "Item not found"
+            return String(localized: "Item not found")
         case .networkError(let error):
-            return "Network error: \(error.localizedDescription)"
+            return String(localized: "Network error: \(error.localizedDescription)")
         }
     }
 }
@@ -3341,6 +3382,6 @@ enum PlexAPIError: LocalizedError {
 nonisolated struct PlexLiveTuneError: LocalizedError {
     let serverMessage: String
 
-    var errorDescription: String? { "Tune failed: \(serverMessage)" }
+    var errorDescription: String? { String(localized: "Tune failed: \(serverMessage)") }
 }
 

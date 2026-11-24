@@ -44,7 +44,7 @@ actor PlexLiveTVProvider: LiveTVProvider {
         self.serverURL = serverURL
         self.authToken = authToken
         self.sourceId = "plex:\(serverURL)"
-        self.displayName = "\(serverName) Live TV"
+        self.displayName = String(localized: "\(serverName) Live TV")
     }
 
     // MARK: - LiveTVProvider Protocol
@@ -416,6 +416,8 @@ actor PlexLiveTVProvider: LiveTVProvider {
         let channelId = String(parts[2])
 
         let tune: PlexLiveTVTuneResult
+        let endTune = LiveResolveTiming.begin?("tune")
+        defer { endTune?() }
         do {
             // Unstructured, so a caller that leaves (Back, a channel switch)
             // doesn't hang up on PMS mid-tune. PMS finishes the tune anyway and
@@ -453,6 +455,9 @@ actor PlexLiveTVProvider: LiveTVProvider {
         // flow every working third-party client ships).
         var directPlayKey: String?
         var decisionOutcome = "decision_unavailable"
+        endTune?()
+        let endDecision = LiveResolveTiming.begin?("decision")
+        defer { endDecision?() }
         do {
             let decision = try await networkManager.requestLiveTranscodeDecision(
                 serverURL: serverURL,
@@ -636,10 +641,10 @@ extension PlexLiveTVProvider: LiveTVRecordingProvider {
             switch template.type {
             // Plex types every non-episodic guide airing (sport, news) as a
             // movie, so "Record Movie" mislabelled most of them.
-            case 1: title = "Record"
-            case 2: title = "Record Series"
-            case 4: title = "Record Episode"
-            default: title = "Record \(template.title)"
+            case 1: title = String(localized: "Record")
+            case 2: title = String(localized: "Record Series")
+            case 4: title = String(localized: "Record Episode")
+            default: title = String(localized: "Record \(template.title)")
             }
             guard let payload = try? String(decoding: encoder.encode(template), as: UTF8.self) else { continue }
             options.append(LiveTVRecordOption(
@@ -653,7 +658,7 @@ extension PlexLiveTVProvider: LiveTVRecordingProvider {
                 if let newPayload = try? String(decoding: encoder.encode(template.withOnlyNewAirings(true)), as: UTF8.self) {
                     options.append(LiveTVRecordOption(
                         id: "\(guid)#\(index)#new",
-                        title: "Record New Episodes",
+                        title: String(localized: "Record New Episodes"),
                         scope: .series,
                         payload: newPayload
                     ))

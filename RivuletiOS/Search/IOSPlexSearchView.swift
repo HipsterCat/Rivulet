@@ -5,27 +5,33 @@ import SwiftUI
 
 /// The Search tab: the system search field, scopes, recent searches and grouped results.
 struct IOSPlexSearchView: View {
-    enum Scope: String, CaseIterable, Identifiable {
-        case all = "All"
-        case movies = "Movies"
-        case shows = "TV Shows"
+    enum Scope: CaseIterable, Identifiable {
+        case all, movies, shows
 
         var id: Self { self }
 
-        func includes(_ item: PlexMetadata) -> Bool {
+        var title: String {
             switch self {
-            case .all: true
-            case .movies: item.type == "movie"
-            case .shows: item.type != "movie"
+            case .all: String(localized: "All")
+            case .movies: String(localized: "Movies")
+            case .shows: String(localized: "TV Shows")
+            }
+        }
+
+        var scope: SearchResults.Scope {
+            switch self {
+            case .all: .all
+            case .movies: .movies
+            case .shows: .shows
             }
         }
     }
 
-    @EnvironmentObject private var plex: IOSPlexSession
+    @EnvironmentObject private var browse: BrowseStore
     @AppStorage("iosRecentSearches") private var recentsRaw = ""
     @State private var query = ""
     @State private var scope = Scope.all
-    @State private var results: [PlexMetadata] = []
+    @State private var results: [MediaItem] = []
     @State private var isSearching = false
     @State private var error: String?
 
@@ -34,7 +40,7 @@ struct IOSPlexSearchView: View {
             .navigationTitle("Search")
             .searchable(text: $query, prompt: "Movies, Shows, and Episodes")
             .searchScopes($scope) {
-                ForEach(Scope.allCases) { Text($0.rawValue).tag($0) }
+                ForEach(Scope.allCases) { Text($0.title).tag($0) }
             }
             .onSubmit(of: .search) { remember(trimmedQuery) }
             .toolbar {
@@ -47,7 +53,7 @@ struct IOSPlexSearchView: View {
 
     @ViewBuilder
     private var content: some View {
-        if !plex.isConfigured {
+        if !browse.hasServers {
             IOSPlexConnectView()
         } else if trimmedQuery.isEmpty {
             recentSearches
@@ -61,8 +67,8 @@ struct IOSPlexSearchView: View {
             }
         } else {
             List {
-                ForEach(groups, id: \.title) { group in
-                    Section(group.title) {
+                ForEach(groups) { group in
+                    Section(title(of: group)) {
                         ForEach(group.items) { item in
                             NavigationLink(value: item) { IOSPlexSearchRow(item: item) }
                         }
@@ -77,7 +83,7 @@ struct IOSPlexSearchView: View {
     private var recentSearches: some View {
         if recents.isEmpty {
             ContentUnavailableView(
-                "Search Your Plex Libraries",
+                "Search Your Libraries",
                 systemImage: "magnifyingglass",
                 description: Text("Find movies, TV shows, and episodes.")
             )
@@ -112,17 +118,18 @@ struct IOSPlexSearchView: View {
 
     private var recents: [String] { recentsRaw.split(separator: "\n").map(String.init) }
 
-    private var groups: [(title: String, items: [PlexMetadata])] {
-        let visible = results.filter(scope.includes)
-        let sections: [(String, Set<String>)] = [
-            ("Movies", ["movie"]),
-            ("TV Shows", ["show", "season"]),
-            ("Episodes", ["episode"]),
-        ]
-        return sections.compactMap { title, types in
-            let items = visible.filter { types.contains($0.type ?? "") }
-            return items.isEmpty ? nil : (title, items)
+    /// By kind; with several servers, each server's own, under its name.
+    private var groups: [SearchResults.Group] {
+        SearchResults.groups(results, scope: scope.scope, providerOrder: browse.providerOrder)
+    }
+
+    private func title(of group: SearchResults.Group) -> String {
+        let kind = switch group.section {
+        case .movies: String(localized: "Movies")
+        case .shows: String(localized: "TV Shows")
+        case .episodes: String(localized: "Episodes")
         }
+        return group.providerID.flatMap { browse.labels.badge(providerID: $0) }.map { "\(kind) · \($0)" } ?? kind
     }
 
     private func remember(_ term: String) {
@@ -134,7 +141,7 @@ struct IOSPlexSearchView: View {
     private func search() async {
         let value = trimmedQuery
         error = nil
-        guard !value.isEmpty, plex.isConfigured else {
+        guard !value.isEmpty, browse.hasServers else {
             results = []
             isSearching = false
             return
@@ -143,7 +150,10 @@ struct IOSPlexSearchView: View {
         try? await Task.sleep(for: .milliseconds(300))
         guard !Task.isCancelled else { return }
         do {
-            results = try await plex.search(value)
+            results = try await SearchResults.search(value, providers: browse.searchProviders)
+            #if DEBUG
+            results = IOSScreenshotMode.demoItems(results, libraries: browse.libraries)
+            #endif
         } catch {
             // A newer keystroke cancelled this request; the next task owns the state.
             if Task.isCancelled || isCancellationError(error) { return }
@@ -155,10 +165,10 @@ struct IOSPlexSearchView: View {
 
 /// A search result like the TV app's: artwork, title, then kind and year or episode.
 struct IOSPlexSearchRow: View {
-    @EnvironmentObject private var plex: IOSPlexSession
-    let item: PlexMetadata
+    @EnvironmentObject private var browse: BrowseStore
+    let item: MediaItem
 
-    private var isEpisode: Bool { item.type == "episode" }
+    private var isEpisode: Bool { item.kind == .episode }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -181,26 +191,18 @@ struct IOSPlexSearchRow: View {
 
     private var artworkURL: URL? {
         isEpisode
-            ? plex.artworkURL(for: item, kind: .thumb, width: 320, height: 180)
-            : plex.artworkURL(for: item, kind: .poster, width: 180, height: 270)
+            ? browse.artworkURL(for: item, kind: .thumb, width: 320, height: 180)
+            : browse.artworkURL(for: item, kind: .poster, width: 180, height: 270)
     }
 
     private var detail: String {
-        let parts: [String?] = switch item.type {
-        case "movie": ["Movie", item.year.map(String.init)]
-        case "show": ["TV Show", item.year.map(String.init)]
-        case "season": ["Season", item.parentTitle]
-        case "episode": [item.grandparentTitle, episodeCode]
-        default: [item.type?.capitalized]
+        let parts: [String?] = switch item.kind {
+        case .movie: [String(localized: "Movie"), item.year.map(String.init)]
+        case .show: [String(localized: "TV Show"), item.year.map(String.init)]
+        case .season: [String(localized: "Season"), item.seriesTitle]
+        case .episode: [item.seriesTitle, item.episodeCode]
+        default: []
         }
-        // With several servers, results from each can share a title.
-        let server = PlexExtraServers.shared.current.isEmpty ? nil
-            : item.serverID.flatMap { plex.otherServerNames[$0] } ?? plex.auth.savedServerName
-        return (parts + [server]).compactMap { $0 }.joined(separator: " · ")
-    }
-
-    private var episodeCode: String? {
-        guard let season = item.parentIndex, let episode = item.index else { return nil }
-        return "S\(season), E\(episode)"
+        return parts.compactMap { $0 }.joined(separator: " · ")
     }
 }

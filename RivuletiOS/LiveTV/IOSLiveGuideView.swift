@@ -10,7 +10,7 @@ import UIKit
 struct IOSLiveGuideView: UIViewRepresentable {
     struct Actions {
         let play: (UnifiedChannel) -> Void
-        let details: (IOSLiveProgrammeSelection) -> Void
+        let details: (LiveProgrammeSelection) -> Void
         let menu: (UnifiedChannel, UnifiedProgram?) -> UIMenu
     }
 
@@ -282,7 +282,7 @@ final class IOSLiveGuideCoordinator: NSObject, UICollectionViewDataSource, UICol
         if program?.isCurrentlyAiring ?? true {
             guide.actions.play(channel)
         } else {
-            guide.actions.details(IOSLiveProgrammeSelection(channel: channel, program: program))
+            guide.actions.details(LiveProgrammeSelection(channel: channel, program: program))
         }
     }
 
@@ -359,7 +359,9 @@ final class IOSLiveGuideContainer: UIView {
         self.timer = timer
     }
 
-    /// Scrolls under the floating tab bar and lets it minimize on scroll.
+    /// Scrolls under the floating tab bar and lets it minimize on scroll. With no tab bar
+    /// (the iPad sidebar) the last row still clears the home indicator. Recomputed on every
+    /// layout, so the inset follows the tab bar as a window narrows into one and widens out.
     private func adoptTabBar() {
         var responder: UIResponder? = self
         var tabBar: UITabBar?
@@ -370,8 +372,10 @@ final class IOSLiveGuideContainer: UIView {
             }
             responder = current.next
         }
-        guard let tabBar, !tabBar.isHidden else { return }
-        let overlap = max(0, bounds.maxY - tabBar.convert(tabBar.bounds, to: self).minY)
+        var overlap = safeAreaInsets.bottom
+        if let tabBar, !tabBar.isHidden {
+            overlap = max(overlap, bounds.maxY - tabBar.convert(tabBar.bounds, to: self).minY)
+        }
         guard abs(overlap - bottomInset) > 0.5 else { return }
         bottomInset = overlap
         coordinator.collectionView.contentInset.bottom = overlap
@@ -568,6 +572,7 @@ private final class IOSLiveGuideProgramCell: UICollectionViewCell {
         ])
         isAccessibilityElement = true
         accessibilityTraits = .button
+        hoverStyle = UIHoverStyle(effect: .highlight, shape: .rect(cornerRadius: 8))
         updateColors()
     }
 
@@ -576,7 +581,7 @@ private final class IOSLiveGuideProgramCell: UICollectionViewCell {
     func configure(program: UnifiedProgram?, isRecording: Bool) {
         self.program = program
         self.isRecording = isRecording
-        titleLabel.text = program?.displayTitle ?? "No guide data"
+        titleLabel.text = program?.displayTitle ?? String(localized: "No guide data")
         let subtitle = [program?.guideDetail, program?.guideTag].compactMap { $0 }.joined(separator: " · ")
         subtitleLabel.text = subtitle.isEmpty ? nil : subtitle
         subtitleLabel.isHidden = subtitle.isEmpty
@@ -585,10 +590,10 @@ private final class IOSLiveGuideProgramCell: UICollectionViewCell {
         let airing = program?.isCurrentlyAiring ?? true
         accessibilityLabel = titleLabel.text
         var value = program.map { [$0.timeRange] } ?? []
-        if program?.isCurrentlyAiring == true { value.append("On now") }
-        if isRecording { value.append("Recording") }
+        if program?.isCurrentlyAiring == true { value.append(String(localized: "On now")) }
+        if isRecording { value.append(String(localized: "Recording")) }
         accessibilityValue = value.joined(separator: ", ")
-        accessibilityHint = airing ? "Plays the channel" : "Shows details"
+        accessibilityHint = airing ? String(localized: "Plays the channel") : String(localized: "Shows details")
     }
 
     override func apply(_ layoutAttributes: UICollectionViewLayoutAttributes) {
@@ -668,7 +673,8 @@ private final class IOSLiveGuideChannelView: UICollectionReusableView {
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
         isAccessibilityElement = true
         accessibilityTraits = .button
-        accessibilityHint = "Plays the channel"
+        accessibilityHint = String(localized: "Plays the channel")
+        box.hoverStyle = UIHoverStyle(effect: .highlight, shape: .rect(cornerRadius: 8))
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -771,7 +777,7 @@ private final class IOSLiveGuideCornerView: UICollectionReusableView {
     required init?(coder: NSCoder) { fatalError() }
 
     func configure(date: Date) {
-        label.text = Calendar.current.isDateInToday(date) ? "Today" : date.formatted(.dateTime.weekday(.abbreviated))
+        label.text = Calendar.current.isDateInToday(date) ? String(localized: "Today") : date.formatted(.dateTime.weekday(.abbreviated))
     }
 }
 
